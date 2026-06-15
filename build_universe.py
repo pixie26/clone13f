@@ -121,13 +121,18 @@ def _new_style_windows(start: str | pd.Timestamp, end: str | pd.Timestamp) -> li
 
 def _infer_window_from_url(url: str) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     m = re.search(r"/(\d{2}[a-z]{3}\d{4})-(\d{2}[a-z]{3}\d{4})_form13f\.zip", url, flags=re.I)
-    if not m:
-        return None, None
-    try:
-        return (pd.to_datetime(m.group(1), format="%d%b%Y"),
-                pd.to_datetime(m.group(2), format="%d%b%Y"))
-    except Exception:
-        return None, None
+    if m:
+        try:
+            return (pd.to_datetime(m.group(1), format="%d%b%Y"),
+                    pd.to_datetime(m.group(2), format="%d%b%Y"))
+        except Exception:
+            return None, None
+
+    m = re.search(r"/(\d{4})q([1-4])_form13f\.zip", url, flags=re.I)
+    if m:
+        period = pd.Period(year=int(m.group(1)), quarter=int(m.group(2)), freq="Q")
+        return period.to_timestamp(how="start").normalize(), period.to_timestamp(how="end").normalize()
+    return None, None
 
 
 def discover_dataset_urls(identity: str, filing_start: str | pd.Timestamp, filing_end: str | pd.Timestamp) -> list[DatasetURL]:
@@ -146,23 +151,26 @@ def discover_dataset_urls(identity: str, filing_start: str | pd.Timestamp, filin
         for href in re.findall(r'href=["\']([^"\']+_form13f\.zip)["\']', r.text, flags=re.I):
             url = urljoin(SEC_13F_LANDING, href)
             ws, we = _infer_window_from_url(url)
-            # New-style windows can be filtered exactly. Legacy quarterly URLs are
-            # retained; final period_date filtering will remove irrelevant rows.
-            if ws is None or we is None or (we >= fs and ws <= fe):
+            if ws is not None and we is not None and we >= fs and ws <= fe:
                 found[url] = DatasetURL(url, ws, we)
     except Exception:
         pass
 
-    # Generated fallback for 2024+ windows.
+    # Generated fallback for 2024+ windows. Do not generate unfinished windows;
+    # if the SEC landing page does not list them yet, they are not usable inputs.
+    today = pd.Timestamp.today().normalize()
     for d in _new_style_windows(max(fs, pd.Timestamp("2024-01-01")), fe):
+        if d.window_end is not None and d.window_end > today:
+            continue
         found.setdefault(d.url, d)
 
     # Legacy fallback through 2023Q4. These archives were simple YYYYqN names.
     for y, q in filing_quarters_between(fs, min(fe, pd.Timestamp("2023-12-31"))):
+        ws, we = _infer_window_from_url(LEGACY_URL_PATTERN.format(y=y, q=q))
         url = LEGACY_URL_PATTERN.format(y=y, q=q)
-        found.setdefault(url, DatasetURL(url, None, None))
+        found.setdefault(url, DatasetURL(url, ws, we))
         old_url = OLDER_DERA_PATTERN.format(y=y, q=q)
-        found.setdefault(old_url, DatasetURL(old_url, None, None))
+        found.setdefault(old_url, DatasetURL(old_url, ws, we))
 
     return list(found.values())
 
@@ -180,6 +188,18 @@ def filing_quarters_between(start: str | pd.Timestamp, end: str | pd.Timestamp) 
 def quarters_between(start: str, end: str) -> list[tuple[int, int]]:
     """Backward-compatible helper retained for older scripts."""
     return filing_quarters_between(start, end)
+
+
+def report_quarter_ends_between(start: str | pd.Timestamp, end: str | pd.Timestamp) -> list[pd.Timestamp]:
+    s, e = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    out: list[pd.Timestamp] = []
+    p = pd.Period(s, "Q")
+    while p.to_timestamp(how="start").normalize() <= e:
+        q_end = p.to_timestamp(how="end").normalize()
+        if s <= q_end <= e:
+            out.append(q_end)
+        p += 1
+    return out
 
 
 def _try_download(url: str, identity: str) -> bytes | None:
@@ -328,10 +348,15 @@ def build_holdings_universe(start: str, end: str, identity: str,
 
     report_start = pd.Timestamp(start).normalize()
     report_end = pd.Timestamp(end).normalize()
-    # 13F filings arrive up to ~45 calendar days after quarter-end; use a buffer
-    # for weekends, holidays, and amendments.
-    filing_start = report_start - pd.Timedelta(days=10)
-    filing_end = report_end + pd.Timedelta(days=75)
+    report_periods = report_quarter_ends_between(report_start, report_end)
+    if not report_periods:
+        raise ValueError(f"No quarter-end 13F report periods in requested range: {start} to {end}")
+
+    # 13F filings arrive after quarter-end. Use the actual target quarter-ends,
+    # not the raw start date, or arbitrary Jan/Apr/Jul starts pull unrelated
+    # filing-window archives.
+    filing_start = min(report_periods)
+    filing_end = max(report_periods) + pd.Timedelta(days=75)
 
     datasets = discover_dataset_urls(identity, filing_start, filing_end)
     if not datasets:
