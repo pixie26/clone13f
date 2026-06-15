@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+13f_cache/
+reports/
+artifacts/
+strategy_dashboard.png

@@ -1,0 +1,338 @@
+这是我做过的研究：
+几乎每一条都有专门文献——而且不是边角料,是 fund-skill / holdings-predictability 这一整支主流文献的核心 paper。逐条对一下，顺便标一下证据强度:
+
+交易 change/initiation,不是 level——有,但带 wrinkle。Sias-Starks-Titman (2006, J. Business) "Changes in institutional ownership and stock returns";Yan-Zhang (2009, RFS) 发现短线 institution 的持仓变动 informative、长线的不 informative——这点和你"只挑 low-turnover"其实有张力,得留意。强度:中-强。
+多 fund consensus——有,而且结论比直觉 favorable。Sias-Turtle-Zykaj (2016, Management Science):HF 的股票组合其实相当独立;而当多家 HF 真同时买同一标的,其 demand shock 与后续 raw 和 risk-adjusted return 正相关,即便在极端 stress 期也找不到反向关系。→ 顺手修正我上轮说的"consensus 然后 reversal":学术上 mean 是正的(Agarwal 等的 confidential holdings 能预测 12 个月、STZ 的 demand shock 正相关,都支持 HF 是 informed trader);crowded-unwind 的左尾是单独的、episodic 现象(Khandani-Lo 2007 quant quake)。即"正 mean + 肥左尾"。强度:强。 [SSRN](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1906932)[ValueWalk](https://www.valuewalk.com/2016/06/hedge-fund-holdings-and-stock-market-efficiency/)
+Fund concentration / active share——教科书级。Cremers-Petajisto (2009, RFS):active share 最高的 fund 扣费前后都显著跑赢 benchmark,且有强 persistence;active share 最低的非指数基金跑输。Kacperczyk-Sialm-Zheng (2005, JF):industry concentration 越高、performance 越好。强度:强。 [SSRN](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=891719)[NYU Libraries](https://archive.nyu.edu/bitstream/2451/28039/2/wpa08046.pdf)
+你这刀的精确版本——low turnover × high active share——有人专门做过。 Cremers-Pareek (2016, JFE) "Patient Capital Outperformance":恰恰是 high active share 且交易不频繁的 manager 体现出投资 skill。这是离你 thesis 最近的一篇,建议精读——它基本就是你两个 filter 的交集。强度:强。 [Wiley Online Library](https://onlinelibrary.wiley.com/doi/10.1111/acfi.70224)
+Under-covered / 小 / opaque 名字——Griffin-Xu(HF 的 edge 在 smaller opaque 标的)、Hong-Lim-Stein (2000) 低 coverage 股票"坏消息传得慢"。强度:中。
+小 AUM / capacity——Chen-Hong-Huang-Kubik (2004, AER):fund 的 return(扣费前后)随 size 上升而下降,源于 liquidity 与组织 diseconomies。强度:强,但注意它测的是 fund 自己的 return,不是 clone。 [Semantic Scholar](https://www.semanticscholar.org/paper/How-Active-is-Your-Fund-Manager-A-New-Measure-That-Cremers-Petajisto/c68c2e8e6cf3c42b888d6eaa2a3a3e0ee6b5ce48)
+分批建仓躲 disclosure pop——最弱。13D activist 的公告效应大(Brav et al. 2008),但普通 13F filing-date 的价格反应 muted/mixed。这条更像 execution heuristic,不是 documented alpha source。强度:弱。
+
+但有两句 meta 层面的诚实话,比上面任何一条都重要:
+A. 几乎所有这些 paper 测的是"fund/manager 跑赢"或"stock 跑赢",不是"clone 它可见的 13F long book 跑赢"。 active share 验证的是这个人有 skill,但他的 alpha 可能来自 short / 衍生品 / timing / intra-quarter / 那些 confidential 藏起来的名字——这些你全 clone 不到。filter 帮你选对了人,你 clone 到手的却是这个人的一个 lossy projection。"文献背书了 filter"和"clone 抓得到 alpha"之间隔着这道裂缝。
+B. 单个 building block 全是 canonical 的;但把这一整套 stack 成一个 point-in-time、net-of-cost、可 clone 的策略,并逐个量它的 marginal IR——没有哪篇 paper 干净地做过。 最接近的也就是 Cremers-Pareek(只到 fund 层,不是 clone)、copycat 系列(粗糙、whole-book)、GURU/ALFA(粗糙且跑输)。所以你的 stack 落在一个真实的 gap 里:零件都被祝福过,组装版没被解过。这既是机会(没被 published 出来套利掉),也是风险——individually significant 的 signal 叠加不保证 additive:active share 和 concentration 高度相关、small-cap 和 under-coverage 重叠,filter 越多 overfitting / multiple-testing 风险越高。
+所以 backtest 要回答的恰恰是文献给不了你的那部分:每个 filter 的 marginal IR、彼此 overlap 多少、factor-strip 之后还剩多少。universe 定了我就开工。
+
+
+
+
+
+
+这是我上一段做的工作：
+
+同时有个known bug
+
+PS D:\Desktop\py\clone13F> python .\run_example.py
+[1/6] Building RULE-BASED universe from SEC 13F datasets (no hand-picking) …
+[2020Q1] downloading …
+D:\Desktop\py\clone13F\build_universe.py:80: UserWarning: Could not infer format, so each element will be parsed individually, falling back to dateutil. To ensure parsing is consistent and as-expected, please specify a format.
+  period_date=pd.to_datetime(df["PERIODOFREPORT"], errors="coerce"),
+D:\Desktop\py\clone13F\build_universe.py:81: UserWarning: Could not infer format, so each element will be parsed individually, falling back to dateutil. To ensure parsing is consistent and as-expected, please specify a format.
+  filing_date=pd.to_datetime(df["FILING_DATE"], errors="coerce"),
+
+
+PS D:\Desktop\py\clone13F> python .\run_example.py
+[1/6] Building RULE-BASED universe from SEC 13F datasets (no hand-picking) …
+[2024Q1] downloading …
+  [warn] 2024Q1: dataset not found at known URLs — check the landing page
+[2024Q2] downloading …
+
+我会先读代码结构和出错点，再核对 SEC 13F dataset 的实际下载路径。你这个 bug 看起来一个是日期解析 warning，另一个更像 URL 规则/季度命名变了。
+
+我已经看到一个明确根因：SEC 从 2024 年开始数据集不是简单的 2024q1_form13f.zip 这种季度命名；它改成 Jan-Feb、Mar-May 这类 filing-month window。所以你的下载器到 2024Q1 会自然找不到。
+
+已思考 4m 55s
+
+我看了代码。整体方向是对的：你已经不是在做“手选几个 guru 然后漂亮回测”，而是在往一个 rule-based / bias-aware research infra 走。 这点很好。但现在代码里有几个会实质影响结果可信度的问题，其中你提到的两个 bug 都是真 bug。
+
+我整理了一个 patched 版本，主要修了 build_universe.py、run_example.py、report.py：
+下载 patched zip
+
+1. 你这个 known bug 的根因
+Bug A：pd.to_datetime warning
+
+这个不是致命 bug，但应该修。现在代码是：
+
+period_date=pd.to_datetime(df["PERIODOFREPORT"], errors="coerce")
+filing_date=pd.to_datetime(df["FILING_DATE"], errors="coerce")
+
+Pandas 无法确定格式，所以回退到 dateutil，会慢，而且不同格式混在一起时可能有歧义。
+
+我在 patched 版里改成了显式解析：
+
+def _sec_date(s):
+    x = s.astype("string").str.strip()
+    out = pd.to_datetime(x, format="%Y-%m-%d", errors="coerce")
+    miss = out.isna()
+    if miss.any():
+        out.loc[miss] = pd.to_datetime(x.loc[miss], format="%Y%m%d", errors="coerce")
+    miss = out.isna()
+    if miss.any():
+        out.loc[miss] = pd.to_datetime(x.loc[miss], format="%m/%d/%Y", errors="coerce")
+    return out
+
+然后：
+
+period_date=df["PERIOD_PARSED"]
+filing_date=df["FILING_DATE_PARSED"]
+Bug B：2024Q1 dataset not found
+
+这个是更大的问题。SEC 官方页面说明，13F data sets 是从 EDGAR 里的 structured XML 抽取并整理的 flat files；同时 SEC 也明确说明，从 2024 年 3 月起，季度数据集会按前 3 个月 filing window 来跑，窗口结束月份是 February / May / August / November。这就是为什么 2024q1_form13f.zip 找不到。
+
+你现在代码里写死了：
+
+https://www.sec.gov/files/structureddata/data/form-13f-data-sets/{Y}q{Q}_form13f.zip
+
+但 2024 年后的实际文件类似：
+
+01jan2024-29feb2024_form13f.zip
+01mar2024-31may2024_form13f.zip
+01jun2024-31aug2024_form13f.zip
+01sep2024-30nov2024_form13f.zip
+01dec2024-28feb2025_form13f.zip
+
+SEC / data.gov 页面也列出了这些新命名文件，例如 2024 Jan-Feb 和 2024 Mar-May。
+
+所以这个 bug 的本质不是网络问题，而是：SEC 文件命名规则变了。
+
+2. 我觉得你现在框架好的地方
+
+你已经做对了几件关键事：
+
+不用 hand-picked CIK list
+这是对的。否则很容易事后挑 Bill Ackman、Baupost、Tiger Cubs，然后得出一个没法交易的漂亮结论。
+用 filing_date，而不是 period_date 做可见时间
+方向对。13F 策略最常见错误就是季度末持仓一出来就假装知道。
+有 thesis vs placebo
+这个很重要。你不是只测一个策略，而是拿 thesis stack 跟 naive guru clone 比较。
+有 ablation 和 walk-forward
+这比很多个人量化项目成熟很多。尤其是 ablation，可以回答“到底是 concentration 有用，还是 turnover 有用，还是纯粹 curve fit”。
+3. 现在最大的问题
+问题一：2024 之后下载逻辑需要重写
+
+我在 patched 版里改成了：
+
+优先 scrape SEC 官方 landing page；
+识别 _form13f.zip 文件；
+对 2024+ 自动生成 Jan-Feb / Mar-May / Jun-Aug / Sep-Nov / Dec-Feb 这种窗口；
+start/end 作为 report period；
+下载时用 end + 75 days，这样 2024Q4 的持仓会去拿 2025 Jan-Feb 的 filing window；
+下载后再按 period_date 过滤。
+
+这是必要的。否则你会漏掉 2024Q4，也会把 filing quarter 和 report quarter 混起来。
+
+问题二：amendment 会造成重复持仓
+
+原版这里有风险：
+
+sub = sub[sub["SUBMISSIONTYPE"].str.contains("13F-HR", na=False)]
+
+这会包括 13F-HR/A。如果一个 manager 同一 report period 有原始版和 amendment，你现在可能把两份 holdings 都 merge 进去。后果是：
+
+AUM 被重复计算；
+top 10 concentration 失真；
+turnover 失真；
+某些股票权重被重复放大。
+
+我在 patched 版里加了：
+
+sub = (
+    sub.sort_values(["CIK", "PERIOD_PARSED", "FILING_DATE_PARSED", "ACCESSION_NUMBER"])
+       .groupby(["CIK", "PERIOD_PARSED"], as_index=False)
+       .tail(1)
+)
+
+即同一 CIK + period 只保留最新 filing。
+
+问题三：manager key 不应该用 manager name
+
+原版：
+
+manager=df["FILINGMANAGER_NAME"].fillna(df["CIK"])
+
+这个有隐患。manager name 可能有大小写、标点、实体名称变化。策略层面应该用稳定 key：
+
+manager = CIK
+manager_name = FILINGMANAGER_NAME
+
+我在 patched 版里这么改了。否则同一个 filer 可能被拆成两个 manager，turnover / history / skill 都会错。
+
+问题四：live mode 里 benchmark 没有真正接上
+
+你的 LIVE_CONFIG 有：
+
+benchmark_ticker="IWD"
+
+但 live mode 里最后是：
+
+value_scores, bench_w, bench_ret = None, None, None
+
+这会导致：
+
+ir_vs_benchmark 没有意义；
+dashboard 可能因为 benchmark.reindex() 直接报错；
+thesis vs benchmark 的比较缺失。
+
+我在 patched 版里加了：
+
+bench_ret = da.fetch_prices([cfg["benchmark_ticker"]], cfg["start"], cfg["end"]).iloc[:, 0]
+
+如果抓不到，就 warning，然后 dashboard 用 cash-like 0 return 避免崩。
+
+问题五：DSR 输入单位错了
+
+这个比较隐蔽。你的 attribution() 输出的 sharpe 是年化 Sharpe：
+
+sharpe = monthly_sr * sqrt(12)
+
+但 deflated_sharpe() 里面的 sr_variance 逻辑按 periodic Sharpe 写的。原版：
+
+sr_variance=float(np.nanvar(grid["sharpe"]))
+
+这会把年化 Sharpe 的 variance 直接塞进去，导致 DSR haircut 不一致。
+
+我改成：
+
+sr_variance=float(np.nanvar(grid["sharpe"] / np.sqrt(12)))
+
+这个必须修，否则 DSR 结论可能偏保守或偏混乱，反正不是你想表达的统计口径。
+
+4. 策略研究层面还缺什么
+第一，要区分两种执行政策
+
+你现在的逻辑是：
+
+rebal_months = first month-end after any filing_date
+
+这相当于 incremental as-filed monthly rebalance。
+
+但你原来的 thesis 更像：
+
+每季度 13F 披露完成后，统一做一次 rebalance。
+
+这两个策略不一样。
+
+我建议后续加一个参数：
+
+execution_policy = "after_deadline" | "as_filed_incremental"
+
+第一版建议用 after_deadline，即每个 report period 在 45 天 deadline 后统一调仓。这个更干净、更少 timing bias。
+
+第二，CUSIP → ticker 用 OpenFIGI 会有 survivorship / symbol drift
+
+这对初版可以接受，但不能作为正式结论。
+
+真正严谨要用：
+
+CRSP PERMNO；
+point-in-time CUSIP / NCUSIP；
+delisted return；
+corporate action adjusted returns。
+
+否则 yfinance + current ticker mapping 会天然漏掉退市股票，回测通常偏乐观。
+
+第三，现在的 manager universe 还不是“hedge fund universe”
+
+SEC 13F filer 包括：
+
+mutual funds；
+pension funds；
+banks；
+insurers；
+RIAs；
+family offices；
+hedge funds。
+
+你现在用 concentration、holdings count、put weight、turnover 过滤，这是合理 proxy，但还不等于 hedge fund classification。
+
+更严谨版本需要接：
+
+Form ADV；
+IAPD；
+或者 paid fund database：HFR / TASS / BarclayHedge / Preqin。
+
+但作为第一版 free-data research，当前做法可以接受。
+
+第四，要加 coverage diagnostics
+
+每次 rebalance 最好输出：
+
+asof date
+eligible managers
+selected managers
+selected names
+avg age of filing
+median filing lag
+turnover
+cash weight
+top sector exposure
+
+否则你不知道策略什么时候 actually invested，什么时候只是 stale holdings 在跑。
+
+第五，最好加一个 “no-signal placebo”
+
+现在你的 placebo 是 naive guru clone。还可以再加两个：
+
+Random manager placebo
+每期随机选同数量 manager，同样 top-n。
+Random name placebo within 13F universe
+每期从所有 13F 股票里随机选同数量股票。
+
+如果 thesis stack 不能显著赢这两个 placebo，那 alpha 可能只是 13F universe / large-cap quality exposure。
+
+5. 我会怎么优化研究路线
+
+我的建议是分三层推进：
+
+v0：先让 live data pipeline 跑通
+
+目标不是 alpha，是数据正确。
+
+必须检查：
+
+每个 SEC zip 能不能下载；
+2024+ window 是否覆盖完整；
+period_date 是否是 quarter-end；
+每个 CIK 每个 period 是否只有一份 filing；
+value 单位是否一致；
+2023 前后 AUM 是否没有断层跳变。
+v1：做 clean long-only signal test
+
+先只做最核心的四个版本：
+
+策略	目的
+All 13F top 10	naive clone
+Concentrated managers top 5	best ideas
+Concentrated + low turnover	long-horizon managers
+Consensus best ideas	manager agreement
+
+先不要扫太多参数。这个阶段要看的是有没有 broad effect。
+
+v2：做真实可投资版本
+
+加入：
+
+after-deadline quarterly rebalance；
+transaction cost；
+ADV / hedge fund filter；
+liquidity filter；
+sector / beta / style control；
+CRSP delisted returns；
+factor attribution。
+
+这时才有资格说：这个策略有没有 alpha。
+
+6. 总评
+
+我觉得这个项目值得继续，而且代码骨架已经不错。但现在不能急着看回测收益。当前阶段最重要的是：
+
+修 SEC 2024+ 文件命名；
+修日期解析；
+去重 amendments；
+用 CIK 作为 manager key；
+修 live benchmark；
+修 DSR Sharpe 单位；
+明确 rebalance policy。
+
+我给你的 patched zip 已经修了前 6 个。第 7 个我建议下一步单独做，因为它会影响 engine 的设计，不只是小修小补。
