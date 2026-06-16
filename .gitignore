@@ -7,4 +7,5 @@ reports/
 artifacts/
 openfigi_cache.parquet
 yfinance_close_cache.parquet
+yfinance_close_cache_coverage.parquet
 strategy_dashboard.png
