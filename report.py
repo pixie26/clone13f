@@ -86,22 +86,32 @@ def dashboard(
 
     ax = fig.add_subplot(gs[0, 2])
     ax.axis("off")
-    lines = [
-        ("OOS ann. Sharpe", f"{dsr_info.get('ann_SR', float('nan')):.2f}"),
-        ("Expected max SR (null)", f"{dsr_info.get('expected_max_SR_null', float('nan')) * np.sqrt(12):.2f}"),
-        ("# configs tried", f"{dsr_info.get('n_trials', 'n/a')}"),
-        ("OOS months", f"{dsr_info.get('T', 'n/a')}"),
-        ("Deflated Sharpe (DSR)", f"{dsr_info.get('DSR', float('nan')):.2f}"),
-    ]
+    if "DSR" in dsr_info:
+        lines = [
+            ("OOS ann. Sharpe", f"{dsr_info.get('ann_SR', float('nan')):.2f}"),
+            ("Expected max SR (null)", f"{dsr_info.get('expected_max_SR_null', float('nan')) * np.sqrt(12):.2f}"),
+            ("# configs tried", f"{dsr_info.get('n_trials', 'n/a')}"),
+            ("OOS months", f"{dsr_info.get('T', 'n/a')}"),
+            ("Deflated Sharpe (DSR)", f"{dsr_info.get('DSR', float('nan')):.2f}"),
+        ]
+        verdict = "survives" if dsr_info.get("DSR", 0) > 0.95 else (
+            "marginal" if dsr_info.get("DSR", 0) > 0.9 else "fails haircut"
+        )
+    else:
+        lines = [
+            ("OOS ann. Sharpe", "skipped"),
+            ("Reason", dsr_info.get("note", "insufficient OOS")),
+            ("# configs tried", f"{dsr_info.get('n_trials', 'n/a')}"),
+            ("Price months", f"{dsr_info.get('price_months', dsr_info.get('T', 'n/a'))}/{dsr_info.get('required_months', 'n/a')}"),
+            ("Deflated Sharpe (DSR)", "skipped"),
+        ]
+        verdict = "not evaluated"
     ax.text(0, 1.0, "Walk-forward OOS scorecard", fontsize=11, fontweight="bold", color=INK, va="top")
     for i, (k, v) in enumerate(lines):
         y = 0.80 - i * 0.16
         ax.text(0.0, y, k, fontsize=9.5, color="#555", va="center")
         ax.text(1.0, y, v, fontsize=11, fontweight="bold", color=INK, va="center", ha="right")
-    verdict = "survives" if dsr_info.get("DSR", 0) > 0.95 else (
-        "marginal" if dsr_info.get("DSR", 0) > 0.9 else "fails haircut"
-    )
-    vc = A_C if verdict == "survives" else (ACC if verdict == "marginal" else B_C)
+    vc = A_C if verdict == "survives" else (ACC if verdict in {"marginal", "not evaluated"} else B_C)
     ax.text(0.0, 0.80 - len(lines) * 0.16 - 0.04, f"DSR > 0.95 needed | {verdict}",
             fontsize=10, fontweight="bold", color=vc, va="center")
 

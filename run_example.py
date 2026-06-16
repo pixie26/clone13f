@@ -37,6 +37,7 @@ from sweep import deflated_sharpe, grid_eval, walk_forward
 LIVE_CONFIG = {
     "identity": "YourName you@firm.com",
     "openfigi_key": None,
+    "sec_history_start": "2024-01-01",
     "start": "2025-01-01",
     "end": "2026-03-31",
     "benchmark_ticker": "IWD",
@@ -208,8 +209,14 @@ def build_live_data(
     cfg = dict(cfg)
     cfg["openfigi_key"] = cfg.get("openfigi_key") or os.environ.get("OPENFIGI_API_KEY")
 
+    holdings_start = cfg.get("sec_history_start") or cfg["start"]
+    if holdings_start != cfg["start"]:
+        print(
+            "    SEC holdings history start: "
+            f"{holdings_start} (strategy price window starts {cfg['start']})"
+        )
     h_cusip = bu.build_holdings_universe(
-        cfg["start"],
+        holdings_start,
         cfg["end"],
         cfg["identity"],
         cache_dir="13f_cache",
@@ -396,26 +403,47 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         ("universe", "turnover_quantile"): [0.34, 0.50],
     }
     grid = grid_eval(holdings, prices, factors, cfg_a, axes, bench_ret, value_scores, bench_w)
-    oos_ret, wf_log, n_trials = walk_forward(
-        holdings,
-        prices,
-        factors,
-        cfg_a,
-        axes,
-        bench_ret,
-        value_scores,
-        bench_w,
-        train_m=48,
-        test_m=12,
-    )
-    dsr = deflated_sharpe(
-        oos_ret,
-        n_trials,
-        sr_variance=float(np.nanvar(grid["sharpe"] / np.sqrt(12))),
-    )
-    print(f"  OOS ann. Sharpe        {dsr.get('ann_SR', float('nan')):.2f}")
-    print(f"  n_trials               {dsr.get('n_trials')}")
-    print(f"  Deflated Sharpe (DSR)  {dsr.get('DSR', float('nan')):.2f}")
+    train_m, test_m = 48, 12
+    required_m = train_m + test_m
+    if len(prices) >= required_m:
+        oos_ret, wf_log, n_trials = walk_forward(
+            holdings,
+            prices,
+            factors,
+            cfg_a,
+            axes,
+            bench_ret,
+            value_scores,
+            bench_w,
+            train_m=train_m,
+            test_m=test_m,
+        )
+        dsr = deflated_sharpe(
+            oos_ret,
+            n_trials,
+            sr_variance=float(np.nanvar(grid["sharpe"] / np.sqrt(12))),
+        )
+    else:
+        n_trials = int(np.prod([len(v) for v in axes.values()]))
+        oos_ret = pd.Series(dtype=float)
+        wf_log = pd.DataFrame()
+        dsr = {
+            "note": "insufficient price history for walk-forward",
+            "price_months": int(len(prices)),
+            "required_months": int(required_m),
+            "train_m": int(train_m),
+            "test_m": int(test_m),
+            "n_trials": int(n_trials),
+            "T": 0,
+        }
+    if "note" in dsr:
+        print(f"  OOS ann. Sharpe        skipped ({dsr['note']})")
+        print(f"  price months           {dsr.get('price_months', len(oos_ret))}/{dsr.get('required_months', required_m)}")
+        print(f"  n_trials               {dsr.get('n_trials')}")
+    else:
+        print(f"  OOS ann. Sharpe        {dsr.get('ann_SR', float('nan')):.2f}")
+        print(f"  n_trials               {dsr.get('n_trials')}")
+        print(f"  Deflated Sharpe (DSR)  {dsr.get('DSR', float('nan')):.2f}")
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = output_root / run_id

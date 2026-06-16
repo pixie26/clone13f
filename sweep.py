@@ -93,7 +93,7 @@ def deflated_sharpe(returns: pd.Series, n_trials: int, sr_variance: float | None
     r = returns.dropna()
     T = len(r)
     if T < 12:
-        return {"note": "insufficient OOS", "T": T}
+        return {"note": "insufficient OOS", "T": T, "n_trials": n_trials}
     sr = r.mean() / r.std() if r.std() else 0.0
     g = r.skew()
     k = r.kurtosis() + 3.0

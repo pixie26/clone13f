@@ -384,6 +384,8 @@ def build_holdings_universe(start: str, end: str, identity: str,
     print(f"  SEC datasets selected: {len(datasets)}")
 
     frames = []
+    raw_rows = 0
+    dedup_rows = 0
     seen_urls: set[str] = set()
     for d in datasets:
         if d.url in seen_urls:
@@ -393,10 +395,19 @@ def build_holdings_universe(start: str, end: str, identity: str,
         cpath = os.path.join(cache_dir, f"{fname}.{PARSED_CACHE_VERSION}.parquet") if cache_dir else None
         if cpath and os.path.exists(cpath):
             dfq = pd.read_parquet(cpath)
-            print(f"[{fname}] cache hit: {len(dfq)} rows")
-            frames.append(dfq)
+            if not dfq.empty:
+                dfq = dfq[dfq["period_date"].between(report_start, report_end)]
+            print(f"[{fname}] cache hit: {len(dfq)} in-range rows")
+            if not dfq.empty:
+                raw_rows += len(dfq)
+                dfq = (dfq.sort_values(["cik", "period_date", "filing_date"])
+                          .drop_duplicates(["accession_number", "cusip", "sec_type"], keep="last"))
+                dedup_rows += len(dfq)
+                dfq = coarse_prefilter(dfq, **prefilter_kw)
+                if not dfq.empty:
+                    frames.append(dfq)
             continue
-        print(f"[{fname}] downloading …")
+        print(f"[{fname}] downloading ...")
         b = _try_download(d.url, identity)
         if b is None:
             print(f"  [warn] dataset not found or blocked: {d.url}")
@@ -408,7 +419,15 @@ def build_holdings_universe(start: str, end: str, identity: str,
         if cpath and not dfq.empty:
             dfq.to_parquet(cpath)
             print(f"[{fname}] cached: {cpath}")
-        frames.append(dfq)
+        if dfq.empty:
+            continue
+        raw_rows += len(dfq)
+        dfq = (dfq.sort_values(["cik", "period_date", "filing_date"])
+                  .drop_duplicates(["accession_number", "cusip", "sec_type"], keep="last"))
+        dedup_rows += len(dfq)
+        dfq = coarse_prefilter(dfq, **prefilter_kw)
+        if not dfq.empty:
+            frames.append(dfq)
         time.sleep(0.5)
 
     frames = [f for f in frames if f is not None and not f.empty]
@@ -416,10 +435,11 @@ def build_holdings_universe(start: str, end: str, identity: str,
         raise RuntimeError("No 13F datasets downloaded/parsed — verify SEC URLs and User-Agent identity.")
 
     allh = pd.concat(frames, ignore_index=True)
-    print(f"  raw in-range holdings rows before de-dup: {len(allh)}")
+    print(f"  raw in-range holdings rows before de-dup: {raw_rows}")
+    print(f"  holdings rows after per-archive de-dup: {dedup_rows}")
     # Final guard: overlapping archives can repeat the same filing; keep distinct
     # filing versions so amendments remain point-in-time events for the engine.
     allh = (allh.sort_values(["cik", "period_date", "filing_date"])
                 .drop_duplicates(["accession_number", "cusip", "sec_type"], keep="last"))
     print(f"  holdings rows after accession/CUSIP/sec_type de-dup: {len(allh)}")
-    return coarse_prefilter(allh, **prefilter_kw)
+    return allh

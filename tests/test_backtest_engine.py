@@ -16,6 +16,7 @@ from data_adapters import (
     priceable_holdings,
 )
 from engine import BacktestConfig, UniverseConfig, attribution, run_backtest
+from sweep import deflated_sharpe
 
 
 def test_run_backtest_raises_on_missing_held_return():
@@ -221,3 +222,39 @@ def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypat
     assert returns.attrs["price_diagnostics"]["used_chart_fallback"] is True
     assert returns.attrs["price_diagnostics"]["tickers_with_close"] == 2
     assert returns.iloc[-1].tolist() == pytest.approx([0.1, 0.1])
+
+
+def test_fetch_prices_drops_incomplete_monthly_return_columns(monkeypatch):
+    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
+
+    def fake_yf_download_close(yf, batch, start, end):
+        return pd.DataFrame(
+            {
+                "AAPL": [100.0, 110.0, 121.0],
+                "MSFT": [100.0, np.nan, 121.0],
+            },
+            index=dates,
+        )
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+
+    returns = da.fetch_prices(
+        ["AAPL", "MSFT"],
+        "2025-01-01",
+        "2025-03-31",
+        batch_size=2,
+        max_retries=0,
+    )
+
+    assert returns.columns.tolist() == ["AAPL"]
+    assert returns.attrs["price_diagnostics"]["tickers_with_close"] == 2
+    assert returns.attrs["price_diagnostics"]["tickers_with_complete_returns"] == 1
+    assert returns.attrs["price_diagnostics"]["tickers_incomplete_returns"] == 1
+
+
+def test_deflated_sharpe_reports_trials_when_oos_is_insufficient():
+    out = deflated_sharpe(pd.Series([0.01] * 6), n_trials=16)
+
+    assert out["note"] == "insufficient OOS"
+    assert out["T"] == 6
+    assert out["n_trials"] == 16
