@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import data_adapters as da
 from data_adapters import (
     _is_yfinance_ticker,
     _load_price_cache,
@@ -183,3 +184,40 @@ def test_price_cache_preserves_existing_columns_and_filters_dates(tmp_path):
     assert loaded.columns.tolist() == ["AAPL", "MSFT"]
     assert loaded.loc[pd.Timestamp("2025-01-31"), "AAPL"] == 101.0
     assert loaded.loc[pd.Timestamp("2025-01-31"), "MSFT"] == 200.0
+
+
+def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypatch, tmp_path):
+    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
+
+    def fake_yf_download_close(yf, batch, start, end):
+        return pd.DataFrame()
+
+    def fake_yfinance_probe(yf, start, end):
+        return "probe_empty_close"
+
+    def fake_chart_probe(start, end):
+        return "chart_probe_ok=SPY,IWD,AAPL"
+
+    def fake_chart_download_close(batch, start, end, *, max_workers=8):
+        data = {ticker: [100.0, 110.0, 121.0] for ticker in batch}
+        return pd.DataFrame(data, index=dates)
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+    monkeypatch.setattr(da, "_yfinance_probe", fake_yfinance_probe)
+    monkeypatch.setattr(da, "_yahoo_chart_probe", fake_chart_probe)
+    monkeypatch.setattr(da, "_yahoo_chart_download_close", fake_chart_download_close)
+
+    returns = da.fetch_prices(
+        ["AAPL", "MSFT"],
+        "2025-01-01",
+        "2025-03-31",
+        batch_size=1,
+        max_retries=0,
+        max_consecutive_empty_batches=1,
+        cache_path=tmp_path / "prices.parquet",
+    )
+
+    assert returns.columns.tolist() == ["AAPL", "MSFT"]
+    assert returns.attrs["price_diagnostics"]["used_chart_fallback"] is True
+    assert returns.attrs["price_diagnostics"]["tickers_with_close"] == 2
+    assert returns.iloc[-1].tolist() == pytest.approx([0.1, 0.1])

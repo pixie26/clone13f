@@ -154,6 +154,127 @@ def _yfinance_probe(yf, start: str, end: str) -> str:
     return f"probe_ok={','.join(map(str, non_empty))}"
 
 
+def _yahoo_chart_symbol(ticker: str) -> str:
+    return ticker.strip().upper().replace(".", "-")
+
+
+def _yahoo_chart_download_one(ticker: str, start: str, end: str) -> pd.Series:
+    start_ts = int(pd.Timestamp(start, tz="UTC").timestamp())
+    # Yahoo chart period2 is exclusive. Add one day so a requested month-end is
+    # available for monthly return construction when the market was open.
+    end_ts = int((pd.Timestamp(end, tz="UTC") + pd.Timedelta(days=1)).timestamp())
+    symbol = _yahoo_chart_symbol(ticker)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "period1": start_ts,
+        "period2": end_ts,
+        "interval": "1d",
+        "events": "history",
+        "includeAdjustedClose": "true",
+    }
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(url, params=params, headers=headers, timeout=20)
+    if response.status_code in {404, 410}:
+        return pd.Series(dtype="float64", name=ticker)
+    if response.status_code == 429:
+        raise RuntimeError(f"Yahoo Chart API rate limited for {ticker}")
+    response.raise_for_status()
+    payload = response.json().get("chart", {})
+    if payload.get("error"):
+        return pd.Series(dtype="float64", name=ticker)
+    results = payload.get("result") or []
+    if not results:
+        return pd.Series(dtype="float64", name=ticker)
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators") or {}
+    adjclose = ((indicators.get("adjclose") or [{}])[0] or {}).get("adjclose")
+    close = ((indicators.get("quote") or [{}])[0] or {}).get("close")
+    values = adjclose or close
+    if not timestamps or not values:
+        return pd.Series(dtype="float64", name=ticker)
+    idx = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None)
+    return pd.Series(values, index=idx, name=ticker, dtype="float64").dropna()
+
+
+def _yahoo_chart_download_close(
+    batch: list[str],
+    start: str,
+    end: str,
+    *,
+    max_workers: int = 8,
+) -> pd.DataFrame:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not batch:
+        return pd.DataFrame()
+    workers = max(1, min(max_workers, len(batch)))
+    series: list[pd.Series] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_ticker = {
+            executor.submit(_yahoo_chart_download_one, ticker, start, end): ticker
+            for ticker in batch
+        }
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                item = future.result()
+            except Exception as exc:
+                errors.append(f"{ticker}: {type(exc).__name__}: {exc}")
+                continue
+            if not item.empty:
+                series.append(item)
+    if errors:
+        print(f"    [warn] Yahoo Chart API ticker errors: {errors[:5]}")
+    if not series:
+        return pd.DataFrame()
+    close = pd.concat(series, axis=1)
+    close.columns = [str(c).strip().upper() for c in close.columns]
+    return close.sort_index()
+
+
+def _yahoo_chart_probe(start: str, end: str) -> str:
+    try:
+        close = _yahoo_chart_download_close(["SPY", "IWD", "AAPL"], start, end, max_workers=3)
+    except Exception as exc:
+        return f"chart_probe_exception={type(exc).__name__}: {exc}"
+    if close.empty:
+        return "chart_probe_empty_close"
+    non_empty = close.dropna(axis=1, how="all").columns.tolist()
+    if not non_empty:
+        return "chart_probe_all_nan_close"
+    return f"chart_probe_ok={','.join(map(str, non_empty))}"
+
+
+def _fetch_yahoo_chart_batches(
+    tickers: list[str],
+    start: str,
+    end: str,
+    *,
+    batch_size: int,
+    cache_path: str | Path | None,
+    max_workers: int,
+) -> tuple[list[pd.DataFrame], list[str]]:
+    frames: list[pd.DataFrame] = []
+    failed_batches: list[str] = []
+    n_batches = int(np.ceil(len(tickers) / batch_size)) if tickers else 0
+    print(f"  Yahoo Chart fallback: {len(tickers)} tickers in {n_batches} batches")
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        batch_no = i // batch_size + 1
+        print(f"    yahoo-chart batch {batch_no}/{n_batches}: {batch[0]}..{batch[-1]}")
+        close = _yahoo_chart_download_close(batch, start, end, max_workers=max_workers)
+        non_nan_close = close.dropna(axis=1, how="all") if not close.empty else close
+        if non_nan_close.empty:
+            failed_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
+        else:
+            frames.append(non_nan_close)
+            _write_price_cache(cache_path, non_nan_close)
+        time.sleep(0.1)
+    return frames, failed_batches
+
+
 def _load_price_cache(cache_path: str | Path | None, start: str, end: str) -> pd.DataFrame:
     if cache_path is None:
         return pd.DataFrame()
@@ -438,6 +559,8 @@ def fetch_prices(
     rate_limit_sleep: int = 60,
     cache_path: str | Path | None = None,
     max_consecutive_empty_batches: int = 3,
+    use_chart_fallback: bool = True,
+    chart_fallback_workers: int = 8,
 ) -> pd.DataFrame:
     ## FRICTION: yfinance has survivorship gaps (delisted names vanish). For a
     ##           publishable backtest use CRSP via WRDS; yfinance is fine first-pass.
@@ -462,6 +585,9 @@ def fetch_prices(
     todo = sorted(set(clean) - set(cached_cols))
     failed_batches: list[str] = []
     empty_batches: list[str] = []
+    empty_batch_tickers: list[list[str]] = []
+    chart_failed_batches: list[str] = []
+    used_chart_fallback = False
     consecutive_empty = 0
     n_batches = int(np.ceil(len(todo) / batch_size)) if todo else 0
     print(f"  price download: {len(todo)} uncached / {len(clean)} requested tickers in {n_batches} batches")
@@ -476,6 +602,7 @@ def fetch_prices(
                     non_nan_close = close.dropna(axis=1, how="all")
                     if non_nan_close.empty:
                         empty_batches.append(f"{batch[0]}..{batch[-1]}: all_nan_close")
+                        empty_batch_tickers.append(batch)
                         consecutive_empty += 1
                     else:
                         frames.append(non_nan_close)
@@ -492,6 +619,7 @@ def fetch_prices(
                     time.sleep(wait)
                     continue
                 empty_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
+                empty_batch_tickers.append(batch)
                 consecutive_empty += 1
                 break
             except Exception as exc:
@@ -510,11 +638,38 @@ def fetch_prices(
         if consecutive_empty >= max_consecutive_empty_batches:
             probe = _yfinance_probe(yf, start, end)
             if "probe_ok=" not in probe:
-                raise RuntimeError(
-                    "Stopping yfinance download after "
-                    f"{consecutive_empty} consecutive empty batches; {probe}; "
-                    f"recent empty batches: {empty_batches[-max_consecutive_empty_batches:]}"
+                if not use_chart_fallback:
+                    raise RuntimeError(
+                        "Stopping yfinance download after "
+                        f"{consecutive_empty} consecutive empty batches; {probe}; "
+                        f"recent empty batches: {empty_batches[-max_consecutive_empty_batches:]}"
+                    )
+                chart_probe = _yahoo_chart_probe(start, end)
+                if "chart_probe_ok=" not in chart_probe:
+                    raise RuntimeError(
+                        "Stopping yfinance download after "
+                        f"{consecutive_empty} consecutive empty batches; {probe}; "
+                        f"Yahoo Chart fallback unavailable: {chart_probe}; "
+                        f"recent empty batches: {empty_batches[-max_consecutive_empty_batches:]}"
+                    )
+                prior_empty = [t for batch_tickers in empty_batch_tickers for t in batch_tickers]
+                remaining = todo[i + batch_size:]
+                fallback_tickers = sorted(set(prior_empty).union(remaining))
+                print(
+                    "    [warn] yfinance returned consecutive empty batches and probe failed; "
+                    f"{probe}. Switching to Yahoo Chart API fallback; {chart_probe}"
                 )
+                chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
+                    fallback_tickers,
+                    start,
+                    end,
+                    batch_size=batch_size,
+                    cache_path=cache_path,
+                    max_workers=chart_fallback_workers,
+                )
+                frames.extend(chart_frames)
+                used_chart_fallback = True
+                break
             print(
                 "    [warn] consecutive empty yfinance batches but probe succeeded; "
                 "continuing and treating those tickers as uncovered"
@@ -530,7 +685,7 @@ def fetch_prices(
         if empty_batches:
             detail_parts.append(f"empty batches: {empty_batches[:3]}")
         detail_parts.append(probe)
-        raise RuntimeError("No price data downloaded from yfinance; " + "; ".join(detail_parts))
+        raise RuntimeError("No price data downloaded from yfinance or fallback; " + "; ".join(detail_parts))
 
     px = pd.concat(frames, axis=1)
     px = px.loc[:, ~px.columns.duplicated()].sort_index()
@@ -552,8 +707,10 @@ def fetch_prices(
         "tickers_without_close": int(len(no_price)),
         "invalid_tickers_skipped": int(dropped),
         "tickers_from_cache": int(len(cached_cols)),
+        "used_chart_fallback": bool(used_chart_fallback),
         "failed_batches": failed_batches[:10],
         "empty_batches": empty_batches[:10],
+        "chart_failed_batches": chart_failed_batches[:10],
     }
     return returns
 
