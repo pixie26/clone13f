@@ -10,6 +10,9 @@ the SWEEP can treat them as hypotheses under test (see sweep.py):
 
 Standardized inputs unchanged (see data_adapters.py): holdings, prices, factors,
 optional value_scores, optional benchmark_weights (Series ticker->weight).
+
+Note: the `prices` argument is a monthly returns matrix, not price levels.
+The name is kept for call-site stability.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
@@ -60,7 +63,10 @@ class BacktestConfig:
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     cost: CostConfig = field(default_factory=CostConfig)
-    missing_price_policy: str = "raise"     # "raise" | "zero"
+    # "exit" liquidates a held name when its monthly return is missing, then
+    # redeploys into priced survivors. This reduces complete-window survivorship
+    # bias from partial yfinance histories, but is still a CRSP/WRDS placeholder.
+    missing_price_policy: str = "exit"      # "exit" | "zero" | "raise"
 
 
 # --------------------------------------------------------------------------- #
@@ -136,6 +142,10 @@ def manager_characteristics(holdings: pd.DataFrame,
              .reset_index(drop=True))
     chars["hist_q"] = chars.groupby("manager")["period_date"].rank(method="dense").astype(int)
 
+    # Known issue: prior-period turnover uses the latest version of that prior
+    # period available in the full dataset. If a prior period is amended after a
+    # decision date, this can leak a small amount of post-asof information into
+    # the turnover screen. Fix later by computing turnover as-of each rebalance.
     turn = pd.Series(np.nan, index=chars.index, dtype=float)
     for _, g in chars.groupby("manager", sort=False):
         prev_period_bw = None
@@ -153,6 +163,30 @@ def manager_characteristics(holdings: pd.DataFrame,
             current_period_latest_bw = r["bw"]
     chars["turnover"] = turn
     return chars
+
+
+def _cap_weights(w: pd.Series, cap: float) -> pd.Series:
+    """Enforce a per-name cap with iterative redistribution where feasible."""
+    w = w[w > 0].astype(float)
+    if w.empty:
+        return w
+    w = w / w.sum()
+    if cap is None or cap <= 0 or cap >= 1:
+        return w
+    if len(w) * cap <= 1.0 + 1e-12:
+        # Infeasible hard cap: not enough names to sum to one under this cap.
+        # Equal weight is the least concentrated fallback; callers can inspect
+        # effective_names vs max_name_weight in the rebalance audit.
+        return pd.Series(1.0 / len(w), index=w.index)
+    for _ in range(100):
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        free = ~over
+        excess = float(w[over].sum() - cap * over.sum())
+        w[over] = cap
+        w[free] = w[free] + w[free] / w[free].sum() * excess
+    return w
 
 
 def _book_value_pctl(w: pd.Series, vscores: pd.Series | None) -> float:
@@ -230,8 +264,7 @@ def target_weights(chars, managers, asof, cfg: PortfolioConfig) -> pd.Series:
         s = s[keep.reindex(s.index).fillna(False)]
     if s.empty:
         return s
-    s = (s / s.sum()).clip(upper=cfg.max_name_weight)
-    return s / s.sum()
+    return _cap_weights(s, cfg.max_name_weight)
 
 
 # --------------------------------------------------------------------------- #
@@ -242,28 +275,29 @@ def _rebalance_months(holdings: pd.DataFrame, prices: pd.DataFrame) -> list[pd.T
 
 
 def _apply_rebalance_target(cur: pd.Series,
-                            age: dict[str, int],
+                            last_in_tgt: dict[str, pd.Timestamp],
                             tgt: pd.Series,
-                            cfg: BacktestConfig) -> tuple[pd.Series, float, list[str]]:
+                            cfg: BacktestConfig,
+                            month: pd.Timestamp) -> tuple[pd.Series, float, list[str]]:
     tgt = tgt / tgt.sum()
-    for n in list(age):                # age everything held
-        age[n] += 1
-    for n in tgt.index:                # reset names back in target
-        age[n] = 0
+    for n in tgt.index:
+        last_in_tgt[n] = month
 
     eff = {n: float(w) for n, w in tgt.items()}
     carried: list[str] = []
     H = cfg.portfolio.holding_horizon_q
-    if H > 0:                          # carry recent names (patient capital)
-        for n, a in list(age.items()):
-            if 0 < a <= H and n not in eff and n in cur.index:
-                eff[n] = float(cur[n])
-                carried.append(n)
-    for n in [n for n, a in age.items() if a > H]:
-        age.pop(n, None)
+    cur_q = month.to_period("Q")
+    for n in list(last_in_tgt):
+        if n in eff:
+            continue
+        q_gap = (cur_q - last_in_tgt[n].to_period("Q")).n
+        if H > 0 and q_gap <= H and n in cur.index:
+            eff[n] = float(cur[n])
+            carried.append(n)
+        elif H <= 0 or q_gap > H:
+            last_in_tgt.pop(n, None)
 
-    eff_s = pd.Series(eff, dtype=float).clip(upper=cfg.portfolio.max_name_weight)
-    eff_s = eff_s / eff_s.sum()
+    eff_s = _cap_weights(pd.Series(eff, dtype=float), cfg.portfolio.max_name_weight)
     alln = eff_s.index.union(cur.index)
     traded = 0.5 * (eff_s.reindex(alln).fillna(0) - cur.reindex(alln).fillna(0)).abs().sum()
     return eff_s, float(traded), carried
@@ -276,16 +310,24 @@ def _apply_monthly_returns(cur: pd.Series,
     if not len(cur):
         return cur, 0.0
     r = prices.loc[month, cur.index]
-    missing = r[r.isna()].index.tolist()
-    if missing:
-        if cfg.missing_price_policy == "raise":
-            sample = ", ".join(map(str, missing[:10]))
+    missing = r[r.isna()].index
+    if len(missing):
+        policy = cfg.missing_price_policy
+        if policy == "raise":
+            sample = ", ".join(map(str, list(missing)[:10]))
             raise ValueError(
                 f"Missing returns for {len(missing)} held names on {month.date()}: {sample}"
             )
-        if cfg.missing_price_policy != "zero":
-            raise ValueError(f"Unknown missing_price_policy={cfg.missing_price_policy!r}")
-        r = r.fillna(0.0)
+        if policy == "zero":
+            r = r.fillna(0.0)
+        elif policy == "exit":
+            keep = r.index.difference(missing)
+            if len(keep) == 0:
+                return pd.Series(dtype=float), 0.0
+            cur = cur[keep]
+            r = r[keep]
+        else:
+            raise ValueError(f"Unknown missing_price_policy={policy!r}")
     net = float((cur * r).sum())
     grown = cur * (1.0 + r)
     return (grown / grown.sum() if grown.sum() > 0 else cur), net
@@ -300,7 +342,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
     rebal_months = set(_rebalance_months(holdings, prices))
 
     cur = pd.Series(dtype=float)
-    age: dict[str, int] = {}
+    last_in_tgt: dict[str, pd.Timestamp] = {}
     summary_rows: list[dict] = []
     holding_rows: list[dict] = []
     manager_rows: list[dict] = []
@@ -316,7 +358,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
 
         tgt = target_weights(chars, managers, m, cfg.portfolio)
         target_names_before_price_filter = int(len(tgt))
-        tgt = tgt[tgt.index.isin(prices.columns)]
+        priced_now = prices.columns[prices.loc[m].notna()]
+        tgt = tgt[tgt.index.isin(priced_now)]
         if tgt.sum() <= 0:
             summary_rows.append({
                 "rebalance_month": m.date().isoformat(),
@@ -332,7 +375,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             })
             continue
 
-        eff, traded, carried = _apply_rebalance_target(cur, age, tgt, cfg)
+        eff, traded, carried = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m)
         cost_bps = traded * cfg.cost.bps_per_side
         top = eff.sort_values(ascending=False).head(12)
         summary_rows.append({
@@ -374,7 +417,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
     rebal_months = set(_rebalance_months(holdings, prices))
 
     cur = pd.Series(dtype=float)
-    age: dict[str, int] = {}
+    last_in_tgt: dict[str, pd.Timestamp] = {}
     net = pd.Series(0.0, index=months)
 
     for m in months:
@@ -382,9 +425,10 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
         if m in rebal_months:
             u = select_universe(chars, m, cfg.universe, value_scores)
             tgt = target_weights(chars, u, m, cfg.portfolio)
-            tgt = tgt[tgt.index.isin(prices.columns)]
+            priced_now = prices.columns[prices.loc[m].notna()]
+            tgt = tgt[tgt.index.isin(priced_now)]
             if tgt.sum() > 0:
-                eff, traded, _ = _apply_rebalance_target(cur, age, tgt, cfg)
+                eff, traded, _ = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m)
                 net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
                 cur = eff
     return net
@@ -394,35 +438,55 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
 def attribution(port_ret, factors, benchmark=None,
                 factor_cols=("MKT", "SMB", "HML", "RMW", "CMA", "MOM")) -> dict:
     factors = factors if factors is not None else pd.DataFrame(index=port_ret.index)
-    df = pd.concat([port_ret.rename("ret"), factors], axis=1).dropna(subset=["ret"])
+    df = pd.concat([port_ret.rename("ret"), factors], axis=1)
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["ret"])
     if len(df) < 12:
         return {"n_months": len(df), "note": "insufficient overlap"}
     if "RF" in df:
-        y = df["ret"] - df["RF"]
+        y_basic = (df["ret"] - df["RF"]).replace([np.inf, -np.inf], np.nan).dropna()
     else:
-        y = df["ret"]
+        y_basic = df["ret"].replace([np.inf, -np.inf], np.nan).dropna()
     out = {
         "n_months": len(df),
         "ann_return": (1 + df["ret"]).prod() ** (12 / len(df)) - 1,
         "ann_vol": df["ret"].std() * np.sqrt(12),
-        "sharpe": (y.mean() / y.std()) * np.sqrt(12) if y.std() else np.nan,
+        "sharpe": (y_basic.mean() / y_basic.std()) * np.sqrt(12) if y_basic.std() else np.nan,
     }
     missing_factor_cols = [c for c in factor_cols if c not in df.columns]
     if "RF" not in df.columns or missing_factor_cols:
         out["note"] = "factor regression unavailable"
         if benchmark is not None:
-            active = (df["ret"] - benchmark.reindex(df.index)).dropna()
+            active = pd.concat([df["ret"], benchmark.reindex(df.index).rename("bench")], axis=1)
+            active = active.replace([np.inf, -np.inf], np.nan).dropna()
+            active = active["ret"] - active["bench"]
             out["ir_vs_benchmark"] = (active.mean() / active.std()) * np.sqrt(12) if active.std() else np.nan
         return out
 
-    res = sm.OLS(y, sm.add_constant(df[list(factor_cols)])).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
+    reg_cols = ["ret", "RF", *factor_cols]
+    reg_df = df[reg_cols].replace([np.inf, -np.inf], np.nan).dropna()
+    out["factor_months_used"] = int(len(reg_df))
+    min_reg_months = len(factor_cols) + 3
+    if len(reg_df) < min_reg_months:
+        out["note"] = "factor regression unavailable: insufficient complete factor rows"
+        if benchmark is not None:
+            active = pd.concat([df["ret"], benchmark.reindex(df.index).rename("bench")], axis=1)
+            active = active.replace([np.inf, -np.inf], np.nan).dropna()
+            active = active["ret"] - active["bench"]
+            out["ir_vs_benchmark"] = (active.mean() / active.std()) * np.sqrt(12) if active.std() else np.nan
+        return out
+
+    y = reg_df["ret"] - reg_df["RF"]
+    x = sm.add_constant(reg_df[list(factor_cols)], has_constant="add")
+    res = sm.OLS(y, x).fit(cov_type="HAC", cov_kwds={"maxlags": min(6, len(reg_df) - 1)})
     out.update({
         "ann_alpha": (1 + res.params["const"]) ** 12 - 1,
         "alpha_t": res.tvalues["const"],
         "betas": {c: res.params[c] for c in factor_cols},
     })
     if benchmark is not None:
-        active = (df["ret"] - benchmark.reindex(df.index)).dropna()
+        active = pd.concat([df["ret"], benchmark.reindex(df.index).rename("bench")], axis=1)
+        active = active.replace([np.inf, -np.inf], np.nan).dropna()
+        active = active["ret"] - active["bench"]
         out["ir_vs_benchmark"] = (active.mean() / active.std()) * np.sqrt(12) if active.std() else np.nan
     return out
 

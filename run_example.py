@@ -38,10 +38,11 @@ from sweep import deflated_sharpe, grid_eval, walk_forward
 LIVE_CONFIG = {
     "identity": "YourName you@firm.com",
     "openfigi_key": None,
-    "sec_history_start": "2024-01-01",
-    "start": "2025-01-01",
-    "end": "2026-03-31",
-    "benchmark_ticker": "IWD",
+    "sec_history_start": "2013-10-01",
+    "start": "2015-01-01",
+    "end": "2026-05-31",
+    # Broad-market total-return proxy. Use QQQ for a tighter growth-style proxy.
+    "benchmark_ticker": "SPY",
     "min_aum": 1e9,
     "max_aum": 30e9,
     "max_holdings": 60,
@@ -259,11 +260,11 @@ def build_live_data(
     try:
         factors = da.fetch_factors(cfg["start"], cfg["end"])
         print(f"    factors: {len(factors)} monthly rows")
-    except ModuleNotFoundError as exc:
+    except Exception as exc:
         if cfg.get("require_factors"):
             raise
         print(f"    [warn] {exc}")
-        print("    [warn] continuing without factor regression; install dependency for FF attribution")
+        print("    [warn] continuing without factor regression; verify factor source/dependency for FF attribution")
         factors = pd.DataFrame(index=prices.index)
         factors.attrs["factor_diagnostics"] = {"available": False, "reason": str(exc)}
     print(f"[1/6] Downloading benchmark prices: {cfg['benchmark_ticker']}")

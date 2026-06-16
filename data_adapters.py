@@ -701,23 +701,36 @@ def fetch_prices(
 
     monthly = px.resample("ME").last()
     returns = monthly.pct_change(fill_method=None).iloc[1:]
-    incomplete_return_cols = sorted(returns.columns[returns.isna().any()].tolist())
-    if incomplete_return_cols:
-        returns = returns.drop(columns=incomplete_return_cols)
-        sample = ", ".join(incomplete_return_cols[:20])
+    # Keep partial-history tickers. Dropping any column with a single NaN creates
+    # a complete-window survivor universe. The engine handles per-month gaps with
+    # missing_price_policy, and rebalance logic filters names that are not priced
+    # on the rebalance month.
+    all_nan_return_cols = sorted(returns.columns[returns.isna().all()].tolist())
+    if all_nan_return_cols:
+        returns = returns.drop(columns=all_nan_return_cols)
+        sample = ", ".join(all_nan_return_cols[:20])
         print(
             "  [warn] price coverage: "
-            f"dropped {len(incomplete_return_cols)}/{px.shape[1]} tickers with incomplete monthly returns; "
+            f"dropped {len(all_nan_return_cols)}/{px.shape[1]} tickers with no monthly returns; "
             f"sample: {sample}"
         )
+    partial_return_cols = sorted(returns.columns[returns.isna().any()].tolist())
+    if partial_return_cols:
+        sample = ", ".join(partial_return_cols[:20])
+        print(
+            "  [info] price coverage: "
+            f"keeping {len(partial_return_cols)}/{returns.shape[1]} tickers with partial monthly "
+            f"history; engine exits or skips them in gap months; sample: {sample}"
+        )
     if returns.empty:
-        raise RuntimeError("All downloaded yfinance price columns had incomplete monthly returns.")
+        raise RuntimeError("All downloaded yfinance price columns had no monthly returns.")
     returns.attrs["price_diagnostics"] = {
         "tickers_requested": int(len(clean)),
         "tickers_with_close": int(px.shape[1]),
-        "tickers_with_complete_returns": int(returns.shape[1]),
+        "tickers_with_complete_returns": int(returns.notna().all().sum()),
+        "tickers_with_partial_returns": int(len(partial_return_cols)),
         "tickers_without_close": int(len(no_price)),
-        "tickers_incomplete_returns": int(len(incomplete_return_cols)),
+        "tickers_no_returns_dropped": int(len(all_nan_return_cols)),
         "invalid_tickers_skipped": int(dropped),
         "tickers_from_cache": int(len(cached_cols)),
         "used_chart_fallback": bool(used_chart_fallback),

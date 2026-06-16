@@ -13,7 +13,9 @@ Key fixes vs the initial version:
 from __future__ import annotations
 
 import calendar
+import hashlib
 import io
+import json
 import os
 import re
 import time
@@ -27,6 +29,7 @@ import pandas as pd
 SEC_13F_BASE = "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/"
 SEC_13F_LANDING = "https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets"
 PARSED_CACHE_VERSION = "v2"
+PROCESSED_UNIVERSE_CACHE_VERSION = "u1"
 
 # Fallback only. The downloader first tries to scrape the official SEC landing page.
 LEGACY_URL_PATTERN = SEC_13F_BASE + "{y}q{q}_form13f.zip"
@@ -50,6 +53,41 @@ def _headers(identity: str) -> dict[str, str]:
 
 class SecDateParseError(ValueError):
     """Raised when an SEC date column fails deterministic parsing."""
+
+
+def _json_default(obj):
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _processed_universe_cache_path(
+    cache_dir: str | None,
+    *,
+    report_start: pd.Timestamp,
+    report_end: pd.Timestamp,
+    filing_start: pd.Timestamp,
+    filing_end: pd.Timestamp,
+    datasets: list[DatasetURL],
+    prefilter_kw: dict,
+) -> str | None:
+    if not cache_dir:
+        return None
+    payload = {
+        "cache_version": PROCESSED_UNIVERSE_CACHE_VERSION,
+        "parsed_cache_version": PARSED_CACHE_VERSION,
+        "report_start": report_start,
+        "report_end": report_end,
+        "filing_start": filing_start,
+        "filing_end": filing_end,
+        "datasets": sorted("|".join(map(str, _dataset_identity(d))) for d in datasets),
+        "prefilter_kw": {k: prefilter_kw[k] for k in sorted(prefilter_kw)},
+    }
+    blob = json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")
+    digest = hashlib.sha256(blob).hexdigest()[:16]
+    return os.path.join(cache_dir, f"processed_universe.{digest}.{PROCESSED_UNIVERSE_CACHE_VERSION}.parquet")
 
 
 def _sec_date(
@@ -136,6 +174,37 @@ def _infer_window_from_url(url: str) -> tuple[pd.Timestamp | None, pd.Timestamp 
     return None, None
 
 
+def _dataset_identity(d: DatasetURL) -> tuple[str, str] | tuple[str, str, str]:
+    if d.window_start is not None and d.window_end is not None:
+        return ("window", d.window_start.strftime("%Y-%m-%d"), d.window_end.strftime("%Y-%m-%d"))
+    return ("url", d.url.rsplit("/", 1)[-1].lower())
+
+
+def _dataset_preference(d: DatasetURL) -> int:
+    if SEC_13F_BASE in d.url:
+        return 0
+    if OLDER_DERA_PATTERN.rsplit("{", 1)[0] in d.url:
+        return 1
+    return 2
+
+
+def _dedupe_dataset_urls(datasets: list[DatasetURL]) -> list[DatasetURL]:
+    by_id: dict[tuple, DatasetURL] = {}
+    for d in datasets:
+        key = _dataset_identity(d)
+        current = by_id.get(key)
+        if current is None or _dataset_preference(d) < _dataset_preference(current):
+            by_id[key] = d
+    return sorted(
+        by_id.values(),
+        key=lambda d: (
+            d.window_start if d.window_start is not None else pd.Timestamp.max,
+            d.window_end if d.window_end is not None else pd.Timestamp.max,
+            d.url,
+        ),
+    )
+
+
 def discover_dataset_urls(identity: str, filing_start: str | pd.Timestamp, filing_end: str | pd.Timestamp) -> list[DatasetURL]:
     """
     Scrape the official SEC landing page for available 13F ZIPs. Falls back to
@@ -173,7 +242,7 @@ def discover_dataset_urls(identity: str, filing_start: str | pd.Timestamp, filin
         old_url = OLDER_DERA_PATTERN.format(y=y, q=q)
         found.setdefault(old_url, DatasetURL(old_url, ws, we))
 
-    return list(found.values())
+    return _dedupe_dataset_urls(list(found.values()))
 
 
 def filing_quarters_between(start: str | pd.Timestamp, end: str | pd.Timestamp) -> list[tuple[int, int]]:
@@ -332,20 +401,36 @@ def coarse_prefilter(holdings: pd.DataFrame,
                      max_put_weight=0.10) -> pd.DataFrame:
     """Coarse, point-in-time filing-level screen before the engine's final screen."""
     h = holdings.copy()
-    g = h[h.sec_type == "SH"].groupby(["cik", "period_date"])
+    # Screen on one filing version per (cik, period). If original and amended
+    # accessions are both present, summing all rows doubles AUM and dilutes PUT
+    # weight. Use the latest accession for screening stats, then keep all
+    # versions of surviving periods so the engine can still apply filing-date PIT.
+    key = ["cik", "period_date"]
+    if "accession_number" in h.columns:
+        versions = (
+            h[key + ["filing_date", "accession_number"]]
+            .drop_duplicates()
+            .sort_values(key + ["filing_date", "accession_number"])
+        )
+        latest_acc = versions.groupby(key, as_index=False).tail(1)[key + ["accession_number"]]
+        hv = h.merge(latest_acc, on=key + ["accession_number"], how="inner")
+    else:
+        hv = h
+
+    g = hv[hv.sec_type == "SH"].groupby(key)
     stats = g.agg(aum=("value", "sum"), n=("cusip", "nunique")).reset_index()
-    tot = h.groupby(["cik", "period_date"])["value"].sum().rename("tot").reset_index()
-    putv = (h[h.sec_type == "PUT"].groupby(["cik", "period_date"])["value"].sum()
+    tot = hv.groupby(key)["value"].sum().rename("tot").reset_index()
+    putv = (hv[hv.sec_type == "PUT"].groupby(key)["value"].sum()
             .rename("putv").reset_index())
-    stats = (stats.merge(tot, on=["cik", "period_date"], how="left")
-                  .merge(putv, on=["cik", "period_date"], how="left")
+    stats = (stats.merge(tot, on=key, how="left")
+                  .merge(putv, on=key, how="left")
                   .fillna({"putv": 0}))
     stats["put_w"] = stats["putv"] / stats["tot"].replace(0, np.nan)
     ok = stats[(stats.aum.between(min_aum, max_aum)) &
                (stats.n <= max_holdings) &
-               (stats.put_w.fillna(0) <= max_put_weight)][["cik", "period_date"]]
-    kept = h.merge(ok, on=["cik", "period_date"], how="inner")
-    n_before = holdings[["cik", "period_date"]].drop_duplicates().shape[0]
+               (stats.put_w.fillna(0) <= max_put_weight)][key]
+    kept = h.merge(ok, on=key, how="inner")
+    n_before = holdings[key].drop_duplicates().shape[0]
     n_after = ok.shape[0]
     print(f"  coarse prefilter: {n_before} -> {n_after} filings "
           f"({kept['cik'].nunique()} distinct filers survive)")
@@ -370,7 +455,11 @@ def build_holdings_universe(start: str, end: str, identity: str,
     # 13F filings arrive after quarter-end. Use the actual target quarter-ends,
     # not the raw start date, or arbitrary Jan/Apr/Jul starts pull unrelated
     # filing-window archives.
-    filing_start = min(report_periods)
+    # Filings for a report quarter become available after the report period end.
+    # Starting the filing window on the quarter-end itself pulls the prior filing
+    # archive for legacy YYYYqN files (for example 2013q4 for a 2013-12-31 report
+    # period), which contains no in-range report rows.
+    filing_start = min(report_periods) + pd.Timedelta(days=1)
     filing_end = max(report_periods) + pd.Timedelta(days=75)
     print(
         "  target report periods: "
@@ -383,14 +472,30 @@ def build_holdings_universe(start: str, end: str, identity: str,
         raise RuntimeError("No SEC 13F dataset URLs discovered.")
     print(f"  SEC datasets selected: {len(datasets)}")
 
+    universe_cache_path = _processed_universe_cache_path(
+        cache_dir,
+        report_start=report_start,
+        report_end=report_end,
+        filing_start=filing_start,
+        filing_end=filing_end,
+        datasets=datasets,
+        prefilter_kw=prefilter_kw,
+    )
+    if universe_cache_path and os.path.exists(universe_cache_path):
+        allh = pd.read_parquet(universe_cache_path)
+        print(f"  processed universe cache hit: {universe_cache_path}")
+        print(f"  holdings rows after accession/CUSIP/sec_type de-dup: {len(allh)}")
+        return allh
+
     frames = []
     raw_rows = 0
     dedup_rows = 0
-    seen_urls: set[str] = set()
+    seen_datasets: set[tuple] = set()
     for d in datasets:
-        if d.url in seen_urls:
+        dataset_key = _dataset_identity(d)
+        if dataset_key in seen_datasets:
             continue
-        seen_urls.add(d.url)
+        seen_datasets.add(dataset_key)
         fname = d.url.rsplit("/", 1)[-1].replace("_form13f.zip", "")
         cpath = os.path.join(cache_dir, f"{fname}.{PARSED_CACHE_VERSION}.parquet") if cache_dir else None
         if cpath and os.path.exists(cpath):
@@ -442,4 +547,7 @@ def build_holdings_universe(start: str, end: str, identity: str,
     allh = (allh.sort_values(["cik", "period_date", "filing_date"])
                 .drop_duplicates(["accession_number", "cusip", "sec_type"], keep="last"))
     print(f"  holdings rows after accession/CUSIP/sec_type de-dup: {len(allh)}")
+    if universe_cache_path:
+        allh.to_parquet(universe_cache_path)
+        print(f"  processed universe cached: {universe_cache_path}")
     return allh

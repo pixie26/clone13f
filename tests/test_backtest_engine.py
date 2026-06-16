@@ -15,7 +15,7 @@ from data_adapters import (
     mapping_diagnostics,
     priceable_holdings,
 )
-from engine import BacktestConfig, PortfolioConfig, UniverseConfig, attribution, rebalance_trace, run_backtest
+from engine import BacktestConfig, PortfolioConfig, UniverseConfig, _cap_weights, attribution, rebalance_trace, run_backtest
 from sweep import deflated_sharpe
 
 
@@ -44,11 +44,142 @@ def test_run_backtest_raises_on_missing_held_return():
             use_low_turnover=False,
             use_hedge_filter=False,
             use_value_tilt=False,
-        )
+        ),
+        missing_price_policy="raise",
     )
 
     with pytest.raises(ValueError, match="Missing returns"):
         run_backtest(holdings, prices, cfg)
+
+
+def test_run_backtest_exits_missing_held_return_by_default():
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-01-31"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 100.0,
+                "sec_type": "SH",
+            }
+        ]
+    )
+    prices = pd.DataFrame({"A": [0.01, np.nan]}, index=pd.to_datetime(["2020-01-31", "2020-02-29"]))
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        )
+    )
+
+    ret = run_backtest(holdings, prices, cfg)
+
+    assert ret.loc[pd.Timestamp("2020-02-29")] == 0.0
+
+
+def test_rebalance_skips_target_without_current_month_price():
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-02-15"),
+                "accession_number": "a2",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+        ]
+    )
+    prices = pd.DataFrame({"A": [0.0, np.nan]}, index=pd.to_datetime(["2020-01-31", "2020-02-29"]))
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        )
+    )
+
+    trace = rebalance_trace(holdings, prices, cfg)
+    feb = trace["summary"][trace["summary"]["rebalance_month"].eq("2020-02-29")].iloc[0]
+
+    assert feb["target_names"] == 0
+    assert feb["effective_names"] == 0
+
+
+def test_cap_weights_enforces_feasible_name_cap():
+    capped = _cap_weights(pd.Series({"A": 0.60, "B": 0.20, "C": 0.10, "D": 0.06, "E": 0.04}), 0.25)
+
+    assert capped.sum() == pytest.approx(1.0)
+    assert capped.max() <= 0.25 + 1e-12
+
+
+def test_holding_horizon_is_measured_in_quarters_not_rebalance_events():
+    rows = [
+        ("m1", "2019-12-31", "2020-01-15", "a1", "A"),
+        ("m1", "2020-03-31", "2020-04-15", "a2", "B"),
+        ("m2", "2020-03-31", "2020-05-15", "a3", "C"),
+        ("m3", "2020-03-31", "2020-06-15", "a4", "D"),
+        ("m4", "2020-06-30", "2020-07-15", "a5", "E"),
+    ]
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": manager,
+                "period_date": pd.Timestamp(period),
+                "filing_date": pd.Timestamp(filing),
+                "accession_number": accession,
+                "submission_type": "13F-HR",
+                "ticker": ticker,
+                "value": 100.0,
+                "sec_type": "SH",
+            }
+            for manager, period, filing, accession, ticker in rows
+        ]
+    )
+    prices = pd.DataFrame(
+        0.0,
+        index=pd.date_range("2020-01-31", "2020-07-31", freq="ME"),
+        columns=list("ABCDE"),
+    )
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(top_n_ideas=1, min_consensus_funds=1, max_name_weight=1.0, holding_horizon_q=2),
+    )
+
+    trace = rebalance_trace(holdings, prices, cfg)
+    july_holdings = trace["holdings"][trace["holdings"]["rebalance_month"].eq("2020-07-31")]
+
+    assert "A" in july_holdings["ticker"].tolist()
+    assert bool(july_holdings.loc[july_holdings["ticker"].eq("A"), "is_carried"].iat[0]) is True
 
 
 def test_rebalance_trace_reports_auditable_rebalance_fields():
@@ -211,6 +342,31 @@ def test_attribution_without_factors_reports_basic_metrics():
     assert "ann_alpha" not in out
 
 
+def test_attribution_drops_nan_factor_rows_before_ols():
+    idx = pd.date_range("2020-01-31", periods=14, freq="ME")
+    ret = pd.Series([0.01] * 14, index=idx)
+    factors = pd.DataFrame(
+        {
+            "RF": [0.001] * 14,
+            "MKT": [0.01] * 14,
+            "SMB": [0.0] * 14,
+            "HML": [0.0] * 14,
+            "RMW": [0.0] * 14,
+            "CMA": [0.0] * 14,
+            "MOM": [0.0] * 14,
+        },
+        index=idx,
+    )
+    factors.loc[idx[2], "MOM"] = np.nan
+    factors.loc[idx[4], "SMB"] = np.inf
+
+    out = attribution(ret, factors)
+
+    assert out["n_months"] == 14
+    assert out["factor_months_used"] == 12
+    assert "ann_alpha" in out
+
+
 def test_parse_ken_french_monthly_csv():
     text = (
         "header\n"
@@ -298,14 +454,14 @@ def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypat
     assert returns.iloc[-1].tolist() == pytest.approx([0.1, 0.1])
 
 
-def test_fetch_prices_drops_incomplete_monthly_return_columns(monkeypatch):
-    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
+def test_fetch_prices_keeps_partial_monthly_return_columns(monkeypatch):
+    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31", "2025-04-30"])
 
     def fake_yf_download_close(yf, batch, start, end):
         return pd.DataFrame(
             {
-                "AAPL": [100.0, 110.0, 121.0],
-                "MSFT": [100.0, np.nan, 121.0],
+                "AAPL": [100.0, 110.0, 121.0, 133.1],
+                "MSFT": [100.0, 110.0, np.nan, 121.0],
             },
             index=dates,
         )
@@ -320,10 +476,12 @@ def test_fetch_prices_drops_incomplete_monthly_return_columns(monkeypatch):
         max_retries=0,
     )
 
-    assert returns.columns.tolist() == ["AAPL"]
+    assert returns.columns.tolist() == ["AAPL", "MSFT"]
+    assert returns["MSFT"].isna().any()
     assert returns.attrs["price_diagnostics"]["tickers_with_close"] == 2
     assert returns.attrs["price_diagnostics"]["tickers_with_complete_returns"] == 1
-    assert returns.attrs["price_diagnostics"]["tickers_incomplete_returns"] == 1
+    assert returns.attrs["price_diagnostics"]["tickers_with_partial_returns"] == 1
+    assert returns.attrs["price_diagnostics"]["tickers_no_returns_dropped"] == 0
 
 
 def test_deflated_sharpe_reports_trials_when_oos_is_insufficient():
