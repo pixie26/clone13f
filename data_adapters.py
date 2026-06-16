@@ -107,21 +107,26 @@ def _normalise_close_frame(raw: pd.DataFrame, tickers: list[str]) -> pd.DataFram
     if raw is None or raw.empty:
         return pd.DataFrame()
     if isinstance(raw.columns, pd.MultiIndex):
-        if "Close" not in raw.columns.get_level_values(0):
+        if "Close" in raw.columns.get_level_values(0):
+            close = raw["Close"]
+        elif "Close" in raw.columns.get_level_values(1):
+            close = raw.xs("Close", axis=1, level=1)
+        else:
             return pd.DataFrame()
-        close = raw["Close"]
     elif "Close" in raw.columns:
         close = raw["Close"]
     else:
         return pd.DataFrame()
     if isinstance(close, pd.Series):
         close = close.to_frame(tickers[0])
+    if isinstance(close.columns, pd.MultiIndex):
+        close.columns = close.columns.get_level_values(-1)
     close.columns = [str(c).strip().upper() for c in close.columns]
     return close
 
 
 def _yf_download_close(yf, batch: list[str], start: str, end: str) -> pd.DataFrame:
-    kwargs = dict(start=start, end=end, auto_adjust=True, progress=False, threads=True)
+    kwargs = dict(start=start, end=end, auto_adjust=True, progress=False, threads=True, group_by="column")
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             raw = yf.download(batch, timeout=30, **kwargs)
@@ -134,6 +139,19 @@ def _yf_download_close(yf, batch: list[str], start: str, end: str) -> pd.DataFra
 def _looks_rate_limited(exc: Exception) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
     return "ratelimit" in text or "rate limit" in text or "too many requests" in text or "429" in text
+
+
+def _yfinance_probe(yf, start: str, end: str) -> str:
+    try:
+        close = _yf_download_close(yf, ["SPY", "IWD", "AAPL"], start, end)
+    except Exception as exc:
+        return f"probe_exception={type(exc).__name__}: {exc}"
+    if close.empty:
+        return "probe_empty_close"
+    non_empty = close.dropna(axis=1, how="all").columns.tolist()
+    if not non_empty:
+        return "probe_all_nan_close"
+    return f"probe_ok={','.join(map(str, non_empty))}"
 
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +410,7 @@ def fetch_prices(
 
     frames: list[pd.DataFrame] = []
     failed_batches: list[str] = []
+    empty_batches: list[str] = []
     n_batches = int(np.ceil(len(clean) / batch_size))
     print(f"  price download: {len(clean)} tickers in {n_batches} batches")
     for i in range(0, len(clean), batch_size):
@@ -403,6 +422,19 @@ def fetch_prices(
                 close = _yf_download_close(yf, batch, start, end)
                 if not close.empty:
                     frames.append(close)
+                    if close.dropna(axis=1, how="all").empty:
+                        empty_batches.append(f"{batch[0]}..{batch[-1]}: all_nan_close")
+                    break
+                last_attempt = attempt >= max_retries
+                if not last_attempt:
+                    wait = min(15 * (attempt + 1), rate_limit_sleep)
+                    print(
+                        "    [warn] yfinance returned empty Close frame; "
+                        f"sleeping {wait}s before retry {attempt + 1}/{max_retries}"
+                    )
+                    time.sleep(wait)
+                    continue
+                empty_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
                 break
             except Exception as exc:
                 last_attempt = attempt >= max_retries
@@ -420,8 +452,14 @@ def fetch_prices(
         time.sleep(0.1)
 
     if not frames:
-        detail = f"; failed batches: {failed_batches[:3]}" if failed_batches else ""
-        raise RuntimeError(f"No price data downloaded from yfinance{detail}")
+        probe = _yfinance_probe(yf, start, end)
+        detail_parts = []
+        if failed_batches:
+            detail_parts.append(f"failed batches: {failed_batches[:3]}")
+        if empty_batches:
+            detail_parts.append(f"empty batches: {empty_batches[:3]}")
+        detail_parts.append(probe)
+        raise RuntimeError("No price data downloaded from yfinance; " + "; ".join(detail_parts))
 
     px = pd.concat(frames, axis=1)
     px = px.loc[:, ~px.columns.duplicated()].sort_index()
@@ -443,6 +481,7 @@ def fetch_prices(
         "tickers_without_close": int(len(no_price)),
         "invalid_tickers_skipped": int(dropped),
         "failed_batches": failed_batches[:10],
+        "empty_batches": empty_batches[:10],
     }
     return returns
 

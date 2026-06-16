@@ -4,6 +4,7 @@ import pytest
 
 from data_adapters import (
     _is_yfinance_ticker,
+    _normalise_close_frame,
     _parse_ken_french_monthly_csv,
     _select_openfigi_ticker,
     align_holdings_to_prices,
@@ -147,3 +148,15 @@ def test_parse_ken_french_monthly_csv():
     assert parsed.index.tolist() == [pd.Timestamp("2025-01-31"), pd.Timestamp("2025-02-28")]
     assert parsed.loc[pd.Timestamp("2025-01-31"), "Mkt-RF"] == 0.01
     assert parsed.loc[pd.Timestamp("2025-02-28"), "RF"] == 0.002
+
+
+def test_normalise_close_frame_accepts_ticker_first_yfinance_columns():
+    cols = pd.MultiIndex.from_tuples(
+        [("AAPL", "Open"), ("AAPL", "Close"), ("MSFT", "Close")]
+    )
+    raw = pd.DataFrame([[100.0, 101.0, 201.0]], columns=cols, index=pd.to_datetime(["2025-01-02"]))
+
+    close = _normalise_close_frame(raw, ["AAPL", "MSFT"])
+
+    assert close.columns.tolist() == ["AAPL", "MSFT"]
+    assert close.iloc[0].tolist() == [101.0, 201.0]
