@@ -14,6 +14,7 @@ import os
 import pathlib
 import platform
 import subprocess
+import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
@@ -26,6 +27,7 @@ from engine import (
     PortfolioConfig,
     UniverseConfig,
     attribution,
+    build_visible_versions_cache,
     manager_characteristics,
     marginal_ir,
     rebalance_trace,
@@ -377,6 +379,7 @@ def write_rebalance_outputs(
     value_scores=None,
     benchmark_weights=None,
     chars=None,
+    visible_versions_cache=None,
 ) -> dict[str, str]:
     trace = rebalance_trace(
         holdings,
@@ -385,6 +388,7 @@ def write_rebalance_outputs(
         value_scores=value_scores,
         benchmark_weights=benchmark_weights,
         chars=chars,
+        visible_versions_cache=visible_versions_cache,
     )
     outputs: dict[str, str] = {}
     for name, df in trace.items():
@@ -415,8 +419,12 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(LIVE_CONFIG)
 
     print("[2/6] Computing per-manager characteristics")
+    t_step = time.perf_counter()
     chars = manager_characteristics(holdings, bench_w)
-    print(f"    {len(chars)} manager-filing-version rows")
+    print(f"    {len(chars)} manager-filing-version rows in {time.perf_counter() - t_step:.1f}s")
+    t_step = time.perf_counter()
+    visible_cache = build_visible_versions_cache(chars, prices.index)
+    print(f"    {len(visible_cache)} month-end visible-version snapshots in {time.perf_counter() - t_step:.1f}s")
 
     cfg_a = BacktestConfig(
         universe=UniverseConfig(
@@ -449,10 +457,18 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     )
 
     print("[3/6] Running thesis and placebo backtests")
-    ret_a = run_backtest(holdings, prices, cfg_a, value_scores, bench_w, chars)
-    ret_b = run_backtest(holdings, prices, cfg_b, value_scores, bench_w, chars)
+    t_step = time.perf_counter()
+    print("    thesis backtest running")
+    ret_a = run_backtest(holdings, prices, cfg_a, value_scores, bench_w, chars, visible_cache)
+    print(f"    thesis backtest done in {time.perf_counter() - t_step:.1f}s")
+    t_placebo = time.perf_counter()
+    print("    placebo backtest running")
+    ret_b = run_backtest(holdings, prices, cfg_b, value_scores, bench_w, chars, visible_cache)
+    print(f"    placebo backtest done in {time.perf_counter() - t_placebo:.1f}s")
+    print("    attribution running")
     att_a = attribution(ret_a, factors, bench_ret)
     att_b = attribution(ret_b, factors, bench_ret)
+    print(f"    thesis/placebo + attribution done in {time.perf_counter() - t_step:.1f}s")
     for label, att in (("Thesis", att_a), ("Placebo", att_b)):
         print(f"\n  {label}")
         for key in ["ann_return", "ann_vol", "sharpe", "ann_alpha", "alpha_t", "ir_vs_benchmark"]:
@@ -460,7 +476,20 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             print(f"  {key:<22} {round(val, 3) if isinstance(val, float) else val}")
 
     print("\n[4/6] Marginal-IR ablation")
-    ablation = marginal_ir(holdings, prices, factors, cfg_a, bench_ret, value_scores, bench_w)
+    t_step = time.perf_counter()
+    ablation = marginal_ir(
+        holdings,
+        prices,
+        factors,
+        cfg_a,
+        bench_ret,
+        value_scores,
+        bench_w,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+        verbose=True,
+    )
+    print(f"  marginal-ir total time {time.perf_counter() - t_step:.1f}s")
     print(ablation.to_string(index=False))
 
     print("\n[5/6] Grid eval and walk-forward sweep")
@@ -470,7 +499,21 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         ("portfolio", "top_n_ideas"): [5, 8],
         ("universe", "turnover_quantile"): [0.34, 0.50],
     }
-    grid = grid_eval(holdings, prices, factors, cfg_a, axes, bench_ret, value_scores, bench_w)
+    t_step = time.perf_counter()
+    grid = grid_eval(
+        holdings,
+        prices,
+        factors,
+        cfg_a,
+        axes,
+        bench_ret,
+        value_scores,
+        bench_w,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+        verbose=True,
+    )
+    print(f"  grid eval total time {time.perf_counter() - t_step:.1f}s")
     train_m, test_m = 48, 12
     required_m = train_m + test_m
     if len(prices) >= required_m:
@@ -485,6 +528,9 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             bench_w,
             train_m=train_m,
             test_m=test_m,
+            chars=chars,
+            visible_versions_cache=visible_cache,
+            verbose=True,
         )
         dsr = deflated_sharpe(
             oos_ret,
@@ -542,6 +588,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         value_scores=value_scores,
         benchmark_weights=bench_w,
         chars=chars,
+        visible_versions_cache=visible_cache,
     )
     print(f"  Saved rebalance summary:  {rebalance_outputs['summary']}")
     print(f"  Saved rebalance holdings: {rebalance_outputs['holdings']}")

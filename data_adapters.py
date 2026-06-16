@@ -271,6 +271,9 @@ def _fetch_yahoo_chart_batches(
         else:
             frames.append(non_nan_close)
             _write_price_cache(cache_path, non_nan_close)
+            _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched")
+            no_close_in_batch = sorted(set(batch) - set(non_nan_close.columns))
+            _write_price_coverage(cache_path, no_close_in_batch, start, end, "no_close")
         time.sleep(0.1)
     return frames, failed_batches
 
@@ -291,6 +294,79 @@ def _load_price_cache(cache_path: str | Path | None, start: str, end: str) -> pd
     px.columns = [str(c).strip().upper() for c in px.columns]
     s, e = pd.Timestamp(start), pd.Timestamp(end)
     return px.loc[(px.index >= s) & (px.index <= e)]
+
+
+def _price_coverage_cache_path(cache_path: str | Path | None) -> Path | None:
+    if cache_path is None:
+        return None
+    path = Path(cache_path)
+    return path.with_name(path.stem + "_coverage" + path.suffix)
+
+
+def _load_price_coverage(cache_path: str | Path | None) -> pd.DataFrame:
+    path = _price_coverage_cache_path(cache_path)
+    if path is None or not path.exists():
+        return pd.DataFrame(columns=["ticker", "start", "end", "status"])
+    try:
+        cov = pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "start", "end", "status"])
+    if cov.empty:
+        return pd.DataFrame(columns=["ticker", "start", "end", "status"])
+    cov = cov.copy()
+    cov["ticker"] = cov["ticker"].astype(str).str.strip().str.upper()
+    cov["start"] = pd.to_datetime(cov["start"])
+    cov["end"] = pd.to_datetime(cov["end"])
+    cov["status"] = cov["status"].astype(str)
+    return cov
+
+
+def _write_price_coverage(cache_path: str | Path | None, tickers, start: str, end: str, status: str) -> None:
+    path = _price_coverage_cache_path(cache_path)
+    if path is None:
+        return
+    clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
+    if not clean:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = _load_price_coverage(cache_path)
+    new = pd.DataFrame({
+        "ticker": clean,
+        "start": pd.Timestamp(start),
+        "end": pd.Timestamp(end),
+        "status": status,
+    })
+    out = new if current.empty else pd.concat([current, new], ignore_index=True)
+    out = (out.sort_values(["ticker", "start", "end", "status"])
+              .drop_duplicates(["ticker", "start", "end", "status"], keep="last"))
+    out.to_parquet(path, index=False)
+
+
+def _coverage_covers(cov: pd.DataFrame, tickers, start: str, end: str, statuses=("fetched", "no_close")) -> set[str]:
+    if cov.empty:
+        return set()
+    clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    hit = cov[
+        cov["ticker"].isin(clean)
+        & cov["status"].isin(statuses)
+        & (cov["start"] <= s)
+        & (cov["end"] >= e)
+    ]
+    return set(hit["ticker"].tolist())
+
+
+def _series_spans_requested_window(s: pd.Series, start: str, end: str) -> bool:
+    x = s.dropna()
+    if x.empty:
+        return False
+    monthly = x.resample("ME").last()
+    if monthly.empty:
+        return False
+    first_required = pd.date_range(pd.Timestamp(start), pd.Timestamp(end), freq="ME")
+    if len(first_required) == 0:
+        return False
+    return monthly.index.min() <= first_required[0] and monthly.index.max() >= first_required[-1]
 
 
 def _write_price_cache(cache_path: str | Path | None, px: pd.DataFrame) -> None:
@@ -574,15 +650,33 @@ def fetch_prices(
         print(f"  [warn] price download: skipped {dropped} invalid ticker strings")
 
     cache_px = _load_price_cache(cache_path, start, end)
-    cached_cols = sorted(set(clean).intersection(cache_px.columns)) if not cache_px.empty else []
+    coverage = _load_price_coverage(cache_path)
+    coverage_fetched = _coverage_covers(coverage, clean, start, end, statuses=("fetched",))
+    coverage_no_close = _coverage_covers(coverage, clean, start, end, statuses=("no_close",))
+    cache_symbol_cols = sorted(set(clean).intersection(cache_px.columns)) if not cache_px.empty else []
+    cached_cols = sorted(
+        t for t in cache_symbol_cols
+        if t in coverage_fetched or _series_spans_requested_window(cache_px[t], start, end)
+    )
+    stale_cached_cols = sorted(set(cache_symbol_cols) - set(cached_cols))
     frames: list[pd.DataFrame] = []
     if cached_cols:
         cached_px = cache_px[cached_cols].dropna(axis=1, how="all")
         if not cached_px.empty:
             frames.append(cached_px)
-        print(f"  yfinance cache: {len(cached_cols)}/{len(clean)} tickers found at {cache_path}")
+        print(f"  yfinance cache: {len(cached_cols)}/{len(clean)} coverage-valid tickers found at {cache_path}")
+    if stale_cached_cols:
+        sample = ", ".join(stale_cached_cols[:20])
+        print(
+            "  [info] yfinance cache: "
+            f"refetching {len(stale_cached_cols)} tickers whose cached history does not cover "
+            f"{start} to {end}; sample: {sample}"
+        )
+    if coverage_no_close:
+        sample = ", ".join(sorted(coverage_no_close)[:20])
+        print(f"  yfinance cache: {len(coverage_no_close)} tickers previously fetched with no close data; sample: {sample}")
 
-    todo = sorted(set(clean) - set(cached_cols))
+    todo = sorted(set(clean) - set(cached_cols) - set(coverage_no_close))
     failed_batches: list[str] = []
     empty_batches: list[str] = []
     empty_batch_tickers: list[list[str]] = []
@@ -607,6 +701,9 @@ def fetch_prices(
                     else:
                         frames.append(non_nan_close)
                         _write_price_cache(cache_path, non_nan_close)
+                        _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched")
+                        no_close_in_batch = sorted(set(batch) - set(non_nan_close.columns))
+                        _write_price_coverage(cache_path, no_close_in_batch, start, end, "no_close")
                         consecutive_empty = 0
                     break
                 last_attempt = attempt >= max_retries
@@ -733,6 +830,8 @@ def fetch_prices(
         "tickers_no_returns_dropped": int(len(all_nan_return_cols)),
         "invalid_tickers_skipped": int(dropped),
         "tickers_from_cache": int(len(cached_cols)),
+        "tickers_refetched_due_to_incomplete_cache": int(len(stale_cached_cols)),
+        "tickers_skipped_known_no_close": int(len(coverage_no_close)),
         "used_chart_fallback": bool(used_chart_fallback),
         "failed_batches": failed_batches[:10],
         "empty_batches": empty_batches[:10],

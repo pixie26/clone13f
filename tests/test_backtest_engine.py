@@ -417,6 +417,36 @@ def test_price_cache_preserves_existing_columns_and_filters_dates(tmp_path):
     assert loaded.loc[pd.Timestamp("2025-01-31"), "MSFT"] == 200.0
 
 
+def test_fetch_prices_refetches_cached_ticker_when_cache_does_not_cover_window(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    _write_price_cache(
+        cache_path,
+        pd.DataFrame({"AAPL": [100.0, 101.0]}, index=pd.to_datetime(["2025-01-31", "2025-02-28"])),
+    )
+    requested_dates = pd.to_datetime(["2015-01-31", "2015-02-28", "2026-03-31"])
+    calls = []
+
+    def fake_yf_download_close(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame({"AAPL": [50.0, 55.0, 110.0]}, index=requested_dates)
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+
+    returns = da.fetch_prices(
+        ["AAPL"],
+        "2015-01-01",
+        "2026-03-31",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+    )
+
+    assert calls == [(("AAPL",), "2015-01-01", "2026-03-31")]
+    assert returns.attrs["price_diagnostics"]["tickers_from_cache"] == 0
+    assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 1
+    assert "AAPL" in returns.columns
+
+
 def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypatch, tmp_path):
     dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
 

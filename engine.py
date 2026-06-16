@@ -16,6 +16,7 @@ The name is kept for call-site stability.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, replace
+import time
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
@@ -111,6 +112,11 @@ def _visible_manager_versions(chars: pd.DataFrame, asof, managers=None) -> pd.Da
                  .tail(1))
 
 
+def build_visible_versions_cache(chars: pd.DataFrame, months) -> dict[pd.Timestamp, pd.DataFrame]:
+    """Cache latest visible manager filing versions for each month/asof."""
+    return {pd.Timestamp(m): _visible_manager_versions(chars, pd.Timestamp(m)) for m in pd.Index(months).sort_values()}
+
+
 def manager_characteristics(holdings: pd.DataFrame,
                             benchmark_weights: pd.Series | None = None) -> pd.DataFrame:
     holdings = _versioned_holdings(holdings)
@@ -135,7 +141,7 @@ def manager_characteristics(holdings: pd.DataFrame,
         "active_share", "bw",
     ]
     if not rows:
-        return pd.DataFrame(columns=cols + ["turnover", "hist_q"])
+        return pd.DataFrame(columns=cols + ["prev_bw", "turnover", "hist_q"])
 
     chars = (pd.DataFrame(rows)
              .sort_values(["manager", "period_date", "filing_date", "accession_number"])
@@ -147,6 +153,7 @@ def manager_characteristics(holdings: pd.DataFrame,
     # decision date, this can leak a small amount of post-asof information into
     # the turnover screen. Fix later by computing turnover as-of each rebalance.
     turn = pd.Series(np.nan, index=chars.index, dtype=float)
+    prev_bw = pd.Series([None] * len(chars), index=chars.index, dtype=object)
     for _, g in chars.groupby("manager", sort=False):
         prev_period_bw = None
         current_period = None
@@ -156,11 +163,13 @@ def manager_characteristics(holdings: pd.DataFrame,
                 prev_period_bw = current_period_latest_bw
                 current_period = r["period_date"]
             if prev_period_bw is not None:
+                prev_bw.at[idx] = prev_period_bw
                 alln = r["bw"].index.union(prev_period_bw.index)
                 a = r["bw"].reindex(alln).fillna(0.0)
                 b = prev_period_bw.reindex(alln).fillna(0.0)
                 turn.loc[idx] = 1.0 - np.minimum(a, b).sum()
             current_period_latest_bw = r["bw"]
+    chars["prev_bw"] = prev_bw
     chars["turnover"] = turn
     return chars
 
@@ -199,10 +208,11 @@ def _book_value_pctl(w: pd.Series, vscores: pd.Series | None) -> float:
 
 
 # --------------------------------------------------------------------------- #
-def select_universe(chars, asof, cfg: UniverseConfig, value_scores=None) -> list[str]:
-    latest = _visible_manager_versions(chars, asof).set_index("manager")
+def filter_universe_versions(latest_versions: pd.DataFrame, cfg: UniverseConfig, value_scores=None) -> pd.DataFrame:
+    latest = latest_versions
     if latest.empty:
-        return []
+        return latest
+    latest = latest.set_index("manager", drop=False)
     keep = pd.Series(True, index=latest.index)
     keep &= latest["hist_q"] >= cfg.min_history_quarters
     if cfg.use_size_band:
@@ -222,7 +232,18 @@ def select_universe(chars, asof, cfg: UniverseConfig, value_scores=None) -> list
                                   if r["period_date"] in value_scores.index else None)
               for m, r in latest.iterrows()}
         keep &= pd.Series(vp).ge(cfg.value_tilt_min_pctl).reindex(keep.index).fillna(False)
-    return list(latest.index[keep.values])
+    return latest.loc[keep.values].reset_index(drop=True)
+
+
+def select_universe_versions(chars, asof, cfg: UniverseConfig, value_scores=None) -> pd.DataFrame:
+    return filter_universe_versions(_visible_manager_versions(chars, asof), cfg, value_scores)
+
+
+def select_universe(chars, asof, cfg: UniverseConfig, value_scores=None) -> list[str]:
+    selected = select_universe_versions(chars, asof, cfg, value_scores)
+    if selected.empty:
+        return []
+    return selected["manager"].tolist()
 
 
 # --------------------------------------------------------------------------- #
@@ -240,18 +261,14 @@ def _idea_scores(cur: pd.Series, prev: pd.Series | None, cfg: PortfolioConfig) -
     return s[s > 0].sort_values(ascending=False).head(cfg.top_n_ideas)
 
 
-def target_weights(chars, managers, asof, cfg: PortfolioConfig) -> pd.Series:
-    known = chars[(chars["filing_date"] <= asof) & (chars["manager"].isin(managers))]
-    if known.empty:
+def target_weights_from_versions(latest_versions: pd.DataFrame, cfg: PortfolioConfig) -> pd.Series:
+    if latest_versions.empty:
         return pd.Series(dtype=float)
     score: dict[str, float] = {}
     count: dict[str, int] = {}
-    for mgr, g in known.groupby("manager"):
-        g = g.sort_values(["period_date", "filing_date", "accession_number"])
-        cur_row = g.iloc[-1]
-        cur = cur_row["bw"]
-        prior = g[g["period_date"] < cur_row["period_date"]]
-        prev = prior.iloc[-1]["bw"] if len(prior) else None
+    for cur_row in latest_versions.itertuples(index=False):
+        cur = getattr(cur_row, "bw")
+        prev = getattr(cur_row, "prev_bw", None)
         picks = _idea_scores(cur, prev, cfg)
         for tkr, wt in picks.items():
             score[tkr] = score.get(tkr, 0.0) + (float(wt) if cfg.consensus_weight else 1.0)
@@ -265,6 +282,11 @@ def target_weights(chars, managers, asof, cfg: PortfolioConfig) -> pd.Series:
     if s.empty:
         return s
     return _cap_weights(s, cfg.max_name_weight)
+
+
+def target_weights(chars, managers, asof, cfg: PortfolioConfig) -> pd.Series:
+    latest = _visible_manager_versions(chars, asof, managers)
+    return target_weights_from_versions(latest, cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -334,7 +356,8 @@ def _apply_monthly_returns(cur: pd.Series,
 
 
 def rebalance_trace(holdings, prices, cfg: BacktestConfig,
-                    value_scores=None, benchmark_weights=None, chars=None) -> dict[str, pd.DataFrame]:
+                    value_scores=None, benchmark_weights=None, chars=None,
+                    visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None) -> dict[str, pd.DataFrame]:
     """Return auditable rebalance summary, holdings, and manager-selection tables."""
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
@@ -352,18 +375,22 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         if m not in rebal_months:
             continue
 
-        managers = select_universe(chars, m, cfg.universe, value_scores)
-        for manager in managers:
+        latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
+        if latest_versions is None:
+            latest_versions = _visible_manager_versions(chars, m)
+        selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+        selected_managers = selected_versions["manager"].tolist() if not selected_versions.empty else []
+        for manager in selected_managers:
             manager_rows.append({"rebalance_month": m.date().isoformat(), "manager": manager})
 
-        tgt = target_weights(chars, managers, m, cfg.portfolio)
+        tgt = target_weights_from_versions(selected_versions, cfg.portfolio)
         target_names_before_price_filter = int(len(tgt))
         priced_now = prices.columns[prices.loc[m].notna()]
         tgt = tgt[tgt.index.isin(priced_now)]
         if tgt.sum() <= 0:
             summary_rows.append({
                 "rebalance_month": m.date().isoformat(),
-                "selected_managers": int(len(managers)),
+                "selected_managers": int(len(selected_versions)),
                 "target_names": int(len(tgt)),
                 "target_names_before_price_filter": target_names_before_price_filter,
                 "effective_names": int(len(cur)),
@@ -380,7 +407,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         top = eff.sort_values(ascending=False).head(12)
         summary_rows.append({
             "rebalance_month": m.date().isoformat(),
-            "selected_managers": int(len(managers)),
+            "selected_managers": int(len(selected_versions)),
             "target_names": int(len(tgt)),
             "target_names_before_price_filter": target_names_before_price_filter,
             "effective_names": int(len(eff)),
@@ -410,7 +437,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
 
 # --------------------------------------------------------------------------- #
 def run_backtest(holdings, prices, cfg: BacktestConfig,
-                 value_scores=None, benchmark_weights=None, chars=None) -> pd.Series:
+                 value_scores=None, benchmark_weights=None, chars=None,
+                 visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None) -> pd.Series:
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
     months = prices.index.sort_values()
@@ -423,8 +451,11 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
     for m in months:
         cur, net.loc[m] = _apply_monthly_returns(cur, prices, m, cfg)
         if m in rebal_months:
-            u = select_universe(chars, m, cfg.universe, value_scores)
-            tgt = target_weights(chars, u, m, cfg.portfolio)
+            latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
+            if latest_versions is None:
+                latest_versions = _visible_manager_versions(chars, m)
+            selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+            tgt = target_weights_from_versions(selected_versions, cfg.portfolio)
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
             if tgt.sum() > 0:
@@ -491,16 +522,49 @@ def attribution(port_ret, factors, benchmark=None,
     return out
 
 
-def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=None, benchmark_weights=None):
-    ch = manager_characteristics(holdings, benchmark_weights)
-    base = attribution(run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch), factors, benchmark)
+def _fmt_metric(value) -> str:
+    return f"{value:.4g}" if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else str(value)
+
+
+def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=None, benchmark_weights=None,
+                chars=None, visible_versions_cache=None, verbose: bool = False):
+    ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
+    visible_cache = visible_versions_cache or build_visible_versions_cache(ch, prices.index)
+    if verbose:
+        print("  marginal-ir 1/? running full stack")
+        t0 = time.perf_counter()
+    base = attribution(
+        run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache),
+        factors,
+        benchmark,
+    )
     bm = base.get("ir_vs_benchmark", base.get("sharpe"))
     rows = [dict(filter="(full stack)", metric=bm, delta=0.0)]
-    for t in ["use_size_band", "use_concentration", "use_low_turnover", "use_hedge_filter", "use_value_tilt", "use_active_share"]:
+    if verbose:
+        print(f"    done full stack in {time.perf_counter() - t0:.1f}s metric={_fmt_metric(bm)}")
+    filters = [t for t in [
+        "use_size_band",
+        "use_concentration",
+        "use_low_turnover",
+        "use_hedge_filter",
+        "use_value_tilt",
+        "use_active_share",
+    ] if getattr(cfg.universe, t)]
+    total = len(filters) + 1
+    for i, t in enumerate(filters, start=2):
+        if verbose:
+            print(f"  marginal-ir {i}/{total} running -{t}")
+            t0 = time.perf_counter()
         if not getattr(cfg.universe, t):
             continue
         cfg2 = replace(cfg, universe=replace(cfg.universe, **{t: False}))
-        att = attribution(run_backtest(holdings, prices, cfg2, value_scores, benchmark_weights, ch), factors, benchmark)
+        att = attribution(
+            run_backtest(holdings, prices, cfg2, value_scores, benchmark_weights, ch, visible_cache),
+            factors,
+            benchmark,
+        )
         m = att.get("ir_vs_benchmark", att.get("sharpe"))
+        if verbose:
+            print(f"    done -{t} in {time.perf_counter() - t0:.1f}s metric={_fmt_metric(m)}")
         rows.append(dict(filter=f"-{t}", metric=m, delta=(bm - m)))
     return pd.DataFrame(rows)
