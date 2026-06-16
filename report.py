@@ -36,6 +36,9 @@ def _rolling_alpha(
     win: int = 12,
     cols=("MKT", "SMB", "HML", "RMW", "CMA", "MOM"),
 ) -> pd.Series:
+    required = set(cols).union({"RF"})
+    if factors is None or not required.issubset(set(factors.columns)):
+        return pd.Series(index=ret.index, dtype=float)
     df = pd.concat([ret.rename("ret"), factors], axis=1).dropna()
     out = pd.Series(index=df.index, dtype=float)
     for i in range(win, len(df) + 1):

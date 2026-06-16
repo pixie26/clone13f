@@ -44,6 +44,8 @@ LIVE_CONFIG = {
     "max_aum": 30e9,
     "max_holdings": 60,
     "max_put_weight": 0.10,
+    "require_factors": False,
+    "openfigi_cache_path": "openfigi_cache.parquet",
 }
 
 
@@ -186,7 +188,18 @@ def build_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd
     return holdings, prices, factors, value_scores, bench_w, bench_ret
 
 
-def build_live_data(cfg: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, None, None, pd.Series | None]:
+def _top_cusips_by_value(holdings: pd.DataFrame, limit: int | None) -> pd.Index:
+    if limit is None or limit <= 0:
+        return pd.Index(holdings["cusip"].dropna().unique())
+    return holdings.groupby("cusip")["value"].sum().nlargest(limit).index
+
+
+def build_live_data(
+    cfg: dict,
+    *,
+    cusip_limit: int | None = None,
+    price_ticker_limit: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, None, None, pd.Series | None]:
     print("[1/6] Building rule-based universe from SEC 13F datasets")
     import build_universe as bu
     import data_adapters as da
@@ -208,10 +221,38 @@ def build_live_data(cfg: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
         f"    rule-based pool: {h_cusip['cik'].nunique()} filers, "
         f"{h_cusip.groupby(['cik', 'period_date']).ngroups} filer-periods"
     )
-    cmap = da.cusip_to_ticker(h_cusip.cusip.unique(), api_key=cfg["openfigi_key"])
+    print("[1/6] Mapping CUSIPs through OpenFIGI")
+    target_cusips = _top_cusips_by_value(h_cusip, cusip_limit)
+    if cusip_limit:
+        h_cusip = h_cusip[h_cusip["cusip"].isin(target_cusips)].copy()
+        print(f"    smoke CUSIP subset: top {len(target_cusips)} CUSIPs by disclosed value")
+    cmap = da.cusip_to_ticker(
+        target_cusips,
+        api_key=cfg["openfigi_key"],
+        cache_path=cfg.get("openfigi_cache_path"),
+    )
     holdings = da.map_holdings_to_tickers(h_cusip, cmap)
-    prices = da.fetch_prices(holdings.ticker.unique(), cfg["start"], cfg["end"])
-    factors = da.fetch_factors(cfg["start"], cfg["end"])
+    holdings = da.priceable_holdings(holdings)
+    print("[1/6] Downloading monthly prices from yfinance")
+    price_holdings = holdings
+    if price_ticker_limit:
+        top_tickers = holdings.groupby("ticker")["value"].sum().nlargest(price_ticker_limit).index
+        price_holdings = holdings[holdings["ticker"].isin(top_tickers)].copy()
+        print(f"    smoke ticker subset: top {len(top_tickers)} tickers by disclosed value")
+    prices = da.fetch_prices(price_holdings.ticker.unique(), cfg["start"], cfg["end"])
+    holdings = da.align_holdings_to_prices(price_holdings, prices)
+    print("[1/6] Downloading Fama-French factors")
+    try:
+        factors = da.fetch_factors(cfg["start"], cfg["end"])
+        print(f"    factors: {len(factors)} monthly rows")
+    except ModuleNotFoundError as exc:
+        if cfg.get("require_factors"):
+            raise
+        print(f"    [warn] {exc}")
+        print("    [warn] continuing without factor regression; install dependency for FF attribution")
+        factors = pd.DataFrame(index=prices.index)
+        factors.attrs["factor_diagnostics"] = {"available": False, "reason": str(exc)}
+    print(f"[1/6] Downloading benchmark prices: {cfg['benchmark_ticker']}")
     try:
         bench_ret = da.fetch_prices([cfg["benchmark_ticker"]], cfg["start"], cfg["end"]).iloc[:, 0]
         bench_ret.name = cfg["benchmark_ticker"]
@@ -220,6 +261,47 @@ def build_live_data(cfg: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame
         bench_ret = None
     print(f"    managers: {holdings.manager.nunique()}, tickers: {holdings.ticker.nunique()}")
     return holdings, prices, factors, None, None, bench_ret
+
+
+def run_live_smoke(output_root: pathlib.Path, *, cusip_limit: int, ticker_limit: int) -> pathlib.Path:
+    cfg = dict(LIVE_CONFIG)
+    holdings, prices, factors, _, _, bench_ret = build_live_data(
+        cfg,
+        cusip_limit=cusip_limit,
+        price_ticker_limit=ticker_limit,
+    )
+    payload = {
+        "mode": "live-smoke",
+        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "git_sha": _git_sha(),
+        "config": {
+            "start": cfg["start"],
+            "end": cfg["end"],
+            "cusip_limit": cusip_limit,
+            "ticker_limit": ticker_limit,
+            "benchmark_ticker": cfg["benchmark_ticker"],
+        },
+        "input_summary": {
+            "holdings_rows": int(len(holdings)),
+            "manager_count": int(holdings["manager"].nunique()),
+            "ticker_count": int(holdings["ticker"].nunique()),
+            "price_months": int(len(prices)),
+            "price_columns": int(len(prices.columns)),
+            "factor_months": int(len(factors)),
+            "benchmark_available": bench_ret is not None,
+            "mapping_diagnostics": holdings.attrs.get("mapping_diagnostics"),
+            "price_filter_diagnostics": holdings.attrs.get("price_filter_diagnostics"),
+            "price_alignment_diagnostics": holdings.attrs.get("price_alignment_diagnostics"),
+            "price_diagnostics": prices.attrs.get("price_diagnostics"),
+            "factor_diagnostics": factors.attrs.get("factor_diagnostics"),
+        },
+    }
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_root.mkdir(parents=True, exist_ok=True)
+    path = output_root / f"live_smoke_{run_id}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+    print(f"  Saved live smoke diagnostics: {path}")
+    return path
 
 
 def write_manifest(path: pathlib.Path, payload: dict) -> None:
@@ -238,9 +320,11 @@ def write_manifest(path: pathlib.Path, payload: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
 
 
-def run(mode: str, output_root: pathlib.Path) -> pathlib.Path:
+def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_tickers: int = 200) -> pathlib.Path:
     if mode == "synthetic":
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
+    elif mode == "live-smoke":
+        return run_live_smoke(output_root, cusip_limit=smoke_cusips, ticker_limit=smoke_tickers)
     else:
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(LIVE_CONFIG)
 
@@ -355,6 +439,9 @@ def run(mode: str, output_root: pathlib.Path) -> pathlib.Path:
             "price_columns": int(len(prices.columns)),
             "factor_months": int(len(factors)),
             "mapping_diagnostics": holdings.attrs.get("mapping_diagnostics"),
+            "price_filter_diagnostics": holdings.attrs.get("price_filter_diagnostics"),
+            "price_alignment_diagnostics": holdings.attrs.get("price_alignment_diagnostics"),
+            "price_diagnostics": prices.attrs.get("price_diagnostics"),
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
         "outputs": {"dashboard": dashboard_path},
@@ -369,18 +456,25 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the 13F-clone research example.")
     parser.add_argument(
         "--mode",
-        choices=["synthetic", "live"],
+        choices=["synthetic", "live", "live-smoke"],
         default="synthetic",
-        help="synthetic is offline and deterministic; live uses SEC/OpenFIGI/yfinance/Fama-French.",
+        help="synthetic is offline; live-smoke tests the live data chain; live runs the full research stack.",
     )
     parser.add_argument("--output-root", default="reports", help="Directory for run outputs.")
+    parser.add_argument("--smoke-cusips", type=int, default=300, help="Top CUSIPs by value to map in live-smoke mode.")
+    parser.add_argument("--smoke-tickers", type=int, default=200, help="Top tickers by value to price in live-smoke mode.")
     return parser.parse_args()
 
 
 def main() -> None:
     _load_local_env()
     args = parse_args()
-    run(args.mode, pathlib.Path(args.output_root))
+    run(
+        args.mode,
+        pathlib.Path(args.output_root),
+        smoke_cusips=args.smoke_cusips,
+        smoke_tickers=args.smoke_tickers,
+    )
 
 
 if __name__ == "__main__":

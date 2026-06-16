@@ -294,18 +294,34 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
 # --------------------------------------------------------------------------- #
 def attribution(port_ret, factors, benchmark=None,
                 factor_cols=("MKT", "SMB", "HML", "RMW", "CMA", "MOM")) -> dict:
-    df = pd.concat([port_ret.rename("ret"), factors], axis=1).dropna()
+    factors = factors if factors is not None else pd.DataFrame(index=port_ret.index)
+    df = pd.concat([port_ret.rename("ret"), factors], axis=1).dropna(subset=["ret"])
     if len(df) < 12:
         return {"n_months": len(df), "note": "insufficient overlap"}
-    y = df["ret"] - df["RF"]
+    if "RF" in df:
+        y = df["ret"] - df["RF"]
+    else:
+        y = df["ret"]
+    out = {
+        "n_months": len(df),
+        "ann_return": (1 + df["ret"]).prod() ** (12 / len(df)) - 1,
+        "ann_vol": df["ret"].std() * np.sqrt(12),
+        "sharpe": (y.mean() / y.std()) * np.sqrt(12) if y.std() else np.nan,
+    }
+    missing_factor_cols = [c for c in factor_cols if c not in df.columns]
+    if "RF" not in df.columns or missing_factor_cols:
+        out["note"] = "factor regression unavailable"
+        if benchmark is not None:
+            active = (df["ret"] - benchmark.reindex(df.index)).dropna()
+            out["ir_vs_benchmark"] = (active.mean() / active.std()) * np.sqrt(12) if active.std() else np.nan
+        return out
+
     res = sm.OLS(y, sm.add_constant(df[list(factor_cols)])).fit(cov_type="HAC", cov_kwds={"maxlags": 6})
-    out = {"n_months": len(df),
-           "ann_alpha": (1 + res.params["const"]) ** 12 - 1,
-           "alpha_t": res.tvalues["const"],
-           "betas": {c: res.params[c] for c in factor_cols},
-           "ann_return": (1 + df["ret"]).prod() ** (12 / len(df)) - 1,
-           "ann_vol": df["ret"].std() * np.sqrt(12),
-           "sharpe": (y.mean() / y.std()) * np.sqrt(12) if y.std() else np.nan}
+    out.update({
+        "ann_alpha": (1 + res.params["const"]) ** 12 - 1,
+        "alpha_t": res.tvalues["const"],
+        "betas": {c: res.params[c] for c in factor_cols},
+    })
     if benchmark is not None:
         active = (df["ret"] - benchmark.reindex(df.index)).dropna()
         out["ir_vs_benchmark"] = (active.mean() / active.std()) * np.sqrt(12) if active.std() else np.nan

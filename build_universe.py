@@ -26,6 +26,7 @@ import pandas as pd
 
 SEC_13F_BASE = "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/"
 SEC_13F_LANDING = "https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets"
+PARSED_CACHE_VERSION = "v2"
 
 # Fallback only. The downloader first tries to scrape the official SEC landing page.
 LEGACY_URL_PATTERN = SEC_13F_BASE + "{y}q{q}_form13f.zip"
@@ -254,6 +255,19 @@ def _col(df: pd.DataFrame, *names: str, default: str | None = None) -> pd.Series
     return pd.Series([default] * len(df), index=df.index)
 
 
+def _security_type(putcall: pd.Series, share_amount_type: pd.Series) -> pd.Series:
+    pc = putcall.fillna("").astype(str).str.upper()
+    amt_type = share_amount_type.fillna("").astype(str).str.upper()
+    return pd.Series(
+        np.select(
+            [pc.str.contains("PUT"), pc.str.contains("CALL"), amt_type.eq("PRN")],
+            ["PUT", "CALL", "PRN"],
+            default="SH",
+        ),
+        index=putcall.index,
+    )
+
+
 def parse_quarter(zip_bytes: bytes) -> pd.DataFrame:
     """One SEC 13F ZIP -> long holdings frame."""
     z = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -283,6 +297,7 @@ def parse_quarter(zip_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame()
 
     pc = _col(df, "PUTCALL", default="").fillna("").astype(str).str.upper()
+    share_amount_type = _col(df, "SSHPRNAMTTYPE", "SSHPRNAMT_TYPE", default="SH")
     cusip = _col(df, "CUSIP").astype("string").str.upper().str.replace(r"[^A-Z0-9]", "", regex=True).str.zfill(9)
 
     out = pd.DataFrame(dict(
@@ -297,8 +312,8 @@ def parse_quarter(zip_bytes: bytes) -> pd.DataFrame:
         issuer=_col(df, "NAMEOFISSUER", default=None),
         value=pd.to_numeric(_col(df, "VALUE"), errors="coerce"),
         shares=pd.to_numeric(_col(df, "SSHPRNAMT", "SSHPRNAMT_VALUE"), errors="coerce"),
-        sec_type=np.where(pc.str.contains("PUT"), "PUT",
-                 np.where(pc.str.contains("CALL"), "CALL", "SH")),
+        share_amount_type=share_amount_type.fillna("").astype(str).str.upper(),
+        sec_type=_security_type(pc, share_amount_type),
     )).dropna(subset=["period_date", "filing_date", "value", "cusip"])
 
     out = out[out["cusip"].str.len().eq(9)]
@@ -357,10 +372,16 @@ def build_holdings_universe(start: str, end: str, identity: str,
     # filing-window archives.
     filing_start = min(report_periods)
     filing_end = max(report_periods) + pd.Timedelta(days=75)
+    print(
+        "  target report periods: "
+        + ", ".join(p.strftime("%Y-%m-%d") for p in report_periods)
+    )
+    print(f"  filing availability window: {filing_start.date()} to {filing_end.date()}")
 
     datasets = discover_dataset_urls(identity, filing_start, filing_end)
     if not datasets:
         raise RuntimeError("No SEC 13F dataset URLs discovered.")
+    print(f"  SEC datasets selected: {len(datasets)}")
 
     frames = []
     seen_urls: set[str] = set()
@@ -369,9 +390,11 @@ def build_holdings_universe(start: str, end: str, identity: str,
             continue
         seen_urls.add(d.url)
         fname = d.url.rsplit("/", 1)[-1].replace("_form13f.zip", "")
-        cpath = os.path.join(cache_dir, f"{fname}.parquet") if cache_dir else None
+        cpath = os.path.join(cache_dir, f"{fname}.{PARSED_CACHE_VERSION}.parquet") if cache_dir else None
         if cpath and os.path.exists(cpath):
-            frames.append(pd.read_parquet(cpath))
+            dfq = pd.read_parquet(cpath)
+            print(f"[{fname}] cache hit: {len(dfq)} rows")
+            frames.append(dfq)
             continue
         print(f"[{fname}] downloading …")
         b = _try_download(d.url, identity)
@@ -381,8 +404,10 @@ def build_holdings_universe(start: str, end: str, identity: str,
         dfq = parse_quarter(b)
         if not dfq.empty:
             dfq = dfq[dfq["period_date"].between(report_start, report_end)]
+        print(f"[{fname}] parsed: {len(dfq)} in-range rows")
         if cpath and not dfq.empty:
             dfq.to_parquet(cpath)
+            print(f"[{fname}] cached: {cpath}")
         frames.append(dfq)
         time.sleep(0.5)
 
@@ -391,8 +416,10 @@ def build_holdings_universe(start: str, end: str, identity: str,
         raise RuntimeError("No 13F datasets downloaded/parsed — verify SEC URLs and User-Agent identity.")
 
     allh = pd.concat(frames, ignore_index=True)
+    print(f"  raw in-range holdings rows before de-dup: {len(allh)}")
     # Final guard: overlapping archives can repeat the same filing; keep distinct
     # filing versions so amendments remain point-in-time events for the engine.
     allh = (allh.sort_values(["cik", "period_date", "filing_date"])
                 .drop_duplicates(["accession_number", "cusip", "sec_type"], keep="last"))
+    print(f"  holdings rows after accession/CUSIP/sec_type de-dup: {len(allh)}")
     return coarse_prefilter(allh, **prefilter_kw)

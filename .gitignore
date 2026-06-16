@@ -5,4 +5,5 @@ __pycache__/
 13f_cache/
 reports/
 artifacts/
+openfigi_cache.parquet
 strategy_dashboard.png
