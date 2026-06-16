@@ -235,57 +235,156 @@ def target_weights(chars, managers, asof, cfg: PortfolioConfig) -> pd.Series:
 
 
 # --------------------------------------------------------------------------- #
+def _rebalance_months(holdings: pd.DataFrame, prices: pd.DataFrame) -> list[pd.Timestamp]:
+    months = prices.index.sort_values()
+    fil = holdings["filing_date"].drop_duplicates().sort_values()
+    return sorted({months[months >= f][0] for f in fil if (months >= f).any()})
+
+
+def _apply_rebalance_target(cur: pd.Series,
+                            age: dict[str, int],
+                            tgt: pd.Series,
+                            cfg: BacktestConfig) -> tuple[pd.Series, float, list[str]]:
+    tgt = tgt / tgt.sum()
+    for n in list(age):                # age everything held
+        age[n] += 1
+    for n in tgt.index:                # reset names back in target
+        age[n] = 0
+
+    eff = {n: float(w) for n, w in tgt.items()}
+    carried: list[str] = []
+    H = cfg.portfolio.holding_horizon_q
+    if H > 0:                          # carry recent names (patient capital)
+        for n, a in list(age.items()):
+            if 0 < a <= H and n not in eff and n in cur.index:
+                eff[n] = float(cur[n])
+                carried.append(n)
+    for n in [n for n, a in age.items() if a > H]:
+        age.pop(n, None)
+
+    eff_s = pd.Series(eff, dtype=float).clip(upper=cfg.portfolio.max_name_weight)
+    eff_s = eff_s / eff_s.sum()
+    alln = eff_s.index.union(cur.index)
+    traded = 0.5 * (eff_s.reindex(alln).fillna(0) - cur.reindex(alln).fillna(0)).abs().sum()
+    return eff_s, float(traded), carried
+
+
+def _apply_monthly_returns(cur: pd.Series,
+                           prices: pd.DataFrame,
+                           month: pd.Timestamp,
+                           cfg: BacktestConfig) -> tuple[pd.Series, float]:
+    if not len(cur):
+        return cur, 0.0
+    r = prices.loc[month, cur.index]
+    missing = r[r.isna()].index.tolist()
+    if missing:
+        if cfg.missing_price_policy == "raise":
+            sample = ", ".join(map(str, missing[:10]))
+            raise ValueError(
+                f"Missing returns for {len(missing)} held names on {month.date()}: {sample}"
+            )
+        if cfg.missing_price_policy != "zero":
+            raise ValueError(f"Unknown missing_price_policy={cfg.missing_price_policy!r}")
+        r = r.fillna(0.0)
+    net = float((cur * r).sum())
+    grown = cur * (1.0 + r)
+    return (grown / grown.sum() if grown.sum() > 0 else cur), net
+
+
+def rebalance_trace(holdings, prices, cfg: BacktestConfig,
+                    value_scores=None, benchmark_weights=None, chars=None) -> dict[str, pd.DataFrame]:
+    """Return auditable rebalance summary, holdings, and manager-selection tables."""
+    if chars is None:
+        chars = manager_characteristics(holdings, benchmark_weights)
+    months = prices.index.sort_values()
+    rebal_months = set(_rebalance_months(holdings, prices))
+
+    cur = pd.Series(dtype=float)
+    age: dict[str, int] = {}
+    summary_rows: list[dict] = []
+    holding_rows: list[dict] = []
+    manager_rows: list[dict] = []
+
+    for m in months:
+        cur, _ = _apply_monthly_returns(cur, prices, m, cfg)
+        if m not in rebal_months:
+            continue
+
+        managers = select_universe(chars, m, cfg.universe, value_scores)
+        for manager in managers:
+            manager_rows.append({"rebalance_month": m.date().isoformat(), "manager": manager})
+
+        tgt = target_weights(chars, managers, m, cfg.portfolio)
+        target_names_before_price_filter = int(len(tgt))
+        tgt = tgt[tgt.index.isin(prices.columns)]
+        if tgt.sum() <= 0:
+            summary_rows.append({
+                "rebalance_month": m.date().isoformat(),
+                "selected_managers": int(len(managers)),
+                "target_names": int(len(tgt)),
+                "target_names_before_price_filter": target_names_before_price_filter,
+                "effective_names": int(len(cur)),
+                "carried_names": 0,
+                "turnover_one_way": 0.0,
+                "cost_bps": 0.0,
+                "top_holdings": "",
+                "note": "no positive target weights",
+            })
+            continue
+
+        eff, traded, carried = _apply_rebalance_target(cur, age, tgt, cfg)
+        cost_bps = traded * cfg.cost.bps_per_side
+        top = eff.sort_values(ascending=False).head(12)
+        summary_rows.append({
+            "rebalance_month": m.date().isoformat(),
+            "selected_managers": int(len(managers)),
+            "target_names": int(len(tgt)),
+            "target_names_before_price_filter": target_names_before_price_filter,
+            "effective_names": int(len(eff)),
+            "carried_names": int(len(carried)),
+            "turnover_one_way": float(traded),
+            "cost_bps": float(cost_bps),
+            "top_holdings": "; ".join(f"{k}:{v:.2%}" for k, v in top.items()),
+            "note": "",
+        })
+        carried_set = set(carried)
+        for rank, (ticker, weight) in enumerate(eff.sort_values(ascending=False).items(), start=1):
+            holding_rows.append({
+                "rebalance_month": m.date().isoformat(),
+                "rank": int(rank),
+                "ticker": ticker,
+                "weight": float(weight),
+                "is_carried": bool(ticker in carried_set),
+            })
+        cur = eff
+
+    return {
+        "summary": pd.DataFrame(summary_rows),
+        "holdings": pd.DataFrame(holding_rows),
+        "managers": pd.DataFrame(manager_rows),
+    }
+
+
+# --------------------------------------------------------------------------- #
 def run_backtest(holdings, prices, cfg: BacktestConfig,
                  value_scores=None, benchmark_weights=None, chars=None) -> pd.Series:
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
     months = prices.index.sort_values()
-    fil = holdings["filing_date"].drop_duplicates().sort_values()
-    rebal_months = sorted({months[months >= f][0] for f in fil if (months >= f).any()})
+    rebal_months = set(_rebalance_months(holdings, prices))
 
     cur = pd.Series(dtype=float)
     age: dict[str, int] = {}
     net = pd.Series(0.0, index=months)
-    H = cfg.portfolio.holding_horizon_q
 
     for m in months:
-        if len(cur):
-            r = prices.loc[m, cur.index]
-            missing = r[r.isna()].index.tolist()
-            if missing:
-                if cfg.missing_price_policy == "raise":
-                    sample = ", ".join(map(str, missing[:10]))
-                    raise ValueError(
-                        f"Missing returns for {len(missing)} held names on {m.date()}: {sample}"
-                    )
-                if cfg.missing_price_policy != "zero":
-                    raise ValueError(f"Unknown missing_price_policy={cfg.missing_price_policy!r}")
-                r = r.fillna(0.0)
-            net.loc[m] = float((cur * r).sum())
-            grown = cur * (1.0 + r)
-            cur = grown / grown.sum() if grown.sum() > 0 else cur
+        cur, net.loc[m] = _apply_monthly_returns(cur, prices, m, cfg)
         if m in rebal_months:
             u = select_universe(chars, m, cfg.universe, value_scores)
             tgt = target_weights(chars, u, m, cfg.portfolio)
             tgt = tgt[tgt.index.isin(prices.columns)]
             if tgt.sum() > 0:
-                tgt = tgt / tgt.sum()
-                for n in list(age):                # age everything held
-                    age[n] += 1
-                for n in tgt.index:                # reset names back in target
-                    age[n] = 0
-                eff = {n: float(w) for n, w in tgt.items()}
-                if H > 0:                          # carry recent names (patient capital)
-                    for n, a in list(age.items()):
-                        if 0 < a <= H and n not in eff and n in cur.index:
-                            eff[n] = float(cur[n])
-                for n in [n for n, a in age.items() if a > H]:
-                    age.pop(n, None)
-                eff = pd.Series(eff)
-                eff = (eff.clip(upper=cfg.portfolio.max_name_weight))
-                eff = eff / eff.sum()
-                alln = eff.index.union(cur.index)
-                traded = 0.5 * (eff.reindex(alln).fillna(0) - cur.reindex(alln).fillna(0)).abs().sum()
+                eff, traded, _ = _apply_rebalance_target(cur, age, tgt, cfg)
                 net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
                 cur = eff
     return net

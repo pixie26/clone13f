@@ -28,6 +28,7 @@ from engine import (
     attribution,
     manager_characteristics,
     marginal_ir,
+    rebalance_trace,
     run_backtest,
 )
 from report import dashboard
@@ -338,6 +339,72 @@ def write_manifest(path: pathlib.Path, payload: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
 
 
+def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weights) -> dict:
+    return {
+        "rebalance_rule": (
+            "At each month-end on or after a visible SEC filing date, select each "
+            "manager's latest filing version available by filing_date and rebalance."
+        ),
+        "point_in_time_rule": "Only filings with filing_date <= rebalance_month are visible.",
+        "execution_timing": (
+            "Existing holdings earn the current month's return first; new target "
+            "weights are set at month-end for subsequent months."
+        ),
+        "transaction_cost": {
+            "model": "one_way_turnover * bps_per_side",
+            "bps_per_side": cfg.cost.bps_per_side,
+        },
+        "universe": asdict(cfg.universe),
+        "portfolio": asdict(cfg.portfolio),
+        "missing_price_policy": cfg.missing_price_policy,
+        "active_filter_status": {
+            "value_tilt_configured": bool(cfg.universe.use_value_tilt),
+            "value_tilt_active": bool(cfg.universe.use_value_tilt and value_scores is not None),
+            "active_share_configured": bool(cfg.universe.use_active_share),
+            "active_share_active": bool(cfg.universe.use_active_share and benchmark_weights is not None),
+        },
+    }
+
+
+def write_rebalance_outputs(
+    out_dir: pathlib.Path,
+    label: str,
+    holdings: pd.DataFrame,
+    prices: pd.DataFrame,
+    cfg: BacktestConfig,
+    *,
+    value_scores=None,
+    benchmark_weights=None,
+    chars=None,
+) -> dict[str, str]:
+    trace = rebalance_trace(
+        holdings,
+        prices,
+        cfg,
+        value_scores=value_scores,
+        benchmark_weights=benchmark_weights,
+        chars=chars,
+    )
+    outputs: dict[str, str] = {}
+    for name, df in trace.items():
+        path = out_dir / f"rebalance_{name}_{label}.csv"
+        df.to_csv(path, index=False)
+        outputs[name] = str(path)
+
+    rules_path = out_dir / f"rebalance_rules_{label}.json"
+    rules_path.write_text(
+        json.dumps(
+            _strategy_rule_summary(cfg, value_scores=value_scores, benchmark_weights=benchmark_weights),
+            indent=2,
+            sort_keys=True,
+            default=_json_default,
+        ),
+        encoding="utf-8",
+    )
+    outputs["rules"] = str(rules_path)
+    return outputs
+
+
 def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_tickers: int = 200) -> pathlib.Path:
     if mode == "synthetic":
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
@@ -464,6 +531,21 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         title=f"13F-clone strategy dashboard [{mode.upper()} DATA]",
         path=str(out_dir / "strategy_dashboard.png"),
     )
+    print("[6/6] Writing rebalance audit files")
+    rebalance_outputs = write_rebalance_outputs(
+        out_dir,
+        "thesis",
+        holdings,
+        prices,
+        cfg_a,
+        value_scores=value_scores,
+        benchmark_weights=bench_w,
+        chars=chars,
+    )
+    print(f"  Saved rebalance summary:  {rebalance_outputs['summary']}")
+    print(f"  Saved rebalance holdings: {rebalance_outputs['holdings']}")
+    print(f"  Saved rebalance managers: {rebalance_outputs['managers']}")
+    print(f"  Saved rebalance rules:    {rebalance_outputs['rules']}")
     manifest_payload = {
         "mode": mode,
         "live_config": LIVE_CONFIG if mode == "live" else None,
@@ -483,7 +565,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             "price_diagnostics": prices.attrs.get("price_diagnostics"),
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
-        "outputs": {"dashboard": dashboard_path},
+        "outputs": {"dashboard": dashboard_path, "rebalance_thesis": rebalance_outputs},
     }
     write_manifest(out_dir / "manifest.json", manifest_payload)
     print(f"  Saved dashboard: {dashboard_path}")

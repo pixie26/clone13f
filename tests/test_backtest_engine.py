@@ -15,7 +15,7 @@ from data_adapters import (
     mapping_diagnostics,
     priceable_holdings,
 )
-from engine import BacktestConfig, UniverseConfig, attribution, run_backtest
+from engine import BacktestConfig, PortfolioConfig, UniverseConfig, attribution, rebalance_trace, run_backtest
 from sweep import deflated_sharpe
 
 
@@ -49,6 +49,80 @@ def test_run_backtest_raises_on_missing_held_return():
 
     with pytest.raises(ValueError, match="Missing returns"):
         run_backtest(holdings, prices, cfg)
+
+
+def test_rebalance_trace_reports_auditable_rebalance_fields():
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 80.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "B",
+                "value": 20.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "m2",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-01-20"),
+                "accession_number": "a2",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 70.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "m2",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-01-20"),
+                "accession_number": "a2",
+                "submission_type": "13F-HR",
+                "ticker": "C",
+                "value": 30.0,
+                "sec_type": "SH",
+            },
+        ]
+    )
+    prices = pd.DataFrame(
+        {"A": [0.01], "B": [0.02], "C": [0.03]},
+        index=pd.to_datetime(["2020-01-31"]),
+    )
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(top_n_ideas=1, min_consensus_funds=2),
+    )
+
+    trace = rebalance_trace(holdings, prices, cfg)
+    summary = trace["summary"].iloc[0]
+
+    assert summary["rebalance_month"] == "2020-01-31"
+    assert summary["selected_managers"] == 2
+    assert summary["target_names"] == 1
+    assert summary["effective_names"] == 1
+    assert summary["turnover_one_way"] == pytest.approx(0.5)
+    assert summary["cost_bps"] == pytest.approx(7.5)
+    assert trace["holdings"]["ticker"].tolist() == ["A"]
+    assert set(trace["managers"]["manager"]) == {"m1", "m2"}
 
 
 def test_mapping_diagnostics_reports_unmapped_value():
