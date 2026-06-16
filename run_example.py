@@ -46,6 +46,7 @@ LIVE_CONFIG = {
     "max_put_weight": 0.10,
     "require_factors": False,
     "openfigi_cache_path": "openfigi_cache.parquet",
+    "price_cache_path": "yfinance_close_cache.parquet",
 }
 
 
@@ -239,7 +240,12 @@ def build_live_data(
         top_tickers = holdings.groupby("ticker")["value"].sum().nlargest(price_ticker_limit).index
         price_holdings = holdings[holdings["ticker"].isin(top_tickers)].copy()
         print(f"    smoke ticker subset: top {len(top_tickers)} tickers by disclosed value")
-    prices = da.fetch_prices(price_holdings.ticker.unique(), cfg["start"], cfg["end"])
+    prices = da.fetch_prices(
+        price_holdings.ticker.unique(),
+        cfg["start"],
+        cfg["end"],
+        cache_path=cfg.get("price_cache_path"),
+    )
     holdings = da.align_holdings_to_prices(price_holdings, prices)
     print("[1/6] Downloading Fama-French factors")
     try:
@@ -254,7 +260,12 @@ def build_live_data(
         factors.attrs["factor_diagnostics"] = {"available": False, "reason": str(exc)}
     print(f"[1/6] Downloading benchmark prices: {cfg['benchmark_ticker']}")
     try:
-        bench_ret = da.fetch_prices([cfg["benchmark_ticker"]], cfg["start"], cfg["end"]).iloc[:, 0]
+        bench_ret = da.fetch_prices(
+            [cfg["benchmark_ticker"]],
+            cfg["start"],
+            cfg["end"],
+            cache_path=cfg.get("price_cache_path"),
+        ).iloc[:, 0]
         bench_ret.name = cfg["benchmark_ticker"]
     except Exception as exc:
         print(f"    [warn] benchmark fetch failed; benchmark disabled: {exc}")

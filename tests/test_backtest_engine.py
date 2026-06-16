@@ -4,9 +4,11 @@ import pytest
 
 from data_adapters import (
     _is_yfinance_ticker,
+    _load_price_cache,
     _normalise_close_frame,
     _parse_ken_french_monthly_csv,
     _select_openfigi_ticker,
+    _write_price_cache,
     align_holdings_to_prices,
     map_holdings_to_tickers,
     mapping_diagnostics,
@@ -160,3 +162,24 @@ def test_normalise_close_frame_accepts_ticker_first_yfinance_columns():
 
     assert close.columns.tolist() == ["AAPL", "MSFT"]
     assert close.iloc[0].tolist() == [101.0, 201.0]
+
+
+def test_price_cache_preserves_existing_columns_and_filters_dates(tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    first = pd.DataFrame(
+        {"AAPL": [100.0, 101.0]},
+        index=pd.to_datetime(["2024-12-31", "2025-01-31"]),
+    )
+    second = pd.DataFrame(
+        {"MSFT": [200.0]},
+        index=pd.to_datetime(["2025-01-31"]),
+    )
+
+    _write_price_cache(cache_path, first)
+    _write_price_cache(cache_path, second)
+    loaded = _load_price_cache(cache_path, "2025-01-01", "2025-01-31")
+
+    assert loaded.index.tolist() == [pd.Timestamp("2025-01-31")]
+    assert loaded.columns.tolist() == ["AAPL", "MSFT"]
+    assert loaded.loc[pd.Timestamp("2025-01-31"), "AAPL"] == 101.0
+    assert loaded.loc[pd.Timestamp("2025-01-31"), "MSFT"] == 200.0

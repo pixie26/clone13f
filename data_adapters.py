@@ -154,6 +154,46 @@ def _yfinance_probe(yf, start: str, end: str) -> str:
     return f"probe_ok={','.join(map(str, non_empty))}"
 
 
+def _load_price_cache(cache_path: str | Path | None, start: str, end: str) -> pd.DataFrame:
+    if cache_path is None:
+        return pd.DataFrame()
+    path = Path(cache_path)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        px = pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame()
+    if px.empty:
+        return pd.DataFrame()
+    px.index = pd.to_datetime(px.index)
+    px.columns = [str(c).strip().upper() for c in px.columns]
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    return px.loc[(px.index >= s) & (px.index <= e)]
+
+
+def _write_price_cache(cache_path: str | Path | None, px: pd.DataFrame) -> None:
+    if cache_path is None or px.empty:
+        return
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = pd.DataFrame()
+    if path.exists():
+        try:
+            current = pd.read_parquet(path)
+        except Exception:
+            current = pd.DataFrame()
+    if not current.empty:
+        current.index = pd.to_datetime(current.index)
+        current.columns = [str(c).strip().upper() for c in current.columns]
+    px = px.copy()
+    px.index = pd.to_datetime(px.index)
+    px.columns = [str(c).strip().upper() for c in px.columns]
+    merged = pd.concat([current, px], axis=1) if not current.empty else px
+    merged = merged.loc[:, ~merged.columns.duplicated()].sort_index()
+    merged.to_parquet(path)
+
+
 # --------------------------------------------------------------------------- #
 # 1) 13F holdings from EDGAR  (public, free; retains dead filers => no survivorship)
 # --------------------------------------------------------------------------- #
@@ -396,6 +436,8 @@ def fetch_prices(
     batch_size: int = 50,
     max_retries: int = 2,
     rate_limit_sleep: int = 60,
+    cache_path: str | Path | None = None,
+    max_consecutive_empty_batches: int = 3,
 ) -> pd.DataFrame:
     ## FRICTION: yfinance has survivorship gaps (delisted names vanish). For a
     ##           publishable backtest use CRSP via WRDS; yfinance is fine first-pass.
@@ -408,22 +450,37 @@ def fetch_prices(
     if dropped:
         print(f"  [warn] price download: skipped {dropped} invalid ticker strings")
 
+    cache_px = _load_price_cache(cache_path, start, end)
+    cached_cols = sorted(set(clean).intersection(cache_px.columns)) if not cache_px.empty else []
     frames: list[pd.DataFrame] = []
+    if cached_cols:
+        cached_px = cache_px[cached_cols].dropna(axis=1, how="all")
+        if not cached_px.empty:
+            frames.append(cached_px)
+        print(f"  yfinance cache: {len(cached_cols)}/{len(clean)} tickers found at {cache_path}")
+
+    todo = sorted(set(clean) - set(cached_cols))
     failed_batches: list[str] = []
     empty_batches: list[str] = []
-    n_batches = int(np.ceil(len(clean) / batch_size))
-    print(f"  price download: {len(clean)} tickers in {n_batches} batches")
-    for i in range(0, len(clean), batch_size):
-        batch = clean[i:i + batch_size]
+    consecutive_empty = 0
+    n_batches = int(np.ceil(len(todo) / batch_size)) if todo else 0
+    print(f"  price download: {len(todo)} uncached / {len(clean)} requested tickers in {n_batches} batches")
+    for i in range(0, len(todo), batch_size):
+        batch = todo[i:i + batch_size]
         batch_no = i // batch_size + 1
         print(f"    yfinance batch {batch_no}/{n_batches}: {batch[0]}..{batch[-1]}")
         for attempt in range(max_retries + 1):
             try:
                 close = _yf_download_close(yf, batch, start, end)
                 if not close.empty:
-                    frames.append(close)
-                    if close.dropna(axis=1, how="all").empty:
+                    non_nan_close = close.dropna(axis=1, how="all")
+                    if non_nan_close.empty:
                         empty_batches.append(f"{batch[0]}..{batch[-1]}: all_nan_close")
+                        consecutive_empty += 1
+                    else:
+                        frames.append(non_nan_close)
+                        _write_price_cache(cache_path, non_nan_close)
+                        consecutive_empty = 0
                     break
                 last_attempt = attempt >= max_retries
                 if not last_attempt:
@@ -435,6 +492,7 @@ def fetch_prices(
                     time.sleep(wait)
                     continue
                 empty_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
+                consecutive_empty += 1
                 break
             except Exception as exc:
                 last_attempt = attempt >= max_retries
@@ -449,6 +507,19 @@ def fetch_prices(
                 failed_batches.append(f"{batch[0]}..{batch[-1]}: {exc}")
                 print(f"    [warn] yfinance batch failed: {batch[0]}..{batch[-1]}: {exc}")
                 break
+        if consecutive_empty >= max_consecutive_empty_batches:
+            probe = _yfinance_probe(yf, start, end)
+            if "probe_ok=" not in probe:
+                raise RuntimeError(
+                    "Stopping yfinance download after "
+                    f"{consecutive_empty} consecutive empty batches; {probe}; "
+                    f"recent empty batches: {empty_batches[-max_consecutive_empty_batches:]}"
+                )
+            print(
+                "    [warn] consecutive empty yfinance batches but probe succeeded; "
+                "continuing and treating those tickers as uncovered"
+            )
+            consecutive_empty = 0
         time.sleep(0.1)
 
     if not frames:
@@ -480,6 +551,7 @@ def fetch_prices(
         "tickers_with_close": int(px.shape[1]),
         "tickers_without_close": int(len(no_price)),
         "invalid_tickers_skipped": int(dropped),
+        "tickers_from_cache": int(len(cached_cols)),
         "failed_batches": failed_batches[:10],
         "empty_batches": empty_batches[:10],
     }

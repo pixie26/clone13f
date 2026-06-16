@@ -6,4 +6,5 @@ __pycache__/
 reports/
 artifacts/
 openfigi_cache.parquet
+yfinance_close_cache.parquet
 strategy_dashboard.png
