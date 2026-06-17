@@ -17,6 +17,7 @@ from data_adapters import (
     priceable_holdings,
 )
 from engine import BacktestConfig, PortfolioConfig, UniverseConfig, _cap_weights, attribution, rebalance_trace, run_backtest, target_weights_from_versions
+from run_example import _rebalance_summary_stats
 from sweep import deflated_sharpe
 
 
@@ -394,8 +395,65 @@ def test_rebalance_trace_reports_auditable_rebalance_fields():
     assert summary["effective_names"] == 1
     assert summary["turnover_one_way"] == pytest.approx(0.5)
     assert summary["cost_bps"] == pytest.approx(7.5)
+    assert summary["max_weight"] == pytest.approx(1.0)
+    assert summary["top5_weight"] == pytest.approx(1.0)
+    assert summary["top10_weight"] == pytest.approx(1.0)
+    assert summary["effective_number"] == pytest.approx(1.0)
+    assert summary["traded_names"] == 1
+    assert summary["buy_names"] == 1
+    assert summary["sell_names"] == 0
+    assert summary["increased_names"] == 1
+    assert summary["decreased_names"] == 0
     assert trace["holdings"]["ticker"].tolist() == ["A"]
     assert set(trace["managers"]["manager"]) == {"m1", "m2"}
+
+
+def test_rebalance_summary_stats_reports_portfolio_and_turnover_summary():
+    summary = pd.DataFrame(
+        [
+            {
+                "rebalance_month": "2020-01-31",
+                "effective_names": 10,
+                "target_names": 8,
+                "carried_names": 2,
+                "turnover_one_way": 0.25,
+                "cost_bps": 3.75,
+                "max_weight": 0.10,
+                "top5_weight": 0.45,
+                "top10_weight": 0.80,
+                "effective_number": 9.5,
+                "traded_names": 6,
+                "buy_names": 4,
+                "sell_names": 2,
+                "top_holdings": "A:10.00%",
+            },
+            {
+                "rebalance_month": "2020-02-29",
+                "effective_names": 12,
+                "target_names": 10,
+                "carried_names": 1,
+                "turnover_one_way": 0.40,
+                "cost_bps": 6.0,
+                "max_weight": 0.08,
+                "top5_weight": 0.40,
+                "top10_weight": 0.75,
+                "effective_number": 11.0,
+                "traded_names": 5,
+                "buy_names": 3,
+                "sell_names": 1,
+                "top_holdings": "B:8.00%",
+            },
+        ]
+    )
+
+    stats = _rebalance_summary_stats(summary)
+
+    assert stats["rebalance_months"] == 2
+    assert stats["avg_effective_names"] == pytest.approx(11)
+    assert stats["max_turnover_one_way"] == pytest.approx(0.40)
+    assert stats["avg_max_weight"] == pytest.approx(0.09)
+    assert stats["last_rebalance_month"] == "2020-02-29"
+    assert stats["last_top_holdings"] == "B:8.00%"
 
 
 def test_mapping_diagnostics_reports_unmapped_value():

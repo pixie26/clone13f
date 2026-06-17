@@ -387,7 +387,7 @@ def write_rebalance_outputs(
     benchmark_weights=None,
     chars=None,
     visible_versions_cache=None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     trace = rebalance_trace(
         holdings,
         prices,
@@ -414,7 +414,96 @@ def write_rebalance_outputs(
         encoding="utf-8",
     )
     outputs["rules"] = str(rules_path)
+    outputs["summary_stats"] = _rebalance_summary_stats(trace["summary"])
     return outputs
+
+
+def _pct(value: float) -> str:
+    return f"{value:.1%}" if pd.notna(value) else "n/a"
+
+
+def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
+    if summary.empty:
+        return {"rebalance_months": 0}
+    out: dict[str, Any] = {"rebalance_months": int(len(summary))}
+    numeric_cols = [
+        "selected_managers",
+        "effective_names",
+        "target_names",
+        "carried_names",
+        "turnover_one_way",
+        "cost_bps",
+        "max_weight",
+        "top5_weight",
+        "top10_weight",
+        "effective_number",
+        "traded_names",
+        "buy_names",
+        "sell_names",
+    ]
+    for col in numeric_cols:
+        if col not in summary:
+            continue
+        s = pd.to_numeric(summary[col], errors="coerce").dropna()
+        if s.empty:
+            continue
+        out[f"avg_{col}"] = float(s.mean())
+        out[f"max_{col}"] = float(s.max())
+    last = summary.iloc[-1]
+    out["last_rebalance_month"] = str(last.get("rebalance_month", ""))
+    out["last_effective_names"] = int(last.get("effective_names", 0) or 0)
+    out["last_turnover_one_way"] = float(last.get("turnover_one_way", 0.0) or 0.0)
+    out["last_max_weight"] = float(last.get("max_weight", 0.0) or 0.0)
+    out["last_top_holdings"] = str(last.get("top_holdings", ""))
+    return out
+
+
+def _print_rebalance_summary(stats: dict[str, Any]) -> None:
+    if not stats or stats.get("rebalance_months", 0) == 0:
+        print("  Rebalance summary: no rebalance months")
+        return
+    print("\n  Rebalance Summary")
+    print(f"  months                 {stats['rebalance_months']}")
+    print(
+        "  holdings avg/max       "
+        f"{stats.get('avg_effective_names', float('nan')):.1f}/"
+        f"{stats.get('max_effective_names', float('nan')):.0f}"
+    )
+    print(
+        "  traded names avg/max   "
+        f"{stats.get('avg_traded_names', float('nan')):.1f}/"
+        f"{stats.get('max_traded_names', float('nan')):.0f}"
+    )
+    print(
+        "  one-way turnover avg/max "
+        f"{_pct(stats.get('avg_turnover_one_way', float('nan')))}/"
+        f"{_pct(stats.get('max_turnover_one_way', float('nan')))}"
+    )
+    print(
+        "  max weight avg/max     "
+        f"{_pct(stats.get('avg_max_weight', float('nan')))}/"
+        f"{_pct(stats.get('max_max_weight', float('nan')))}"
+    )
+    print(
+        "  top10 weight avg/max   "
+        f"{_pct(stats.get('avg_top10_weight', float('nan')))}/"
+        f"{_pct(stats.get('max_top10_weight', float('nan')))}"
+    )
+    print(
+        "  cost bps avg/max       "
+        f"{stats.get('avg_cost_bps', float('nan')):.2f}/"
+        f"{stats.get('max_cost_bps', float('nan')):.2f}"
+    )
+    print(
+        "  latest rebalance       "
+        f"{stats.get('last_rebalance_month')} | "
+        f"names={stats.get('last_effective_names')} | "
+        f"turnover={_pct(stats.get('last_turnover_one_way', float('nan')))} | "
+        f"max_weight={_pct(stats.get('last_max_weight', float('nan')))}"
+    )
+    top = stats.get("last_top_holdings")
+    if top:
+        print(f"  latest top holdings    {top}")
 
 
 def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_tickers: int = 200) -> pathlib.Path:
@@ -612,6 +701,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     print(f"  Saved rebalance holdings: {rebalance_outputs['holdings']}")
     print(f"  Saved rebalance managers: {rebalance_outputs['managers']}")
     print(f"  Saved rebalance rules:    {rebalance_outputs['rules']}")
+    _print_rebalance_summary(rebalance_outputs.get("summary_stats", {}))
     manifest_payload = {
         "mode": mode,
         "live_config": LIVE_CONFIG if mode == "live" else None,
@@ -631,6 +721,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             "price_diagnostics": prices.attrs.get("price_diagnostics"),
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
+        "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),
         "outputs": {"dashboard": dashboard_path, "rebalance_thesis": rebalance_outputs},
     }
     write_manifest(out_dir / "manifest.json", manifest_payload)

@@ -366,6 +366,41 @@ def _apply_rebalance_target(cur: pd.Series,
     return eff_s, float(traded), carried
 
 
+def _portfolio_summary_stats(weights: pd.Series) -> dict[str, float]:
+    w = weights[weights > 0].astype(float)
+    if w.empty:
+        return {
+            "max_weight": 0.0,
+            "top5_weight": 0.0,
+            "top10_weight": 0.0,
+            "hhi": 0.0,
+            "effective_number": 0.0,
+        }
+    w = w / w.sum()
+    hhi = float((w ** 2).sum())
+    return {
+        "max_weight": float(w.max()),
+        "top5_weight": float(w.sort_values(ascending=False).head(5).sum()),
+        "top10_weight": float(w.sort_values(ascending=False).head(10).sum()),
+        "hhi": hhi,
+        "effective_number": float(1.0 / hhi) if hhi > 0 else 0.0,
+    }
+
+
+def _trade_summary_stats(before: pd.Series, after: pd.Series) -> dict[str, int]:
+    alln = before.index.union(after.index)
+    b = before.reindex(alln).fillna(0.0)
+    a = after.reindex(alln).fillna(0.0)
+    changed = (a - b).abs() > 1e-12
+    return {
+        "traded_names": int(changed.sum()),
+        "buy_names": int(((b <= 1e-12) & (a > 1e-12)).sum()),
+        "sell_names": int(((b > 1e-12) & (a <= 1e-12)).sum()),
+        "increased_names": int(((a - b) > 1e-12).sum()),
+        "decreased_names": int(((b - a) > 1e-12).sum()),
+    }
+
+
 def _apply_monthly_returns(cur: pd.Series,
                            prices: pd.DataFrame,
                            month: pd.Timestamp,
@@ -434,6 +469,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         priced_now = prices.columns[prices.loc[m].notna()]
         tgt = tgt[tgt.index.isin(priced_now)]
         if tgt.sum() <= 0:
+            portfolio_stats = _portfolio_summary_stats(cur)
             summary_rows.append({
                 "rebalance_month": m.date().isoformat(),
                 "selected_managers": int(len(selected_versions)),
@@ -443,6 +479,12 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                 "carried_names": 0,
                 "turnover_one_way": 0.0,
                 "cost_bps": 0.0,
+                **portfolio_stats,
+                "traded_names": 0,
+                "buy_names": 0,
+                "sell_names": 0,
+                "increased_names": 0,
+                "decreased_names": 0,
                 "top_holdings": "",
                 "note": "no positive target weights",
             })
@@ -450,6 +492,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
 
         eff, traded, carried = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m)
         cost_bps = traded * cfg.cost.bps_per_side
+        portfolio_stats = _portfolio_summary_stats(eff)
+        trade_stats = _trade_summary_stats(cur, eff)
         top = eff.sort_values(ascending=False).head(12)
         summary_rows.append({
             "rebalance_month": m.date().isoformat(),
@@ -460,6 +504,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             "carried_names": int(len(carried)),
             "turnover_one_way": float(traded),
             "cost_bps": float(cost_bps),
+            **portfolio_stats,
+            **trade_stats,
             "top_holdings": "; ".join(f"{k}:{v:.2%}" for k, v in top.items()),
             "note": "",
         })
