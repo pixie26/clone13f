@@ -842,6 +842,8 @@ def _print_startup_parameters(
     test_m: int | None = None,
     smoke_cusips: int | None = None,
     smoke_tickers: int | None = None,
+    skip_marginal: bool = False,
+    skip_sweep: bool = False,
 ) -> None:
     print("\nRun Parameters")
     print(f"  mode                  {mode}")
@@ -898,10 +900,21 @@ def _print_startup_parameters(
         print(f"  sweep trials          {int(np.prod([len(v) for v in axes.values()]))}")
     if train_m is not None and test_m is not None:
         print(f"  walk-forward          train={train_m}m, test={test_m}m, select_on=active_sharpe")
+    print(f"  skip_marginal         {skip_marginal}")
+    print(f"  skip_sweep            {skip_sweep}")
     print("")
 
 
-def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_tickers: int = 200) -> pathlib.Path:
+def run(
+    mode: str,
+    output_root: pathlib.Path,
+    *,
+    smoke_cusips: int = 300,
+    smoke_tickers: int = 200,
+    skip_marginal: bool = False,
+    skip_sweep: bool = False,
+    sweep_checkpoint_every: int = 5,
+) -> pathlib.Path:
     cfg_a, cfg_b, axes, train_m, test_m = _default_run_configs()
     _print_startup_parameters(
         mode=mode,
@@ -913,6 +926,8 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         test_m=None if mode == "live-smoke" else test_m,
         smoke_cusips=smoke_cusips,
         smoke_tickers=smoke_tickers,
+        skip_marginal=skip_marginal,
+        skip_sweep=skip_sweep,
     )
     if mode == "synthetic":
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
@@ -920,6 +935,11 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         return run_live_smoke(output_root, cusip_limit=smoke_cusips, ticker_limit=smoke_tickers)
     else:
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(LIVE_CONFIG)
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_dir = output_root / run_id
+    out_dir.mkdir(parents=True, exist_ok=False)
+    print(f"[output] Writing incremental reports under {out_dir}")
 
     print("[2/6] Computing per-manager characteristics")
     t_step = time.perf_counter()
@@ -936,7 +956,17 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     print("[3/6] Running thesis and placebo backtests")
     t_step = time.perf_counter()
     print("    thesis backtest running")
-    ret_a = run_backtest(holdings, prices, cfg_a, value_scores, bench_w, chars, visible_cache, security_groups)
+    ret_a = run_backtest(
+        holdings,
+        prices,
+        cfg_a,
+        value_scores,
+        bench_w,
+        chars,
+        visible_cache,
+        security_groups,
+        capture_rebalance=True,
+    )
     print(f"    thesis backtest done in {time.perf_counter() - t_step:.1f}s")
     t_placebo = time.perf_counter()
     print("    placebo backtest running")
@@ -952,46 +982,119 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             val = att.get(key)
             print(f"  {key:<22} {round(val, 3) if isinstance(val, float) else val}")
 
-    print("\n[4/6] Marginal-IR ablation")
-    t_step = time.perf_counter()
-    ablation = marginal_ir(
-        holdings,
-        prices,
-        factors,
-        cfg_a,
-        bench_ret,
-        value_scores,
-        bench_w,
-        chars=chars,
-        visible_versions_cache=visible_cache,
+    dashboard_params = _dashboard_parameter_summary(
+        mode=mode,
+        cfg=cfg_a,
+        prices=prices,
+        holdings=holdings,
+        benchmark=bench_ret,
+        axes=axes,
+        train_m=train_m,
+        test_m=test_m,
         security_groups=security_groups,
-        verbose=True,
     )
-    print(f"  marginal-ir total time {time.perf_counter() - t_step:.1f}s")
-    print(ablation.to_string(index=False))
+    thesis_summary = ret_a.attrs.get("rebalance_summary", pd.DataFrame())
+    thesis_summary_path = out_dir / "rebalance_summary_thesis_partial.csv"
+    thesis_summary.to_csv(thesis_summary_path, index=False)
+    stage3_stats = _rebalance_summary_stats(thesis_summary)
+    print(f"  Saved thesis rebalance summary: {thesis_summary_path}")
+    _print_rebalance_summary(stage3_stats)
+    stage3_payload = {
+        "stage": "after_thesis_placebo",
+        "mode": mode,
+        "cfg_thesis": asdict(cfg_a),
+        "cfg_placebo": asdict(cfg_b),
+        "sweep_axes": {f"{scope}.{field}": values for (scope, field), values in axes.items()},
+        "metrics": {"thesis": att_a, "placebo": att_b},
+        "rebalance_summary_stats": stage3_stats,
+        "outputs": {"rebalance_summary_thesis_partial": str(thesis_summary_path)},
+    }
+    write_manifest(out_dir / "manifest_stage3.json", stage3_payload)
+    quick_dashboard_path = dashboard(
+        ret_a,
+        ret_b,
+        bench_ret,
+        factors,
+        pd.DataFrame({"filter": ["(skipped)"], "metric": [np.nan], "delta": [np.nan]}),
+        pd.DataFrame(),
+        heat_x="max_portfolio_names",
+        heat_y="aum_band",
+        dsr_info={
+            "note": "sweep not run yet",
+            "metric": "active_return_vs_benchmark",
+            "benchmark": getattr(bench_ret, "name", None) if bench_ret is not None else None,
+            "n_trials": int(np.prod([len(v) for v in axes.values()])),
+            "T": 0,
+        },
+        parameter_summary=dashboard_params,
+        title=f"13F-clone quick dashboard [{mode.upper()} DATA]",
+        path=str(out_dir / "strategy_dashboard_stage3.png"),
+    )
+    print(f"  Saved quick dashboard: {quick_dashboard_path}")
 
-    print("\n[5/6] Grid eval and walk-forward sweep")
-    t_step = time.perf_counter()
-    grid = grid_eval(
-        holdings,
-        prices,
-        factors,
-        cfg_a,
-        axes,
-        bench_ret,
-        value_scores,
-        bench_w,
-        metric="active_sharpe",
-        chars=chars,
-        visible_versions_cache=visible_cache,
-        verbose=True,
-        include_returns=True,
-        security_groups=security_groups,
-    )
-    grid_returns = grid.attrs.get("returns_by_config")
-    print(f"  grid eval total time {time.perf_counter() - t_step:.1f}s")
+    if skip_marginal:
+        print("\n[4/6] Marginal-IR ablation skipped")
+        ablation = pd.DataFrame({"filter": ["(skipped)"], "metric": [np.nan], "delta": [np.nan]})
+    else:
+        print("\n[4/6] Marginal-IR ablation")
+        t_step = time.perf_counter()
+        ablation = marginal_ir(
+            holdings,
+            prices,
+            factors,
+            cfg_a,
+            bench_ret,
+            value_scores,
+            bench_w,
+            chars=chars,
+            visible_versions_cache=visible_cache,
+            security_groups=security_groups,
+            verbose=True,
+        )
+        print(f"  marginal-ir total time {time.perf_counter() - t_step:.1f}s")
+        print(ablation.to_string(index=False))
+
+    grid_returns = {}
     required_m = train_m + test_m
-    if len(prices) >= required_m:
+    if skip_sweep:
+        print("\n[5/6] Grid eval and walk-forward sweep skipped")
+        grid = pd.DataFrame()
+        oos_ret = pd.Series(dtype=float)
+        wf_log = pd.DataFrame()
+        n_trials = int(np.prod([len(v) for v in axes.values()]))
+        dsr = {
+            "note": "skipped by --skip-sweep",
+            "metric": "active_return_vs_benchmark",
+            "benchmark": getattr(bench_ret, "name", None) if bench_ret is not None else None,
+            "n_trials": int(n_trials),
+            "price_months": int(len(prices)),
+            "required_months": int(required_m),
+            "T": 0,
+        }
+    else:
+        print("\n[5/6] Grid eval and walk-forward sweep")
+        t_step = time.perf_counter()
+        grid = grid_eval(
+            holdings,
+            prices,
+            factors,
+            cfg_a,
+            axes,
+            bench_ret,
+            value_scores,
+            bench_w,
+            metric="active_sharpe",
+            chars=chars,
+            visible_versions_cache=visible_cache,
+            verbose=True,
+            include_returns=True,
+            security_groups=security_groups,
+            checkpoint_dir=out_dir,
+            checkpoint_every=sweep_checkpoint_every,
+        )
+        grid_returns = grid.attrs.get("returns_by_config")
+        print(f"  grid eval total time {time.perf_counter() - t_step:.1f}s")
+    if not skip_sweep and len(prices) >= required_m:
         oos_ret, wf_log, n_trials = walk_forward(
             holdings,
             prices,
@@ -1019,7 +1122,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         dsr["metric"] = "active_return_vs_benchmark"
         dsr["benchmark"] = getattr(bench_ret, "name", None) if bench_ret is not None else None
         dsr["raw_oos_months"] = int(len(oos_ret.dropna()))
-    else:
+    elif not skip_sweep:
         n_trials = int(np.prod([len(v) for v in axes.values()]))
         oos_ret = pd.Series(dtype=float)
         wf_log = pd.DataFrame()
@@ -1043,33 +1146,21 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         print(f"  n_trials               {dsr.get('n_trials')}")
         print(f"  Deflated Sharpe (DSR)  {dsr.get('DSR', float('nan')):.2f}")
 
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_dir = output_root / run_id
-    out_dir.mkdir(parents=True, exist_ok=False)
-
-    print("\n[6/6] Writing sweep result files")
-    sweep_outputs = write_sweep_outputs(
-        out_dir,
-        grid,
-        grid.attrs.get("returns_by_config_id"),
-        bench_ret,
-    )
-    print(f"  Saved sweep grid:       {sweep_outputs['grid']}")
-    print(f"  Saved sweep returns:    {sweep_outputs['returns']}")
-    print(f"  Saved interactive HTML: {sweep_outputs['interactive_html']}")
+    if skip_sweep:
+        sweep_outputs = {}
+    else:
+        print("\n[6/6] Writing sweep result files")
+        sweep_outputs = write_sweep_outputs(
+            out_dir,
+            grid,
+            grid.attrs.get("returns_by_config_id"),
+            bench_ret,
+        )
+        print(f"  Saved sweep grid:       {sweep_outputs['grid']}")
+        print(f"  Saved sweep returns:    {sweep_outputs['returns']}")
+        print(f"  Saved interactive HTML: {sweep_outputs['interactive_html']}")
 
     print("\n[6/6] Rendering strategy dashboard")
-    dashboard_params = _dashboard_parameter_summary(
-        mode=mode,
-        cfg=cfg_a,
-        prices=prices,
-        holdings=holdings,
-        benchmark=bench_ret,
-        axes=axes,
-        train_m=train_m,
-        test_m=test_m,
-        security_groups=security_groups,
-    )
     dashboard_path = dashboard(
         ret_a,
         ret_b,
@@ -1159,6 +1250,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", default="reports", help="Directory for run outputs.")
     parser.add_argument("--smoke-cusips", type=int, default=300, help="Top CUSIPs by value to map in live-smoke mode.")
     parser.add_argument("--smoke-tickers", type=int, default=200, help="Top tickers by value to price in live-smoke mode.")
+    parser.add_argument("--skip-marginal", action="store_true", help="Skip marginal-IR ablation after thesis/placebo.")
+    parser.add_argument("--skip-sweep", action="store_true", help="Skip parameter grid and walk-forward sweep.")
+    parser.add_argument(
+        "--sweep-checkpoint-every",
+        type=int,
+        default=5,
+        help="Write sweep_grid_partial.csv every N grid configs; 0 disables checkpointing.",
+    )
     return parser.parse_args()
 
 
@@ -1170,6 +1269,9 @@ def main() -> None:
         pathlib.Path(args.output_root),
         smoke_cusips=args.smoke_cusips,
         smoke_tickers=args.smoke_tickers,
+        skip_marginal=args.skip_marginal,
+        skip_sweep=args.skip_sweep,
+        sweep_checkpoint_every=args.sweep_checkpoint_every,
     )
 
 

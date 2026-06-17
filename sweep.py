@@ -12,6 +12,7 @@ Two outputs, kept strictly separate:
 from __future__ import annotations
 import itertools, math
 import time
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from dataclasses import fields, replace
@@ -200,12 +201,32 @@ def _needs_factor_attribution(metric: str) -> bool:
     return metric not in {"active", "active_sharpe"}
 
 
+def _write_grid_checkpoint(rows: list[dict], checkpoint_dir, returns_by_config_id: dict[str, pd.Series] | None = None) -> None:
+    if checkpoint_dir is None:
+        return
+    path = Path(checkpoint_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(path / "sweep_grid_partial.csv", index=False)
+    if returns_by_config_id:
+        ret_rows = []
+        for config_id, ret in returns_by_config_id.items():
+            for date, value in ret.replace([np.inf, -np.inf], np.nan).dropna().items():
+                ret_rows.append({
+                    "config_id": config_id,
+                    "date": pd.Timestamp(date).date().isoformat(),
+                    "return": float(value),
+                })
+        pd.DataFrame(ret_rows).to_csv(path / "sweep_returns_partial.csv", index=False)
+
+
 def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
               value_scores=None, benchmark_weights=None, metric="sharpe",
               chars=None, visible_versions_cache=None, verbose: bool = False,
               include_returns: bool = False, security_groups=None,
               include_factor_metrics: bool | None = None,
-              use_selection_cache: bool = True) -> pd.DataFrame:
+              use_selection_cache: bool = True,
+              checkpoint_dir=None,
+              checkpoint_every: int = 5) -> pd.DataFrame:
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
     visible_cache = visible_versions_cache if visible_versions_cache is not None else build_visible_versions_cache(ch, prices.index)
     run_attribution = _needs_factor_attribution(metric) if include_factor_metrics is None else bool(include_factor_metrics)
@@ -291,6 +312,12 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
             "active_sharpe": active_sharpe,
             **_rebalance_validity_metrics(ret.attrs.get("rebalance_summary"), cfg),
         })
+        if checkpoint_dir is not None and (i == total or (checkpoint_every > 0 and i % checkpoint_every == 0)):
+            _write_grid_checkpoint(
+                rows,
+                checkpoint_dir,
+                returns_by_config_id if include_returns else None,
+            )
     out = pd.DataFrame(rows)
     if include_returns:
         out.attrs["returns_by_config"] = returns_by_config

@@ -553,6 +553,53 @@ def test_grid_eval_active_sharpe_skips_factor_attribution(monkeypatch):
     assert pd.isna(grid.loc[0, "alpha_t"])
 
 
+def test_grid_eval_writes_partial_checkpoint(tmp_path, monkeypatch):
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    prices = pd.DataFrame({"A": [0.0, 0.0, 0.0]}, index=months)
+    benchmark = pd.Series([0.0, 0.01, 0.0], index=months, name="SPY")
+    base = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="level"),
+    )
+
+    def fake_run_backtest(*args, **kwargs):
+        out = pd.Series([0.01, 0.02, 0.03], index=months)
+        out.attrs["rebalance_summary"] = pd.DataFrame({"effective_names": [10], "valid_rebalance": [True]})
+        return out
+
+    monkeypatch.setattr(sw, "run_backtest", fake_run_backtest)
+
+    sw.grid_eval(
+        pd.DataFrame(),
+        prices,
+        pd.DataFrame(index=months),
+        base,
+        {("portfolio", "top_n_ideas"): [5, 10]},
+        benchmark=benchmark,
+        metric="active_sharpe",
+        chars=pd.DataFrame(),
+        visible_versions_cache={},
+        use_selection_cache=False,
+        include_returns=True,
+        checkpoint_dir=tmp_path,
+        checkpoint_every=1,
+    )
+
+    grid_path = tmp_path / "sweep_grid_partial.csv"
+    returns_path = tmp_path / "sweep_returns_partial.csv"
+    assert grid_path.exists()
+    assert returns_path.exists()
+    assert len(pd.read_csv(grid_path)) == 2
+    assert {"config_id", "active_sharpe", "invested_month_frac"}.issubset(pd.read_csv(grid_path).columns)
+
+
 def test_grid_eval_factor_metric_runs_attribution(monkeypatch):
     months = pd.date_range("2020-01-31", periods=3, freq="ME")
     prices = pd.DataFrame({"A": [0.0, 0.0, 0.0]}, index=months)
