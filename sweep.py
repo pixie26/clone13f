@@ -37,9 +37,27 @@ def iter_configs(base: BacktestConfig, axes: dict) -> list[tuple[dict, BacktestC
     return out
 
 
+def _label_key(label: dict) -> tuple:
+    return tuple(sorted(label.items()))
+
+
 def _periodic_sharpe(r: pd.Series) -> float:
     r = r.dropna()
     return r.mean() / r.std() if r.std() else 0.0
+
+
+def active_return_stream(returns: pd.Series, benchmark: pd.Series | None) -> pd.Series:
+    if benchmark is None:
+        return returns.dropna()
+    active = pd.concat([returns.rename("ret"), benchmark.reindex(returns.index).rename("bench")], axis=1)
+    active = active.replace([np.inf, -np.inf], np.nan).dropna()
+    return active["ret"] - active["bench"]
+
+
+def _score_series(returns: pd.Series, benchmark: pd.Series | None, metric: str) -> pd.Series:
+    if metric in {"active", "active_sharpe", "ir", "ir_vs_benchmark"}:
+        return active_return_stream(returns, benchmark)
+    return returns.dropna()
 
 
 def _fmt_metric(value) -> str:
@@ -48,10 +66,12 @@ def _fmt_metric(value) -> str:
 
 def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
               value_scores=None, benchmark_weights=None, metric="sharpe",
-              chars=None, visible_versions_cache=None, verbose: bool = False) -> pd.DataFrame:
+              chars=None, visible_versions_cache=None, verbose: bool = False,
+              include_returns: bool = False) -> pd.DataFrame:
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
     visible_cache = visible_versions_cache or build_visible_versions_cache(ch, prices.index)
     rows = []
+    returns_by_config: dict[tuple, pd.Series] = {}
     configs = iter_configs(base, axes)
     total = len(configs)
     for i, (label, cfg) in enumerate(configs, start=1):
@@ -59,20 +79,28 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
             print(f"  grid {i}/{total} running {label}")
             t0 = time.perf_counter()
         ret = run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache)
+        if include_returns:
+            returns_by_config[_label_key(label)] = ret
         att = attribution(ret, factors, benchmark)
+        active_sharpe = _periodic_sharpe(active_return_stream(ret, benchmark)) * math.sqrt(12)
         if verbose:
-            chosen = att.get(metric, att.get("sharpe"))
+            chosen = active_sharpe if metric in {"active", "active_sharpe"} else att.get(metric, att.get("sharpe"))
             print(f"    done grid {i}/{total} in {time.perf_counter() - t0:.1f}s {metric}={_fmt_metric(chosen)}")
         rows.append({**label, "sharpe": att.get("sharpe"),
                      "ann_alpha": att.get("ann_alpha"), "alpha_t": att.get("alpha_t"),
-                     "ir": att.get("ir_vs_benchmark")})
-    return pd.DataFrame(rows)
+                     "ir": att.get("ir_vs_benchmark"),
+                     "active_sharpe": active_sharpe})
+    out = pd.DataFrame(rows)
+    if include_returns:
+        out.attrs["returns_by_config"] = returns_by_config
+    return out
 
 
 def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                  value_scores=None, benchmark_weights=None,
                  train_m=36, test_m=12, select_on="sharpe",
-                 chars=None, visible_versions_cache=None, verbose: bool = False):
+                 chars=None, visible_versions_cache=None, verbose: bool = False,
+                 precomputed_returns: dict[tuple, pd.Series] | None = None):
     """Rolling OOS. Returns (oos_returns, fold_log, n_trials)."""
     configs = iter_configs(base, axes)
     n_trials = len(configs)
@@ -98,21 +126,27 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
             if verbose:
                 print(f"    train config {i}/{n_trials} {label}")
                 t0 = time.perf_counter()
-            ret = run_backtest(holdings, prices.loc[tr], cfg, value_scores, benchmark_weights, ch, visible_cache)
-            sc = _periodic_sharpe(ret)
+            if precomputed_returns is not None and _label_key(label) in precomputed_returns:
+                ret = precomputed_returns[_label_key(label)].reindex(tr)
+            else:
+                ret = run_backtest(holdings, prices.loc[tr], cfg, value_scores, benchmark_weights, ch, visible_cache)
+            sc = _periodic_sharpe(_score_series(ret, benchmark.reindex(tr) if benchmark is not None else None, select_on))
             if verbose:
-                print(f"      done in {time.perf_counter() - t0:.1f}s train_sharpe={_fmt_metric(sc)}")
+                print(f"      done in {time.perf_counter() - t0:.1f}s train_{select_on}={_fmt_metric(sc)}")
             if sc > best_score:
                 best, best_score, best_lbl = cfg, sc, label
         if verbose:
-            print(f"    selected {best_lbl} train_sharpe={_fmt_metric(best_score)}; running test window")
+            print(f"    selected {best_lbl} train_{select_on}={_fmt_metric(best_score)}; running test window")
             t0 = time.perf_counter()
-        te_ret = run_backtest(holdings, prices.loc[months[:start + train_m + test_m]],
-                              best, value_scores, benchmark_weights, ch, visible_cache).reindex(te)
+        if precomputed_returns is not None and _label_key(best_lbl) in precomputed_returns:
+            te_ret = precomputed_returns[_label_key(best_lbl)].reindex(te)
+        else:
+            te_ret = run_backtest(holdings, prices.loc[months[:start + train_m + test_m]],
+                                  best, value_scores, benchmark_weights, ch, visible_cache).reindex(te)
         if verbose:
             print(f"    done test fold {fold_no}/{n_folds} in {time.perf_counter() - t0:.1f}s")
         oos.append(te_ret)
-        log.append({"test_start": te[0], "test_end": te[-1], "train_sharpe": best_score, **best_lbl})
+        log.append({"test_start": te[0], "test_end": te[-1], f"train_{select_on}": best_score, **best_lbl})
         start += test_m
     oos_ret = pd.concat(oos).sort_index() if oos else pd.Series(dtype=float)
     return oos_ret, pd.DataFrame(log), n_trials

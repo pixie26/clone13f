@@ -34,7 +34,7 @@ from engine import (
     run_backtest,
 )
 from report import dashboard
-from sweep import deflated_sharpe, grid_eval, walk_forward
+from sweep import active_return_stream, deflated_sharpe, grid_eval, walk_forward
 
 
 LIVE_CONFIG = {
@@ -366,6 +366,12 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
             "value_tilt_active": bool(cfg.universe.use_value_tilt and value_scores is not None),
             "active_share_configured": bool(cfg.universe.use_active_share),
             "active_share_active": bool(cfg.universe.use_active_share and benchmark_weights is not None),
+            "active_weight_signal": cfg.portfolio.idea_signal == "active_weight",
+            "active_weight_benchmark": (
+                "PIT equal-manager aggregate of all visible latest 13F books at each rebalance"
+                if cfg.portfolio.idea_signal == "active_weight"
+                else None
+            ),
         },
     }
 
@@ -495,7 +501,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
 
     print("\n[5/6] Grid eval and walk-forward sweep")
     axes = {
-        ("portfolio", "idea_signal"): ["level", "change"],
+        ("portfolio", "idea_signal"): ["level", "change", "initiation", "active_weight"],
         ("portfolio", "min_consensus_funds"): [1, 2],
         ("portfolio", "top_n_ideas"): [5, 8],
         ("universe", "turnover_quantile"): [0.34, 0.50],
@@ -510,10 +516,13 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         bench_ret,
         value_scores,
         bench_w,
+        metric="active_sharpe",
         chars=chars,
         visible_versions_cache=visible_cache,
         verbose=True,
+        include_returns=True,
     )
+    grid_returns = grid.attrs.get("returns_by_config")
     print(f"  grid eval total time {time.perf_counter() - t_step:.1f}s")
     train_m, test_m = 48, 12
     required_m = train_m + test_m
@@ -529,21 +538,29 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             bench_w,
             train_m=train_m,
             test_m=test_m,
+            select_on="active_sharpe",
             chars=chars,
             visible_versions_cache=visible_cache,
             verbose=True,
+            precomputed_returns=grid_returns,
         )
+        oos_dsr_stream = active_return_stream(oos_ret, bench_ret)
         dsr = deflated_sharpe(
-            oos_ret,
+            oos_dsr_stream,
             n_trials,
-            sr_variance=float(np.nanvar(grid["sharpe"] / np.sqrt(12))),
+            sr_variance=float(np.nanvar(grid["active_sharpe"] / np.sqrt(12))),
         )
+        dsr["metric"] = "active_return_vs_benchmark"
+        dsr["benchmark"] = getattr(bench_ret, "name", None) if bench_ret is not None else None
+        dsr["raw_oos_months"] = int(len(oos_ret.dropna()))
     else:
         n_trials = int(np.prod([len(v) for v in axes.values()]))
         oos_ret = pd.Series(dtype=float)
         wf_log = pd.DataFrame()
         dsr = {
             "note": "insufficient price history for walk-forward",
+            "metric": "active_return_vs_benchmark",
+            "benchmark": getattr(bench_ret, "name", None) if bench_ret is not None else None,
             "price_months": int(len(prices)),
             "required_months": int(required_m),
             "train_m": int(train_m),
@@ -552,11 +569,11 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             "T": 0,
         }
     if "note" in dsr:
-        print(f"  OOS ann. Sharpe        skipped ({dsr['note']})")
+        print(f"  OOS active Sharpe      skipped ({dsr['note']})")
         print(f"  price months           {dsr.get('price_months', len(oos_ret))}/{dsr.get('required_months', required_m)}")
         print(f"  n_trials               {dsr.get('n_trials')}")
     else:
-        print(f"  OOS ann. Sharpe        {dsr.get('ann_SR', float('nan')):.2f}")
+        print(f"  OOS active Sharpe      {dsr.get('ann_SR', float('nan')):.2f}")
         print(f"  n_trials               {dsr.get('n_trials')}")
         print(f"  Deflated Sharpe (DSR)  {dsr.get('DSR', float('nan')):.2f}")
 

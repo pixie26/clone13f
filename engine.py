@@ -47,11 +47,12 @@ class UniverseConfig:
 @dataclass
 class PortfolioConfig:
     top_n_ideas: int = 8
-    idea_signal: str = "level"              # "level" | "change" | "initiation"
+    idea_signal: str = "level"              # "level" | "change" | "initiation" | "active_weight"
     consensus_weight: bool = True
     min_consensus_funds: int = 1            # drop names held by < this many in-universe funds
     max_name_weight: float = 0.05
     holding_horizon_q: int = 0              # 0 = full rebalance; N = carry N extra quarters
+    min_active_weight_holdings: int = 20    # active_weight needs a diversified book to be meaningful
 
 
 @dataclass
@@ -86,6 +87,25 @@ def _active_share(w: pd.Series, wb: pd.Series | None) -> float:
     b = wb.reindex(alln).fillna(0.0)
     b = b / b.sum() if b.sum() > 0 else b
     return float(0.5 * (a - b).abs().sum())
+
+
+def _aggregate_book_weights(books) -> pd.Series:
+    """Equal-manager aggregate of visible 13F books, used as a PIT benchmark proxy."""
+    total = pd.Series(dtype=float)
+    n = 0
+    for book in books:
+        if book is None or len(book) == 0:
+            continue
+        w = pd.Series(book, dtype=float)
+        w = w[w > 0]
+        if w.empty:
+            continue
+        total = total.add(w / w.sum(), fill_value=0.0)
+        n += 1
+    if n == 0:
+        return total
+    total = total / n
+    return total / total.sum() if total.sum() > 0 else total
 
 
 def _versioned_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
@@ -247,29 +267,50 @@ def select_universe(chars, asof, cfg: UniverseConfig, value_scores=None) -> list
 
 
 # --------------------------------------------------------------------------- #
-def _idea_scores(cur: pd.Series, prev: pd.Series | None, cfg: PortfolioConfig) -> pd.Series:
-    if cfg.idea_signal == "level" or prev is None:
+def _idea_scores(
+    cur: pd.Series,
+    prev: pd.Series | None,
+    cfg: PortfolioConfig,
+    active_benchmark_weights: pd.Series | None = None,
+) -> pd.Series:
+    if cfg.idea_signal == "level":
         s = cur
     elif cfg.idea_signal == "change":
-        alln = cur.index.union(prev.index)
-        s = (cur.reindex(alln).fillna(0.0) - prev.reindex(alln).fillna(0.0)).clip(lower=0)
+        if prev is None:
+            s = cur
+        else:
+            alln = cur.index.union(prev.index)
+            s = (cur.reindex(alln).fillna(0.0) - prev.reindex(alln).fillna(0.0)).clip(lower=0)
     elif cfg.idea_signal == "initiation":
-        new = cur.index.difference(prev.index)
+        new = cur.index.difference(prev.index) if prev is not None else cur.index
         s = cur.reindex(new).fillna(0.0)
+    elif cfg.idea_signal == "active_weight":
+        if active_benchmark_weights is None or len(active_benchmark_weights) == 0:
+            return pd.Series(dtype=float)
+        if int((cur > 0).sum()) < cfg.min_active_weight_holdings:
+            return pd.Series(dtype=float)
+        bench = active_benchmark_weights / active_benchmark_weights.sum()
+        s = (cur - bench.reindex(cur.index).fillna(0.0)).clip(lower=0)
     else:
         raise ValueError(cfg.idea_signal)
     return s[s > 0].sort_values(ascending=False).head(cfg.top_n_ideas)
 
 
-def target_weights_from_versions(latest_versions: pd.DataFrame, cfg: PortfolioConfig) -> pd.Series:
+def target_weights_from_versions(
+    latest_versions: pd.DataFrame,
+    cfg: PortfolioConfig,
+    active_benchmark_weights: pd.Series | None = None,
+) -> pd.Series:
     if latest_versions.empty:
         return pd.Series(dtype=float)
+    if cfg.idea_signal == "active_weight" and active_benchmark_weights is None:
+        active_benchmark_weights = _aggregate_book_weights(latest_versions["bw"])
     score: dict[str, float] = {}
     count: dict[str, int] = {}
     for cur_row in latest_versions.itertuples(index=False):
         cur = getattr(cur_row, "bw")
         prev = getattr(cur_row, "prev_bw", None)
-        picks = _idea_scores(cur, prev, cfg)
+        picks = _idea_scores(cur, prev, cfg, active_benchmark_weights)
         for tkr, wt in picks.items():
             score[tkr] = score.get(tkr, 0.0) + (float(wt) if cfg.consensus_weight else 1.0)
             count[tkr] = count.get(tkr, 0) + 1
@@ -378,12 +419,17 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
         if latest_versions is None:
             latest_versions = _visible_manager_versions(chars, m)
+        active_benchmark_weights = (
+            _aggregate_book_weights(latest_versions["bw"])
+            if cfg.portfolio.idea_signal == "active_weight"
+            else None
+        )
         selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
         selected_managers = selected_versions["manager"].tolist() if not selected_versions.empty else []
         for manager in selected_managers:
             manager_rows.append({"rebalance_month": m.date().isoformat(), "manager": manager})
 
-        tgt = target_weights_from_versions(selected_versions, cfg.portfolio)
+        tgt = target_weights_from_versions(selected_versions, cfg.portfolio, active_benchmark_weights)
         target_names_before_price_filter = int(len(tgt))
         priced_now = prices.columns[prices.loc[m].notna()]
         tgt = tgt[tgt.index.isin(priced_now)]
@@ -454,8 +500,13 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
             latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
             if latest_versions is None:
                 latest_versions = _visible_manager_versions(chars, m)
+            active_benchmark_weights = (
+                _aggregate_book_weights(latest_versions["bw"])
+                if cfg.portfolio.idea_signal == "active_weight"
+                else None
+            )
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
-            tgt = target_weights_from_versions(selected_versions, cfg.portfolio)
+            tgt = target_weights_from_versions(selected_versions, cfg.portfolio, active_benchmark_weights)
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
             if tgt.sum() > 0:

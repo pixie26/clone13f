@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 import data_adapters as da
+import sweep as sw
 from data_adapters import (
     _is_yfinance_ticker,
     _load_price_cache,
@@ -15,7 +16,7 @@ from data_adapters import (
     mapping_diagnostics,
     priceable_holdings,
 )
-from engine import BacktestConfig, PortfolioConfig, UniverseConfig, _cap_weights, attribution, rebalance_trace, run_backtest
+from engine import BacktestConfig, PortfolioConfig, UniverseConfig, _cap_weights, attribution, rebalance_trace, run_backtest, target_weights_from_versions
 from sweep import deflated_sharpe
 
 
@@ -133,6 +134,147 @@ def test_cap_weights_enforces_feasible_name_cap():
 
     assert capped.sum() == pytest.approx(1.0)
     assert capped.max() <= 0.25 + 1e-12
+
+
+def test_active_weight_signal_uses_relative_overweight_not_absolute_level():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"SPY": 0.40, "A": 0.30, "B": 0.30}),
+                "prev_bw": None,
+            }
+        ]
+    )
+    benchmark = pd.Series({"SPY": 0.50, "A": 0.05, "B": 0.45})
+    cfg = PortfolioConfig(
+        idea_signal="active_weight",
+        top_n_ideas=1,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=1,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark)
+
+    assert target.index.tolist() == ["A"]
+    assert target.loc["A"] == pytest.approx(1.0)
+
+
+def test_active_weight_signal_requires_minimum_book_breadth():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.80, "B": 0.20}),
+                "prev_bw": None,
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.10, "C": 0.80})
+    cfg = PortfolioConfig(
+        idea_signal="active_weight",
+        top_n_ideas=1,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark)
+
+    assert target.empty
+
+
+def test_walk_forward_selects_on_active_sharpe_not_raw_market_return(monkeypatch):
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    prices = pd.DataFrame({"A": [0.0, 0.0, 0.0]}, index=months)
+    benchmark = pd.Series([0.05, 0.04, 0.03], index=months, name="SPY")
+    base = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="level"),
+    )
+
+    def fake_run_backtest(holdings, px, cfg, value_scores=None, benchmark_weights=None, chars=None, visible_versions_cache=None):
+        if cfg.portfolio.idea_signal == "active_weight":
+            active = pd.Series([0.01, 0.02, 0.01], index=months).reindex(px.index)
+        else:
+            active = pd.Series([-0.02, -0.01, -0.02], index=months).reindex(px.index)
+        return benchmark.reindex(px.index) + active
+
+    monkeypatch.setattr(sw, "run_backtest", fake_run_backtest)
+
+    _, log, _ = sw.walk_forward(
+        pd.DataFrame(),
+        prices,
+        pd.DataFrame(index=months),
+        base,
+        {("portfolio", "idea_signal"): ["level", "active_weight"]},
+        benchmark=benchmark,
+        train_m=2,
+        test_m=1,
+        select_on="active_sharpe",
+        chars=pd.DataFrame(),
+        visible_versions_cache={months[0]: pd.DataFrame()},
+    )
+
+    assert log["idea_signal"].tolist() == ["active_weight"]
+
+
+def test_walk_forward_can_reuse_precomputed_config_returns(monkeypatch):
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    prices = pd.DataFrame({"A": [0.0, 0.0, 0.0]}, index=months)
+    benchmark = pd.Series([0.0, 0.0, 0.0], index=months, name="SPY")
+    base = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="level"),
+    )
+
+    def fail_run_backtest(*args, **kwargs):
+        raise AssertionError("walk_forward should use precomputed returns")
+
+    monkeypatch.setattr(sw, "run_backtest", fail_run_backtest)
+    precomputed = {
+        (("idea_signal", "level"),): pd.Series([0.01, 0.02, 0.01], index=months),
+    }
+
+    oos, log, n_trials = sw.walk_forward(
+        pd.DataFrame(),
+        prices,
+        pd.DataFrame(index=months),
+        base,
+        {("portfolio", "idea_signal"): ["level"]},
+        benchmark=benchmark,
+        train_m=2,
+        test_m=1,
+        select_on="active_sharpe",
+        chars=pd.DataFrame(),
+        visible_versions_cache={months[0]: pd.DataFrame()},
+        precomputed_returns=precomputed,
+    )
+
+    assert n_trials == 1
+    assert log["idea_signal"].tolist() == ["level"]
+    assert oos.index.tolist() == [months[-1]]
 
 
 def test_holding_horizon_is_measured_in_quarters_not_rebalance_events():

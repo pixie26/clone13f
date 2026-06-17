@@ -73,7 +73,7 @@ def dashboard(
     gs = fig.add_gridspec(3, 3, hspace=0.42, wspace=0.28,
                           left=0.06, right=0.975, top=0.91, bottom=0.07)
     fig.suptitle(title, x=0.06, ha="left", fontsize=15, fontweight="bold", color=INK)
-    fig.text(0.06, 0.935, "filing-date rebalance | factor-adjusted | walk-forward OOS | DSR haircut",
+    fig.text(0.06, 0.935, "filing-date rebalance | factor-adjusted | active-return walk-forward OOS | DSR haircut",
              ha="left", fontsize=9.5, color="#666")
 
     ax = fig.add_subplot(gs[0, :2])
@@ -89,8 +89,9 @@ def dashboard(
     ax = fig.add_subplot(gs[0, 2])
     ax.axis("off")
     if "DSR" in dsr_info:
+        metric_label = "OOS active Sharpe" if dsr_info.get("metric") == "active_return_vs_benchmark" else "OOS ann. Sharpe"
         lines = [
-            ("OOS ann. Sharpe", f"{dsr_info.get('ann_SR', float('nan')):.2f}"),
+            (metric_label, f"{dsr_info.get('ann_SR', float('nan')):.2f}"),
             ("Expected max SR (null)", f"{dsr_info.get('expected_max_SR_null', float('nan')) * np.sqrt(12):.2f}"),
             ("# configs tried", f"{dsr_info.get('n_trials', 'n/a')}"),
             ("OOS months", f"{dsr_info.get('T', 'n/a')}"),
@@ -101,7 +102,7 @@ def dashboard(
         )
     else:
         lines = [
-            ("OOS ann. Sharpe", "skipped"),
+            ("OOS active Sharpe", "skipped"),
             ("Reason", dsr_info.get("note", "insufficient OOS")),
             ("# configs tried", f"{dsr_info.get('n_trials', 'n/a')}"),
             ("Price months", f"{dsr_info.get('price_months', dsr_info.get('T', 'n/a'))}/{dsr_info.get('required_months', 'n/a')}"),
@@ -137,7 +138,8 @@ def dashboard(
 
     ax = fig.add_subplot(gs[2, :2])
     try:
-        piv = grid_df.pivot_table(index=heat_y, columns=heat_x, values="sharpe", aggfunc="mean")
+        heat_value = "active_sharpe" if "active_sharpe" in grid_df.columns else "sharpe"
+        piv = grid_df.pivot_table(index=heat_y, columns=heat_x, values=heat_value, aggfunc="mean")
         im = ax.imshow(piv.values, cmap="BuGn", aspect="auto", origin="lower")
         ax.set_xticks(range(len(piv.columns)))
         ax.set_xticklabels(piv.columns, fontsize=8)
@@ -151,7 +153,8 @@ def dashboard(
         fig.colorbar(im, ax=ax, fraction=.035, pad=.02)
     except Exception as exc:
         ax.text(.5, .5, f"heatmap n/a\n{exc}", ha="center")
-    ax.set_title("Parameter plateau (in-sample Sharpe): want a broad region, not one hot cell",
+    heat_label = "active Sharpe" if "active_sharpe" in grid_df.columns else "Sharpe"
+    ax.set_title(f"Parameter plateau (in-sample {heat_label}): want a broad region, not one hot cell",
                  fontsize=10, color=INK)
 
     ax = fig.add_subplot(gs[2, 2])
