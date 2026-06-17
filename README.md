@@ -10,9 +10,9 @@ This repository is intended as a reproducible systematic research sandbox, not a
 - Handles filing-date visibility and amendment versions in the backtest path.
 - Maps CUSIPs through OpenFIGI, with cache support and coverage diagnostics.
 - Downloads monthly returns from yfinance, with cache support and Yahoo Chart API fallback.
-- Supports idea signals such as `level`, `change`, `initiation`, and `active_weight`.
+- Supports idea signals such as `level`, `change`, `initiation`, `active_weight`, `active_weight_change`, and `active_weight_initiation`.
 - Runs thesis vs placebo backtests, marginal-IR ablations, grid sweeps, walk-forward selection, and deflated Sharpe checks.
-- Writes dashboard PNGs, rebalance audit CSVs, rule summaries, and run manifests under `reports/`.
+- Writes dashboard PNGs, interactive sweep HTML, sweep CSVs, rebalance audit CSVs, rule summaries, and run manifests under `reports/`.
 
 ## Main Files
 
@@ -69,6 +69,9 @@ python -B run_example.py --mode live
 Outputs are written to timestamped folders under `reports/`, including:
 
 - `strategy_dashboard.png`
+- `interactive_results.html`
+- `sweep_grid.csv`
+- `sweep_returns.csv`
 - `manifest.json`
 - `rebalance_summary_thesis.csv`
 - `rebalance_holdings_thesis.csv`

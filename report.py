@@ -6,6 +6,7 @@ alpha, marginal-IR ablation, parameter plateau heatmap, and OOS/DSR scorecard.
 """
 from __future__ import annotations
 
+import json
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -208,4 +209,262 @@ def dashboard(
 
     fig.savefig(path, dpi=130, facecolor="white")
     plt.close(fig)
+    return path
+
+
+def _json_clean(value):
+    if isinstance(value, (np.integer, np.floating)):
+        value = value.item()
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.date().isoformat()
+    return value
+
+
+def _growth_of_one(returns: pd.Series) -> pd.Series:
+    return (1 + returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)).cumprod()
+
+
+def _drawdown(returns: pd.Series) -> pd.Series:
+    growth = _growth_of_one(returns)
+    return growth / growth.cummax() - 1
+
+
+def interactive_results(
+    grid_df: pd.DataFrame,
+    returns_by_config_id: dict[str, pd.Series],
+    benchmark: pd.Series | None = None,
+    path: str = "interactive_results.html",
+) -> str:
+    """Write a self-contained HTML viewer for parameter-sweep results."""
+    table_cols = [
+        "config_id",
+        "aum_band",
+        "idea_signal",
+        "top_n_ideas",
+        "min_consensus_funds",
+        "holding_horizon_q",
+        "max_portfolio_names",
+        "total_return",
+        "ann_return",
+        "ann_vol",
+        "max_drawdown",
+        "sharpe",
+        "active_sharpe",
+        "ir",
+    ]
+    available_cols = [c for c in table_cols if c in grid_df.columns]
+    records = [
+        {k: _json_clean(v) for k, v in row.items()}
+        for row in grid_df[available_cols].to_dict(orient="records")
+    ]
+    series_payload = {}
+    for config_id, ret in returns_by_config_id.items():
+        ret = ret.replace([np.inf, -np.inf], np.nan).dropna()
+        if ret.empty:
+            continue
+        bench = benchmark.reindex(ret.index).replace([np.inf, -np.inf], np.nan).fillna(0.0) if benchmark is not None else None
+        active = ret - bench if bench is not None else ret
+        series_payload[config_id] = {
+            "dates": [pd.Timestamp(x).date().isoformat() for x in ret.index],
+            "growth": [float(x) for x in _growth_of_one(ret).values],
+            "benchmark": [float(x) for x in _growth_of_one(bench).values] if bench is not None else [],
+            "active_growth": [float(x) for x in _growth_of_one(active).values],
+            "drawdown": [float(x) for x in _drawdown(ret).values],
+        }
+
+    payload = {
+        "records": records,
+        "series": series_payload,
+        "benchmarkName": getattr(benchmark, "name", None) if benchmark is not None else None,
+    }
+    payload_json = json.dumps(payload, default=str, allow_nan=False)
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>13F Parameter Sweep Results</title>
+  <style>
+    :root {{
+      --ink: #1b1b1f;
+      --muted: #61636b;
+      --line: #d8dbe2;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --accent: #0b6e4f;
+      --bench: #7b8494;
+      --bad: #b0413e;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: Segoe UI, Arial, sans-serif; color: var(--ink); background: var(--bg); }}
+    header {{ padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }}
+    h1 {{ margin: 0 0 6px; font-size: 20px; font-weight: 650; }}
+    .sub {{ color: var(--muted); font-size: 13px; }}
+    main {{ display: grid; grid-template-columns: 380px 1fr; gap: 16px; padding: 16px 20px 24px; }}
+    aside, section {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }}
+    aside {{ padding: 14px; max-height: calc(100vh - 105px); overflow: auto; }}
+    section {{ padding: 14px; min-width: 0; }}
+    .filters {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }}
+    label {{ display: grid; gap: 4px; font-size: 12px; color: var(--muted); }}
+    select {{ width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--ink); }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    th, td {{ padding: 7px 6px; border-bottom: 1px solid #eceef3; text-align: right; white-space: nowrap; }}
+    th {{ position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; cursor: pointer; }}
+    td:first-child, th:first-child {{ text-align: left; }}
+    tr {{ cursor: pointer; }}
+    tr.active {{ background: #eaf4ef; }}
+    .summary {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; margin-bottom: 14px; }}
+    .metric {{ border: 1px solid #eceef3; border-radius: 8px; padding: 10px; }}
+    .metric span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }}
+    .metric strong {{ font-size: 18px; }}
+    .chart-wrap {{ border: 1px solid #eceef3; border-radius: 8px; padding: 10px; }}
+    svg {{ width: 100%; height: 390px; display: block; }}
+    .legend {{ display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin: 8px 0 0; }}
+    .key {{ display: inline-flex; align-items: center; gap: 6px; }}
+    .swatch {{ width: 18px; height: 3px; display: inline-block; }}
+    @media (max-width: 980px) {{ main {{ grid-template-columns: 1fr; }} aside {{ max-height: none; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>13F Parameter Sweep Results</h1>
+    <div class="sub">Filter configurations, inspect historical growth of 1, and compare active-weight variants.</div>
+  </header>
+  <main>
+    <aside>
+      <div class="filters" id="filters"></div>
+      <table id="results"></table>
+    </aside>
+    <section>
+      <div class="summary" id="summary"></div>
+      <div class="chart-wrap">
+        <svg id="chart" viewBox="0 0 900 390" role="img" aria-label="Historical return chart"></svg>
+        <div class="legend">
+          <span class="key"><span class="swatch" style="background: var(--accent)"></span>Strategy growth</span>
+          <span class="key"><span class="swatch" style="background: var(--bench)"></span>Benchmark growth</span>
+          <span class="key"><span class="swatch" style="background: var(--bad)"></span>Drawdown</span>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const DATA = {payload_json};
+    const filterFields = ["aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "max_portfolio_names"];
+    const tableFields = ["aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "max_portfolio_names", "ann_return", "active_sharpe", "max_drawdown"];
+    let sortField = "active_sharpe";
+    let sortDir = -1;
+    let selectedId = null;
+
+    function fmt(v, pct=false) {{
+      if (v === null || v === undefined || Number.isNaN(v)) return "n/a";
+      if (pct) return (v * 100).toFixed(1) + "%";
+      if (typeof v === "number") return v.toFixed(2);
+      return String(v);
+    }}
+
+    function initFilters() {{
+      const root = document.getElementById("filters");
+      root.innerHTML = "";
+      for (const field of filterFields) {{
+        const values = [...new Set(DATA.records.map(r => r[field]).filter(v => v !== null && v !== undefined))];
+        const label = document.createElement("label");
+        label.textContent = field;
+        const select = document.createElement("select");
+        select.dataset.field = field;
+        select.innerHTML = `<option value="">All</option>` + values.map(v => `<option value="${{v}}">${{v}}</option>`).join("");
+        select.addEventListener("change", render);
+        label.appendChild(select);
+        root.appendChild(label);
+      }}
+    }}
+
+    function filteredRows() {{
+      const selects = [...document.querySelectorAll("#filters select")];
+      return DATA.records.filter(row => selects.every(sel => !sel.value || String(row[sel.dataset.field]) === sel.value))
+        .sort((a, b) => {{
+          const av = a[sortField], bv = b[sortField];
+          if (av === bv) return 0;
+          if (av === null || av === undefined) return 1;
+          if (bv === null || bv === undefined) return -1;
+          return av > bv ? sortDir : -sortDir;
+        }});
+    }}
+
+    function renderTable(rows) {{
+      const table = document.getElementById("results");
+      const head = `<thead><tr>${{tableFields.map(f => `<th data-field="${{f}}">${{f}}</th>`).join("")}}</tr></thead>`;
+      const body = rows.map(row => `<tr data-id="${{row.config_id}}" class="${{row.config_id === selectedId ? "active" : ""}}">
+        ${{tableFields.map(f => `<td>${{fmt(row[f], ["ann_return", "max_drawdown"].includes(f))}}</td>`).join("")}}
+      </tr>`).join("");
+      table.innerHTML = head + `<tbody>${{body}}</tbody>`;
+      table.querySelectorAll("th").forEach(th => th.addEventListener("click", () => {{
+        const field = th.dataset.field;
+        if (sortField === field) sortDir *= -1; else {{ sortField = field; sortDir = -1; }}
+        render();
+      }}));
+      table.querySelectorAll("tr[data-id]").forEach(tr => tr.addEventListener("click", () => {{
+        selectedId = tr.dataset.id;
+        render();
+      }}));
+    }}
+
+    function scale(vals, minPx, maxPx) {{
+      const finite = vals.filter(v => Number.isFinite(v));
+      const min = Math.min(...finite), max = Math.max(...finite);
+      const span = Math.max(1e-9, max - min);
+      return v => maxPx - (v - min) / span * (maxPx - minPx);
+    }}
+
+    function pathFor(values, yScale) {{
+      const n = values.length;
+      return values.map((v, i) => `${{i === 0 ? "M" : "L"}} ${{50 + i * (820 / Math.max(1, n - 1))}} ${{yScale(v)}}`).join(" ");
+    }}
+
+    function renderChart(row) {{
+      const svg = document.getElementById("chart");
+      const s = DATA.series[row.config_id];
+      if (!s) {{ svg.innerHTML = `<text x="450" y="195" text-anchor="middle" fill="#61636b">No return series</text>`; return; }}
+      const combined = [...s.growth, ...(s.benchmark || [])];
+      const y = scale(combined, 28, 260);
+      const yDD = v => 350 - (v / Math.min(-0.01, ...s.drawdown)) * 70;
+      const benchPath = s.benchmark && s.benchmark.length ? `<path d="${{pathFor(s.benchmark, y)}}" fill="none" stroke="#7b8494" stroke-width="2"/>` : "";
+      svg.innerHTML = `
+        <line x1="50" y1="260" x2="870" y2="260" stroke="#d8dbe2"/>
+        <line x1="50" y1="350" x2="870" y2="350" stroke="#d8dbe2"/>
+        <path d="${{pathFor(s.growth, y)}}" fill="none" stroke="#0b6e4f" stroke-width="3"/>
+        ${{benchPath}}
+        <path d="${{pathFor(s.drawdown, yDD)}}" fill="none" stroke="#b0413e" stroke-width="2"/>
+        <text x="50" y="18" fill="#1b1b1f" font-size="14">${{row.config_id}}</text>
+        <text x="50" y="382" fill="#61636b" font-size="12">${{s.dates[0]}}</text>
+        <text x="870" y="382" fill="#61636b" font-size="12" text-anchor="end">${{s.dates[s.dates.length - 1]}}</text>`;
+    }}
+
+    function renderSummary(row) {{
+      const items = [
+        ["Total return", fmt(row.total_return, true)],
+        ["Ann. return", fmt(row.ann_return, true)],
+        ["Ann. vol", fmt(row.ann_vol, true)],
+        ["Max drawdown", fmt(row.max_drawdown, true)],
+        ["Active Sharpe", fmt(row.active_sharpe)],
+      ];
+      document.getElementById("summary").innerHTML = items.map(([k, v]) => `<div class="metric"><span>${{k}}</span><strong>${{v}}</strong></div>`).join("");
+    }}
+
+    function render() {{
+      const rows = filteredRows();
+      if (!selectedId || !rows.some(r => r.config_id === selectedId)) selectedId = rows[0]?.config_id || null;
+      renderTable(rows);
+      const row = rows.find(r => r.config_id === selectedId);
+      if (row) {{ renderSummary(row); renderChart(row); }}
+    }}
+
+    initFilters();
+    render();
+  </script>
+</body>
+</html>"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
     return path

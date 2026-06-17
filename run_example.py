@@ -26,6 +26,7 @@ from engine import (
     BacktestConfig,
     PortfolioConfig,
     UniverseConfig,
+    _needs_active_benchmark_weights,
     attribution,
     build_visible_versions_cache,
     manager_characteristics,
@@ -33,7 +34,7 @@ from engine import (
     rebalance_trace,
     run_backtest,
 )
-from report import dashboard
+from report import dashboard, interactive_results
 from sweep import active_return_stream, deflated_sharpe, grid_eval, walk_forward
 
 
@@ -45,7 +46,7 @@ LIVE_CONFIG = {
     "end": "2026-05-31",
     # Broad-market total-return proxy. Use QQQ for a tighter growth-style proxy.
     "benchmark_ticker": "SPY",
-    "min_aum": 1e9,
+    "min_aum": 0.5e9,
     "max_aum": 30e9,
     "max_holdings": 60,
     "max_put_weight": 0.10,
@@ -401,10 +402,10 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
             "value_tilt_active": bool(cfg.universe.use_value_tilt and value_scores is not None),
             "active_share_configured": bool(cfg.universe.use_active_share),
             "active_share_active": bool(cfg.universe.use_active_share and benchmark_weights is not None),
-            "active_weight_signal": cfg.portfolio.idea_signal == "active_weight",
+            "active_weight_signal": _needs_active_benchmark_weights(cfg.portfolio.idea_signal),
             "active_weight_benchmark": (
                 "PIT equal-manager aggregate of all visible latest 13F books at each rebalance"
-                if cfg.portfolio.idea_signal == "active_weight"
+                if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
                 else None
             ),
         },
@@ -446,6 +447,7 @@ def _dashboard_parameter_summary(
         "Portfolio": (
             f"idea_signal={p.idea_signal}, top_n_ideas={p.top_n_ideas}, "
             f"min_consensus_funds={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
+            f"max_portfolio_names={p.max_portfolio_names}, "
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
             f"min_active_weight_holdings={p.min_active_weight_holdings}"
         ),
@@ -510,6 +512,55 @@ def write_rebalance_outputs(
     )
     outputs["rules"] = str(rules_path)
     outputs["summary_stats"] = _rebalance_summary_stats(trace["summary"])
+    return outputs
+
+
+def write_sweep_outputs(
+    out_dir: pathlib.Path,
+    grid: pd.DataFrame,
+    returns_by_config_id: dict[str, pd.Series] | None,
+    benchmark: pd.Series | None,
+) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    grid_path = out_dir / "sweep_grid.csv"
+    grid.to_csv(grid_path, index=False)
+    outputs["grid"] = str(grid_path)
+
+    returns_by_config_id = returns_by_config_id or {}
+    rows = []
+    for config_id, ret in returns_by_config_id.items():
+        ret = ret.replace([np.inf, -np.inf], np.nan).dropna()
+        if ret.empty:
+            continue
+        bench = benchmark.reindex(ret.index).replace([np.inf, -np.inf], np.nan) if benchmark is not None else None
+        active = ret - bench if bench is not None else ret
+        growth = (1 + ret.fillna(0.0)).cumprod()
+        bench_growth = (1 + bench.fillna(0.0)).cumprod() if bench is not None else pd.Series(index=ret.index, dtype=float)
+        active_growth = (1 + active.fillna(0.0)).cumprod()
+        dd = growth / growth.cummax() - 1
+        for date, value in ret.items():
+            rows.append({
+                "config_id": config_id,
+                "date": pd.Timestamp(date).date().isoformat(),
+                "return": float(value),
+                "benchmark_return": float(bench.loc[date]) if bench is not None and pd.notna(bench.loc[date]) else np.nan,
+                "active_return": float(active.loc[date]) if pd.notna(active.loc[date]) else np.nan,
+                "growth_of_one": float(growth.loc[date]),
+                "benchmark_growth_of_one": float(bench_growth.loc[date]) if bench is not None and pd.notna(bench_growth.loc[date]) else np.nan,
+                "active_growth_of_one": float(active_growth.loc[date]),
+                "drawdown": float(dd.loc[date]),
+            })
+    returns_path = out_dir / "sweep_returns.csv"
+    pd.DataFrame(rows).to_csv(returns_path, index=False)
+    outputs["returns"] = str(returns_path)
+
+    html_path = out_dir / "interactive_results.html"
+    outputs["interactive_html"] = interactive_results(
+        grid,
+        returns_by_config_id,
+        benchmark=benchmark,
+        path=str(html_path),
+    )
     return outputs
 
 
@@ -636,8 +687,8 @@ def _print_rebalance_summary(stats: dict[str, Any]) -> None:
 def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, int]:
     cfg_a = BacktestConfig(
         universe=UniverseConfig(
-            min_aum=1e9,
-            max_aum=30e9,
+            min_aum=0.5e9,
+            max_aum=5e9,
             min_top_n_weight=0.50,
             max_holdings=40,
             turnover_quantile=0.34,
@@ -646,11 +697,13 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             min_history_quarters=4,
         ),
         portfolio=PortfolioConfig(
-            idea_signal="change",
-            top_n_ideas=8,
+            idea_signal="active_weight",
+            top_n_ideas=3,
             min_consensus_funds=2,
-            holding_horizon_q=2,
+            max_portfolio_names=25,
+            holding_horizon_q=0,
             max_name_weight=0.05,
+            min_active_weight_holdings=20,
         ),
     )
     cfg_b = BacktestConfig(
@@ -664,10 +717,19 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         portfolio=PortfolioConfig(idea_signal="level", min_consensus_funds=1, holding_horizon_q=0),
     )
     axes = {
-        ("portfolio", "idea_signal"): ["level", "change", "initiation", "active_weight"],
-        ("portfolio", "min_consensus_funds"): [1, 2],
-        ("portfolio", "top_n_ideas"): [5, 8],
-        ("universe", "turnover_quantile"): [0.34, 0.50],
+        ("universe", "aum_band"): [
+            ("0.5-5B", 0.5e9, 5e9),
+            ("15-30B", 15e9, 30e9),
+        ],
+        ("portfolio", "idea_signal"): [
+            "active_weight",
+            "active_weight_change",
+            "active_weight_initiation",
+        ],
+        ("portfolio", "top_n_ideas"): [3, 5],
+        ("portfolio", "min_consensus_funds"): [2, 5],
+        ("portfolio", "holding_horizon_q"): [0, 1],
+        ("portfolio", "max_portfolio_names"): [25, 50],
     }
     train_m, test_m = 48, 12
     return cfg_a, cfg_b, axes, train_m, test_m
@@ -722,6 +784,7 @@ def _print_startup_parameters(
             "  thesis portfolio      "
             f"idea_signal={p.idea_signal}, top_n_ideas={p.top_n_ideas}, "
             f"min_consensus={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
+            f"max_portfolio_names={p.max_portfolio_names}, "
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
             f"missing_price_policy={cfg_a.missing_price_policy}, cost={c.bps_per_side:.1f}bps"
         )
@@ -887,6 +950,17 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     out_dir = output_root / run_id
     out_dir.mkdir(parents=True, exist_ok=False)
 
+    print("\n[6/6] Writing sweep result files")
+    sweep_outputs = write_sweep_outputs(
+        out_dir,
+        grid,
+        grid.attrs.get("returns_by_config_id"),
+        bench_ret,
+    )
+    print(f"  Saved sweep grid:       {sweep_outputs['grid']}")
+    print(f"  Saved sweep returns:    {sweep_outputs['returns']}")
+    print(f"  Saved interactive HTML: {sweep_outputs['interactive_html']}")
+
     print("\n[6/6] Rendering strategy dashboard")
     dashboard_params = _dashboard_parameter_summary(
         mode=mode,
@@ -906,8 +980,8 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         factors,
         ablation,
         grid,
-        heat_x="top_n_ideas",
-        heat_y="turnover_quantile",
+        heat_x="max_portfolio_names",
+        heat_y="aum_band",
         dsr_info=dsr,
         oos_log=wf_log,
         parameter_summary=dashboard_params,
@@ -955,7 +1029,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
         "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),
-        "outputs": {"dashboard": dashboard_path, "rebalance_thesis": rebalance_outputs},
+        "outputs": {"dashboard": dashboard_path, "rebalance_thesis": rebalance_outputs, "sweep": sweep_outputs},
     }
     write_manifest(out_dir / "manifest.json", manifest_payload)
     print(f"  Saved dashboard: {dashboard_path}")

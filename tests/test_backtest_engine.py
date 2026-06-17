@@ -4,6 +4,7 @@ import pytest
 
 import data_adapters as da
 import engine as en
+import report as rp
 import sweep as sw
 from data_adapters import (
     _is_yfinance_ticker,
@@ -272,6 +273,117 @@ def test_active_weight_signal_requires_minimum_book_breadth():
     target = target_weights_from_versions(latest_versions, cfg, benchmark)
 
     assert target.empty
+
+
+def test_active_weight_change_requires_positive_current_overweight():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.40, "B": 0.35, "C": 0.25}),
+                "prev_bw": pd.Series({"A": 0.20, "B": 0.10, "C": 0.70}),
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.50, "C": 0.40})
+    cfg = PortfolioConfig(
+        idea_signal="active_weight_change",
+        top_n_ideas=2,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark)
+
+    assert target.index.tolist() == ["A"]
+    assert target.loc["A"] == pytest.approx(1.0)
+
+
+def test_active_weight_initiation_uses_new_positive_overweights_only():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.30, "B": 0.30, "C": 0.40}),
+                "prev_bw": pd.Series({"A": 0.60, "B": 0.40}),
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.10, "C": 0.05})
+    cfg = PortfolioConfig(
+        idea_signal="active_weight_initiation",
+        top_n_ideas=2,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark)
+
+    assert target.index.tolist() == ["C"]
+    assert target.loc["C"] == pytest.approx(1.0)
+
+
+def test_max_portfolio_names_caps_aggregate_target_before_weight_caps():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.50, "B": 0.30, "C": 0.20}),
+                "prev_bw": None,
+            },
+            {
+                "manager": "m2",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a2",
+                "bw": pd.Series({"A": 0.40, "D": 0.35, "E": 0.25}),
+                "prev_bw": None,
+            },
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="level",
+        top_n_ideas=3,
+        min_consensus_funds=1,
+        max_portfolio_names=2,
+        max_name_weight=1.0,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg)
+
+    assert target.index.tolist() == ["A", "D"]
+    assert target.sum() == pytest.approx(1.0)
+
+
+def test_iter_configs_supports_paired_aum_band_axis():
+    base = BacktestConfig()
+
+    configs = sw.iter_configs(
+        base,
+        {
+            ("universe", "aum_band"): [("0.5-5B", 0.5e9, 5e9), ("15-30B", 15e9, 30e9)],
+            ("portfolio", "top_n_ideas"): [3],
+        },
+    )
+
+    labels = [label for label, _ in configs]
+    cfgs = [cfg for _, cfg in configs]
+    assert labels == [{"aum_band": "0.5-5B", "top_n_ideas": 3}, {"aum_band": "15-30B", "top_n_ideas": 3}]
+    assert cfgs[0].universe.min_aum == 0.5e9
+    assert cfgs[0].universe.max_aum == 5e9
+    assert cfgs[1].universe.min_aum == 15e9
+    assert cfgs[1].universe.max_aum == 30e9
 
 
 def test_walk_forward_selects_on_active_sharpe_not_raw_market_return(monkeypatch):
@@ -1301,3 +1413,35 @@ def test_deflated_sharpe_reports_trials_when_oos_is_insufficient():
     assert out["note"] == "insufficient OOS"
     assert out["T"] == 6
     assert out["n_trials"] == 16
+
+
+def test_interactive_results_writes_self_contained_html(tmp_path):
+    idx = pd.date_range("2020-01-31", periods=3, freq="ME")
+    grid = pd.DataFrame(
+        [
+            {
+                "config_id": "aum_band=0.5-5B|idea_signal=active_weight",
+                "aum_band": "0.5-5B",
+                "idea_signal": "active_weight",
+                "top_n_ideas": 3,
+                "min_consensus_funds": 2,
+                "holding_horizon_q": 0,
+                "max_portfolio_names": 25,
+                "ann_return": 0.12,
+                "ann_vol": 0.20,
+                "max_drawdown": -0.05,
+                "active_sharpe": 0.8,
+            }
+        ]
+    )
+    returns = {"aum_band=0.5-5B|idea_signal=active_weight": pd.Series([0.01, -0.02, 0.03], index=idx)}
+    benchmark = pd.Series([0.0, 0.01, 0.0], index=idx, name="SPY")
+    path = tmp_path / "interactive.html"
+
+    out = rp.interactive_results(grid, returns, benchmark, path=str(path))
+
+    assert out == str(path)
+    text = path.read_text(encoding="utf-8")
+    assert "13F Parameter Sweep Results" in text
+    assert "active_weight" in text
+    assert "growth" in text

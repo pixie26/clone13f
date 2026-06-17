@@ -47,9 +47,10 @@ class UniverseConfig:
 @dataclass
 class PortfolioConfig:
     top_n_ideas: int = 8
-    idea_signal: str = "level"              # "level" | "change" | "initiation" | "active_weight"
+    idea_signal: str = "level"              # "level" | "change" | "initiation" | active-weight variants
     consensus_weight: bool = True
     min_consensus_funds: int = 1            # drop names held by < this many in-universe funds
+    max_portfolio_names: int | None = None  # cap final aggregate target before weight caps
     max_name_weight: float = 0.05
     max_issuer_weight: float = 0.075
     holding_horizon_q: int = 0              # 0 = full rebalance; N = carry N extra quarters
@@ -107,6 +108,10 @@ def _aggregate_book_weights(books) -> pd.Series:
         return total
     total = total / n
     return total / total.sum() if total.sum() > 0 else total
+
+
+def _needs_active_benchmark_weights(idea_signal: str) -> bool:
+    return idea_signal in {"active_weight", "active_weight_change", "active_weight_initiation"}
 
 
 def _versioned_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
@@ -341,13 +346,25 @@ def _idea_scores(
     elif cfg.idea_signal == "initiation":
         new = cur.index.difference(prev.index) if prev is not None else cur.index
         s = cur.reindex(new).fillna(0.0)
-    elif cfg.idea_signal == "active_weight":
+    elif _needs_active_benchmark_weights(cfg.idea_signal):
         if active_benchmark_weights is None or len(active_benchmark_weights) == 0:
             return pd.Series(dtype=float)
         if int((cur > 0).sum()) < cfg.min_active_weight_holdings:
             return pd.Series(dtype=float)
         bench = active_benchmark_weights / active_benchmark_weights.sum()
-        s = (cur - bench.reindex(cur.index).fillna(0.0)).clip(lower=0)
+        active_cur = (cur - bench.reindex(cur.index).fillna(0.0)).clip(lower=0)
+        if cfg.idea_signal == "active_weight":
+            s = active_cur
+        elif cfg.idea_signal == "active_weight_change":
+            if prev is None:
+                s = active_cur
+            else:
+                alln = cur.index.union(prev.index)
+                inc = (cur.reindex(alln).fillna(0.0) - prev.reindex(alln).fillna(0.0)).clip(lower=0)
+                s = inc.reindex(cur.index).fillna(0.0) * active_cur.reindex(cur.index).fillna(0.0)
+        elif cfg.idea_signal == "active_weight_initiation":
+            new = cur.index.difference(prev.index) if prev is not None else cur.index
+            s = active_cur.reindex(new).fillna(0.0)
     else:
         raise ValueError(cfg.idea_signal)
     return s[s > 0].sort_values(ascending=False).head(cfg.top_n_ideas)
@@ -360,7 +377,7 @@ def target_weights_from_versions(
 ) -> pd.Series:
     if latest_versions.empty:
         return pd.Series(dtype=float)
-    if cfg.idea_signal == "active_weight" and active_benchmark_weights is None:
+    if _needs_active_benchmark_weights(cfg.idea_signal) and active_benchmark_weights is None:
         active_benchmark_weights = _aggregate_book_weights(latest_versions["bw"])
     score: dict[str, float] = {}
     count: dict[str, int] = {}
@@ -379,6 +396,8 @@ def target_weights_from_versions(
         s = s[keep.reindex(s.index).fillna(False)]
     if s.empty:
         return s
+    if cfg.max_portfolio_names is not None and cfg.max_portfolio_names > 0:
+        s = s.sort_values(ascending=False).head(cfg.max_portfolio_names)
     return _cap_weights(s, cfg.max_name_weight)
 
 
@@ -563,7 +582,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             latest_versions = _visible_manager_versions(chars, m)
         active_benchmark_weights = (
             _aggregate_book_weights(latest_versions["bw"])
-            if cfg.portfolio.idea_signal == "active_weight"
+            if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
             else None
         )
         selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
@@ -673,7 +692,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 latest_versions = _visible_manager_versions(chars, m)
             active_benchmark_weights = (
                 _aggregate_book_weights(latest_versions["bw"])
-                if cfg.portfolio.idea_signal == "active_weight"
+                if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
                 else None
             )
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
@@ -774,7 +793,7 @@ def run_backtest_from_selection_cache(
             rebal_no += 1
             selected_versions = selected_versions_by_month.get(month, pd.DataFrame())
             active_benchmark_weights = None
-            if cfg.portfolio.idea_signal == "active_weight":
+            if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
                 if active_benchmark_weights_by_month is not None:
                     active_benchmark_weights = active_benchmark_weights_by_month.get(month)
                 if active_benchmark_weights is None and not selected_versions.empty:

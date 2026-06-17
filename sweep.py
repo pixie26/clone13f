@@ -24,6 +24,7 @@ try:
         build_rebalance_selection_cache,
         build_visible_versions_cache,
         manager_characteristics,
+        _needs_active_benchmark_weights,
         run_backtest,
         run_backtest_from_selection_cache,
     )
@@ -35,6 +36,7 @@ except ImportError:
         build_rebalance_selection_cache,
         build_visible_versions_cache,
         manager_characteristics,
+        _needs_active_benchmark_weights,
         run_backtest,
         run_backtest_from_selection_cache,
     )
@@ -48,8 +50,14 @@ def iter_configs(base: BacktestConfig, axes: dict) -> list[tuple[dict, BacktestC
         u, p = dict(), dict()
         label = {}
         for (scope, field), val in zip(keys, combo):
-            (u if scope == "universe" else p)[field] = val
-            label[field] = val
+            if scope == "universe" and field == "aum_band":
+                band_label, min_aum, max_aum = val
+                u["min_aum"] = min_aum
+                u["max_aum"] = max_aum
+                label["aum_band"] = band_label
+            else:
+                (u if scope == "universe" else p)[field] = val
+                label[field] = val
         cfg = replace(base, universe=replace(base.universe, **u), portfolio=replace(base.portfolio, **p))
         out.append((label, cfg))
     return out
@@ -57,6 +65,10 @@ def iter_configs(base: BacktestConfig, axes: dict) -> list[tuple[dict, BacktestC
 
 def _label_key(label: dict) -> tuple:
     return tuple(sorted(label.items()))
+
+
+def _config_id(label: dict) -> str:
+    return "|".join(f"{key}={value}" for key, value in sorted(label.items()))
 
 
 def _universe_key(cfg) -> tuple:
@@ -91,6 +103,31 @@ def _basic_sharpe(returns: pd.Series) -> float:
     return _periodic_sharpe(r) * math.sqrt(12)
 
 
+def _max_drawdown(returns: pd.Series) -> float:
+    r = returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if r.empty:
+        return np.nan
+    cum = (1 + r).cumprod()
+    return float((cum / cum.cummax() - 1).min())
+
+
+def _return_metrics(returns: pd.Series) -> dict:
+    r = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    if r.empty:
+        return {
+            "total_return": np.nan,
+            "ann_return": np.nan,
+            "ann_vol": np.nan,
+            "max_drawdown": np.nan,
+        }
+    return {
+        "total_return": float((1 + r).prod() - 1),
+        "ann_return": float((1 + r).prod() ** (12 / len(r)) - 1),
+        "ann_vol": float(r.std() * math.sqrt(12)),
+        "max_drawdown": _max_drawdown(r),
+    }
+
+
 def _needs_factor_attribution(metric: str) -> bool:
     return metric not in {"active", "active_sharpe"}
 
@@ -108,6 +145,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
     active_benchmark_cache: dict[pd.Timestamp, pd.Series] | None = None
     rows = []
     returns_by_config: dict[tuple, pd.Series] = {}
+    returns_by_config_id: dict[str, pd.Series] = {}
     configs = iter_configs(base, axes)
     total = len(configs)
     for i, (label, cfg) in enumerate(configs, start=1):
@@ -126,7 +164,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
                     ch,
                     visible_cache,
                 )
-            if cfg.portfolio.idea_signal == "active_weight" and active_benchmark_cache is None:
+            if _needs_active_benchmark_weights(cfg.portfolio.idea_signal) and active_benchmark_cache is None:
                 active_benchmark_cache = build_active_benchmark_weights_cache(
                     holdings,
                     prices,
@@ -145,7 +183,9 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
             ret = run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups)
         if include_returns:
             returns_by_config[_label_key(label)] = ret
+            returns_by_config_id[_config_id(label)] = ret
         active_sharpe = _periodic_sharpe(active_return_stream(ret, benchmark)) * math.sqrt(12)
+        return_metrics = _return_metrics(ret)
         if run_attribution:
             att = attribution(ret, factors, benchmark)
             row_metrics = {
@@ -164,10 +204,17 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
         if verbose:
             chosen = active_sharpe if metric in {"active", "active_sharpe"} else row_metrics.get(metric, row_metrics.get("sharpe"))
             print(f"    done grid {i}/{total} in {time.perf_counter() - t0:.1f}s {metric}={_fmt_metric(chosen)}")
-        rows.append({**label, **row_metrics, "active_sharpe": active_sharpe})
+        rows.append({
+            "config_id": _config_id(label),
+            **label,
+            **return_metrics,
+            **row_metrics,
+            "active_sharpe": active_sharpe,
+        })
     out = pd.DataFrame(rows)
     if include_returns:
         out.attrs["returns_by_config"] = returns_by_config
+        out.attrs["returns_by_config_id"] = returns_by_config_id
     return out
 
 
