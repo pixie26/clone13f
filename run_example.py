@@ -276,6 +276,7 @@ def build_live_data(
             cfg["start"],
             cfg["end"],
             cache_path=cfg.get("price_cache_path"),
+            require_full_window=True,
         ).iloc[:, 0]
         bench_ret.name = cfg["benchmark_ticker"]
     except Exception as exc:

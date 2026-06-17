@@ -386,7 +386,14 @@ def _write_price_cache(cache_path: str | Path | None, px: pd.DataFrame) -> None:
     px = px.copy()
     px.index = pd.to_datetime(px.index)
     px.columns = [str(c).strip().upper() for c in px.columns]
-    merged = pd.concat([current, px], axis=1) if not current.empty else px
+    if not current.empty:
+        # New downloads must replace stale shorter histories for the same
+        # ticker. Keeping the old duplicate column silently corrupts later
+        # cache reads, most visibly for the benchmark series.
+        current = current.drop(columns=[c for c in px.columns if c in current.columns], errors="ignore")
+        merged = pd.concat([current, px], axis=1)
+    else:
+        merged = px
     merged = merged.loc[:, ~merged.columns.duplicated()].sort_index()
     merged.to_parquet(path)
 
@@ -637,6 +644,7 @@ def fetch_prices(
     max_consecutive_empty_batches: int = 3,
     use_chart_fallback: bool = True,
     chart_fallback_workers: int = 8,
+    require_full_window: bool = False,
 ) -> pd.DataFrame:
     ## FRICTION: yfinance has survivorship gaps (delisted names vanish). For a
     ##           publishable backtest use CRSP via WRDS; yfinance is fine first-pass.
@@ -656,7 +664,10 @@ def fetch_prices(
     cache_symbol_cols = sorted(set(clean).intersection(cache_px.columns)) if not cache_px.empty else []
     cached_cols = sorted(
         t for t in cache_symbol_cols
-        if t in coverage_fetched or _series_spans_requested_window(cache_px[t], start, end)
+        if (
+            _series_spans_requested_window(cache_px[t], start, end)
+            or (not require_full_window and t in coverage_fetched)
+        )
     )
     stale_cached_cols = sorted(set(cache_symbol_cols) - set(cached_cols))
     frames: list[pd.DataFrame] = []

@@ -21,12 +21,13 @@ BM_C = "#9aa0a6"
 ACC = "#c79a3a"
 
 
-def _cum(r: pd.Series) -> pd.Series:
-    return (1 + r.fillna(0)).cumprod()
+def _cum(r: pd.Series, *, fill_missing: bool = False) -> pd.Series:
+    x = r.fillna(0) if fill_missing else r
+    return (1 + x).cumprod()
 
 
 def _dd(r: pd.Series) -> pd.Series:
-    c = _cum(r)
+    c = _cum(r, fill_missing=True)
     return c / c.cummax() - 1
 
 
@@ -76,9 +77,10 @@ def dashboard(
              ha="left", fontsize=9.5, color="#666")
 
     ax = fig.add_subplot(gs[0, :2])
-    _cum(retA).plot(ax=ax, color=A_C, lw=2.2, label="A | thesis stack")
-    _cum(retB).plot(ax=ax, color=B_C, lw=1.6, label="B | placebo")
-    _cum(benchmark.reindex(retA.index)).plot(ax=ax, color=BM_C, lw=1.4, ls="--", label="benchmark")
+    _cum(retA, fill_missing=True).plot(ax=ax, color=A_C, lw=2.2, label="A | thesis stack")
+    _cum(retB, fill_missing=True).plot(ax=ax, color=B_C, lw=1.6, label="B | placebo")
+    bm_name = getattr(benchmark, "name", None) or "benchmark"
+    _cum(benchmark.reindex(retA.index)).plot(ax=ax, color=BM_C, lw=1.4, ls="--", label=f"benchmark | {bm_name}")
     ax.set_title("Cumulative net return (growth of 1)", fontsize=11, color=INK)
     ax.legend(fontsize=8.5, frameon=False)
     ax.grid(alpha=.25)
