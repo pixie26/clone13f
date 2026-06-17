@@ -52,6 +52,7 @@ LIVE_CONFIG = {
     "require_factors": False,
     "openfigi_cache_path": "openfigi_cache.parquet",
     "price_cache_path": "yfinance_close_cache.parquet",
+    "security_overrides_path": "data/security_overrides.csv",
 }
 
 
@@ -88,6 +89,35 @@ def _json_default(x: Any) -> Any:
 def _config_hash(payload: dict) -> str:
     raw = json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def load_security_groups(tickers, path: str | pathlib.Path | None = "data/security_overrides.csv") -> pd.Series:
+    clean = pd.Index([str(t).strip().upper() for t in tickers if pd.notna(t)])
+    groups = pd.Series(clean, index=clean, dtype="string")
+    if path is None:
+        return groups.astype(str)
+    p = pathlib.Path(path)
+    if not p.exists():
+        print(f"  [warn] security overrides not found: {p}; issuer groups default to ticker")
+        return groups.astype(str)
+    overrides = pd.read_csv(p)
+    required = {"ticker", "issuer_group"}
+    missing = required.difference(overrides.columns)
+    if missing:
+        raise ValueError(f"security overrides missing columns: {sorted(missing)}")
+    overrides = overrides.dropna(subset=["ticker", "issuer_group"]).copy()
+    overrides["ticker"] = overrides["ticker"].astype(str).str.strip().str.upper()
+    overrides["issuer_group"] = overrides["issuer_group"].astype(str).str.strip().str.upper()
+    mapped = overrides.set_index("ticker")["issuer_group"]
+    common = groups.index.intersection(mapped.index)
+    groups.loc[common] = mapped.loc[common].astype(str)
+    multi_groups = mapped[mapped.isin(mapped[mapped.duplicated(keep=False)])].nunique()
+    print(
+        "  security overrides: "
+        f"{len(common)}/{len(groups)} active tickers mapped to issuer groups "
+        f"({multi_groups} multi-ticker groups in override file)"
+    )
+    return groups.astype(str)
 
 
 def build_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
@@ -343,7 +373,7 @@ def write_manifest(path: pathlib.Path, payload: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
 
 
-def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weights) -> dict:
+def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weights, security_groups=None) -> dict:
     return {
         "rebalance_rule": (
             "At each month-end on or after a visible SEC filing date, select each "
@@ -360,6 +390,11 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
         },
         "universe": asdict(cfg.universe),
         "portfolio": asdict(cfg.portfolio),
+        "security_grouping": {
+            "enabled": security_groups is not None,
+            "max_issuer_weight": cfg.portfolio.max_issuer_weight,
+            "unmapped_ticker_policy": "issuer_group defaults to ticker",
+        },
         "missing_price_policy": cfg.missing_price_policy,
         "active_filter_status": {
             "value_tilt_configured": bool(cfg.universe.use_value_tilt),
@@ -376,6 +411,59 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
     }
 
 
+def _dashboard_parameter_summary(
+    *,
+    mode: str,
+    cfg: BacktestConfig,
+    prices: pd.DataFrame,
+    holdings: pd.DataFrame,
+    benchmark,
+    axes: dict,
+    train_m: int,
+    test_m: int,
+    security_groups: pd.Series,
+) -> dict[str, str]:
+    u = cfg.universe
+    p = cfg.portfolio
+    c = cfg.cost
+    benchmark_name = getattr(benchmark, "name", None) if benchmark is not None else None
+    sweep_axis_text = "; ".join(
+        f"{scope}.{field}={list(values)}"
+        for (scope, field), values in axes.items()
+    )
+    return {
+        "Data": (
+            f"mode={mode}, returns={prices.index.min().date()}..{prices.index.max().date()}, "
+            f"months={len(prices)}, managers={holdings['manager'].nunique()}, "
+            f"tickers={len(prices.columns)}, benchmark={benchmark_name or 'disabled'}"
+        ),
+        "Universe": (
+            f"min_aum={u.min_aum:.0f}, max_aum={u.max_aum:.0f}, "
+            f"max_holdings={u.max_holdings}, min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
+            f"turnover_q={u.turnover_quantile}, min_history_q={u.min_history_quarters}, "
+            f"hedge_put_max={u.hedge_put_max_weight:.0%}, value_tilt_min={u.value_tilt_min_pctl:.0%}"
+        ),
+        "Portfolio": (
+            f"idea_signal={p.idea_signal}, top_n_ideas={p.top_n_ideas}, "
+            f"min_consensus_funds={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
+            f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
+            f"min_active_weight_holdings={p.min_active_weight_holdings}"
+        ),
+        "Execution/cost": (
+            f"rebalance=month-end after filing_date visibility, missing_price_policy={cfg.missing_price_policy}, "
+            f"cost={c.bps_per_side:.1f}bps per one-way turnover"
+        ),
+        "Validation": (
+            f"walk_forward=train {train_m}m/test {test_m}m, select_on=active_sharpe, "
+            f"sweep_trials={int(np.prod([len(v) for v in axes.values()]))}"
+        ),
+        "Sweep axes": sweep_axis_text,
+        "Security grouping": (
+            f"issuer_groups={security_groups.nunique()}, override_unmapped_policy=ticker_as_issuer_group"
+        ),
+    }
+
+
 def write_rebalance_outputs(
     out_dir: pathlib.Path,
     label: str,
@@ -387,6 +475,7 @@ def write_rebalance_outputs(
     benchmark_weights=None,
     chars=None,
     visible_versions_cache=None,
+    security_groups=None,
 ) -> dict[str, Any]:
     trace = rebalance_trace(
         holdings,
@@ -396,6 +485,7 @@ def write_rebalance_outputs(
         benchmark_weights=benchmark_weights,
         chars=chars,
         visible_versions_cache=visible_versions_cache,
+        security_groups=security_groups,
     )
     outputs: dict[str, str] = {}
     for name, df in trace.items():
@@ -406,7 +496,12 @@ def write_rebalance_outputs(
     rules_path = out_dir / f"rebalance_rules_{label}.json"
     rules_path.write_text(
         json.dumps(
-            _strategy_rule_summary(cfg, value_scores=value_scores, benchmark_weights=benchmark_weights),
+            _strategy_rule_summary(
+                cfg,
+                value_scores=value_scores,
+                benchmark_weights=benchmark_weights,
+                security_groups=security_groups,
+            ),
             indent=2,
             sort_keys=True,
             default=_json_default,
@@ -434,6 +529,8 @@ def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
         "turnover_one_way",
         "cost_bps",
         "max_weight",
+        "issuer_groups",
+        "max_issuer_weight",
         "top5_weight",
         "top10_weight",
         "effective_number",
@@ -450,11 +547,19 @@ def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
         out[f"avg_{col}"] = float(s.mean())
         out[f"max_{col}"] = float(s.max())
     last = summary.iloc[-1]
+    for col in ["name_cap_feasible", "issuer_cap_feasible"]:
+        if col in summary:
+            s = summary[col].astype(bool)
+            out[f"{col}_months"] = int(s.sum())
+            out[f"{col}_ratio"] = float(s.mean()) if len(s) else float("nan")
     out["last_rebalance_month"] = str(last.get("rebalance_month", ""))
     out["last_effective_names"] = int(last.get("effective_names", 0) or 0)
     out["last_turnover_one_way"] = float(last.get("turnover_one_way", 0.0) or 0.0)
     out["last_max_weight"] = float(last.get("max_weight", 0.0) or 0.0)
+    out["last_max_issuer_weight"] = float(last.get("max_issuer_weight", 0.0) or 0.0)
     out["last_top_holdings"] = str(last.get("top_holdings", ""))
+    out["last_top_issuer_exposures"] = str(last.get("top_issuer_exposures", ""))
+    out["last_multi_class_exposures"] = str(last.get("multi_class_exposures", ""))
     return out
 
 
@@ -485,6 +590,22 @@ def _print_rebalance_summary(stats: dict[str, Any]) -> None:
         f"{_pct(stats.get('max_max_weight', float('nan')))}"
     )
     print(
+        "  max issuer avg/max     "
+        f"{_pct(stats.get('avg_max_issuer_weight', float('nan')))}/"
+        f"{_pct(stats.get('max_max_issuer_weight', float('nan')))}"
+    )
+    print(
+        "  issuer groups avg/max  "
+        f"{stats.get('avg_issuer_groups', float('nan')):.1f}/"
+        f"{stats.get('max_issuer_groups', float('nan')):.0f}"
+    )
+    if "name_cap_feasible_ratio" in stats or "issuer_cap_feasible_ratio" in stats:
+        print(
+            "  cap feasible months    "
+            f"name={_pct(stats.get('name_cap_feasible_ratio', float('nan')))} | "
+            f"issuer={_pct(stats.get('issuer_cap_feasible_ratio', float('nan')))}"
+        )
+    print(
         "  top10 weight avg/max   "
         f"{_pct(stats.get('avg_top10_weight', float('nan')))}/"
         f"{_pct(stats.get('max_top10_weight', float('nan')))}"
@@ -504,6 +625,12 @@ def _print_rebalance_summary(stats: dict[str, Any]) -> None:
     top = stats.get("last_top_holdings")
     if top:
         print(f"  latest top holdings    {top}")
+    issuers = stats.get("last_top_issuer_exposures")
+    if issuers:
+        print(f"  latest top issuers     {issuers}")
+    multi = stats.get("last_multi_class_exposures")
+    if multi:
+        print(f"  latest multi-class     {multi}")
 
 
 def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_tickers: int = 200) -> pathlib.Path:
@@ -521,6 +648,10 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     t_step = time.perf_counter()
     visible_cache = build_visible_versions_cache(chars, prices.index)
     print(f"    {len(visible_cache)} month-end visible-version snapshots in {time.perf_counter() - t_step:.1f}s")
+    security_groups = load_security_groups(
+        prices.columns,
+        LIVE_CONFIG.get("security_overrides_path", "data/security_overrides.csv"),
+    )
 
     cfg_a = BacktestConfig(
         universe=UniverseConfig(
@@ -555,11 +686,11 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     print("[3/6] Running thesis and placebo backtests")
     t_step = time.perf_counter()
     print("    thesis backtest running")
-    ret_a = run_backtest(holdings, prices, cfg_a, value_scores, bench_w, chars, visible_cache)
+    ret_a = run_backtest(holdings, prices, cfg_a, value_scores, bench_w, chars, visible_cache, security_groups)
     print(f"    thesis backtest done in {time.perf_counter() - t_step:.1f}s")
     t_placebo = time.perf_counter()
     print("    placebo backtest running")
-    ret_b = run_backtest(holdings, prices, cfg_b, value_scores, bench_w, chars, visible_cache)
+    ret_b = run_backtest(holdings, prices, cfg_b, value_scores, bench_w, chars, visible_cache, security_groups)
     print(f"    placebo backtest done in {time.perf_counter() - t_placebo:.1f}s")
     print("    attribution running")
     att_a = attribution(ret_a, factors, bench_ret)
@@ -583,6 +714,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         bench_w,
         chars=chars,
         visible_versions_cache=visible_cache,
+        security_groups=security_groups,
         verbose=True,
     )
     print(f"  marginal-ir total time {time.perf_counter() - t_step:.1f}s")
@@ -610,6 +742,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         visible_versions_cache=visible_cache,
         verbose=True,
         include_returns=True,
+        security_groups=security_groups,
     )
     grid_returns = grid.attrs.get("returns_by_config")
     print(f"  grid eval total time {time.perf_counter() - t_step:.1f}s")
@@ -632,6 +765,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             visible_versions_cache=visible_cache,
             verbose=True,
             precomputed_returns=grid_returns,
+            security_groups=security_groups,
         )
         oos_dsr_stream = active_return_stream(oos_ret, bench_ret)
         dsr = deflated_sharpe(
@@ -671,6 +805,17 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     out_dir.mkdir(parents=True, exist_ok=False)
 
     print("\n[6/6] Rendering strategy dashboard")
+    dashboard_params = _dashboard_parameter_summary(
+        mode=mode,
+        cfg=cfg_a,
+        prices=prices,
+        holdings=holdings,
+        benchmark=bench_ret,
+        axes=axes,
+        train_m=train_m,
+        test_m=test_m,
+        security_groups=security_groups,
+    )
     dashboard_path = dashboard(
         ret_a,
         ret_b,
@@ -682,6 +827,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         heat_y="turnover_quantile",
         dsr_info=dsr,
         oos_log=wf_log,
+        parameter_summary=dashboard_params,
         title=f"13F-clone strategy dashboard [{mode.upper()} DATA]",
         path=str(out_dir / "strategy_dashboard.png"),
     )
@@ -696,6 +842,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         benchmark_weights=bench_w,
         chars=chars,
         visible_versions_cache=visible_cache,
+        security_groups=security_groups,
     )
     print(f"  Saved rebalance summary:  {rebalance_outputs['summary']}")
     print(f"  Saved rebalance holdings: {rebalance_outputs['holdings']}")
@@ -708,6 +855,7 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
         "cfg_thesis": asdict(cfg_a),
         "cfg_placebo": asdict(cfg_b),
         "sweep_axes": {f"{scope}.{field}": values for (scope, field), values in axes.items()},
+        "dashboard_parameter_summary": dashboard_params,
         "input_summary": {
             "holdings_rows": int(len(holdings)),
             "manager_count": int(holdings["manager"].nunique()),
@@ -719,6 +867,8 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             "price_filter_diagnostics": holdings.attrs.get("price_filter_diagnostics"),
             "price_alignment_diagnostics": holdings.attrs.get("price_alignment_diagnostics"),
             "price_diagnostics": prices.attrs.get("price_diagnostics"),
+            "security_overrides_path": LIVE_CONFIG.get("security_overrides_path", "data/security_overrides.csv"),
+            "issuer_group_count": int(security_groups.nunique()),
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
         "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),

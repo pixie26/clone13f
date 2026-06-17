@@ -234,6 +234,7 @@ Known issues to track:
 
 * Prior-period turnover in `manager_characteristics` can still use a later amendment of the prior period. This is usually small but is a strict PIT issue. Fix by recomputing turnover as-of each rebalance date.
 * The `missing_price_policy="exit"` behavior is a yfinance-compatible fallback, not a replacement for true delisting returns.
+* CUSIP/OpenFIGI mapping coverage remains incomplete. The current mapper handles CUSIP vs CINS and common share-class ticker normalization, but residual unmapped value can still be systematic around stale identifiers, corporate actions, foreign issuers, renamed/merged securities, or non-common 13F instruments. Always report all-value and price-candidate coverage, top unmapped CUSIPs by value, and treat large unmapped value as a research validity risk until resolved with CRSP/WRDS or a supplemental audited identifier map.
 * ETF holdings are allowed for now because they can represent real hedge fund beta allocation. If needed, report ETF exposure separately rather than dropping ETFs silently.
 
 ## Testing Expectations

@@ -1,0 +1,17 @@
+ticker,issuer_group,asset_type,note
+GOOG,ALPHABET,common_stock,Alphabet Class C
+GOOGL,ALPHABET,common_stock,Alphabet Class A
+BRK-A,BERKSHIRE_HATHAWAY,common_stock,Berkshire Hathaway Class A
+BRK-B,BERKSHIRE_HATHAWAY,common_stock,Berkshire Hathaway Class B
+FOX,FOX_CORP,common_stock,Fox Class B
+FOXA,FOX_CORP,common_stock,Fox Class A
+LEN,LENNAR,common_stock,Lennar Class A
+LEN-B,LENNAR,common_stock,Lennar Class B
+HEI,HEICO,common_stock,HEICO common
+HEI-A,HEICO,common_stock,HEICO Class A
+NWS,NEWS_CORP,common_stock,News Corp Class B
+NWSA,NEWS_CORP,common_stock,News Corp Class A
+UA,UNDER_ARMOUR,common_stock,Under Armour Class C
+UAA,UNDER_ARMOUR,common_stock,Under Armour Class A
+PBR,PETROBRAS,adr,Petrobras common ADR
+PBR-A,PETROBRAS,adr,Petrobras preferred ADR

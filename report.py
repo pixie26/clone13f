@@ -21,6 +21,23 @@ BM_C = "#9aa0a6"
 ACC = "#c79a3a"
 
 
+def _format_param_lines(parameter_summary) -> list[str]:
+    if not parameter_summary:
+        return []
+    if isinstance(parameter_summary, dict):
+        lines = []
+        for key, value in parameter_summary.items():
+            if isinstance(value, dict):
+                body = ", ".join(f"{k}={v}" for k, v in value.items())
+            elif isinstance(value, (list, tuple)):
+                body = ", ".join(map(str, value))
+            else:
+                body = str(value)
+            lines.append(f"{key}: {body}")
+        return lines
+    return [str(x) for x in parameter_summary]
+
+
 def _cum(r: pd.Series, *, fill_missing: bool = False) -> pd.Series:
     x = r.fillna(0) if fill_missing else r
     return (1 + x).cumprod()
@@ -63,17 +80,34 @@ def dashboard(
     heat_y,
     dsr_info,
     oos_log=None,
+    parameter_summary=None,
     title="13F-clone strategy dashboard",
     path="strategy_dashboard.png",
 ):
     if benchmark is None:
         benchmark = pd.Series(0.0, index=retA.index, name="cash_benchmark")
-    fig = plt.figure(figsize=(15, 9.5))
+    param_lines = _format_param_lines(parameter_summary)
+    has_params = bool(param_lines)
+    fig = plt.figure(figsize=(15, 10.8 if has_params else 9.5))
     fig.patch.set_facecolor("white")
-    gs = fig.add_gridspec(3, 3, hspace=0.42, wspace=0.28,
-                          left=0.06, right=0.975, top=0.91, bottom=0.07)
+    if has_params:
+        gs = fig.add_gridspec(
+            4,
+            3,
+            height_ratios=[1, 1, 1, 0.50],
+            hspace=0.48,
+            wspace=0.28,
+            left=0.06,
+            right=0.975,
+            top=0.895,
+            bottom=0.055,
+        )
+    else:
+        gs = fig.add_gridspec(3, 3, hspace=0.42, wspace=0.28,
+                              left=0.06, right=0.975, top=0.91, bottom=0.07)
     fig.suptitle(title, x=0.06, ha="left", fontsize=15, fontweight="bold", color=INK)
-    fig.text(0.06, 0.935, "filing-date rebalance | factor-adjusted | active-return walk-forward OOS | DSR haircut",
+    fig.text(0.06, 0.92 if has_params else 0.935,
+             "filing-date rebalance | factor-adjusted | active-return walk-forward OOS | DSR haircut",
              ha="left", fontsize=9.5, color="#666")
 
     ax = fig.add_subplot(gs[0, :2])
@@ -164,6 +198,13 @@ def dashboard(
     ax.set_title("Rolling 12m factor alpha (ann.)", fontsize=10.5, color=INK)
     ax.grid(alpha=.25)
     ax.set_xlabel("")
+
+    if has_params:
+        ax = fig.add_subplot(gs[3, :])
+        ax.axis("off")
+        ax.text(0.0, 0.96, "Run parameters", fontsize=10.5, fontweight="bold", color=INK, va="top")
+        for i, line in enumerate(param_lines[:7]):
+            ax.text(0.0, 0.74 - i * 0.12, line, fontsize=8.0, color="#444", va="top")
 
     fig.savefig(path, dpi=130, facecolor="white")
     plt.close(fig)

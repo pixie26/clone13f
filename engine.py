@@ -51,6 +51,7 @@ class PortfolioConfig:
     consensus_weight: bool = True
     min_consensus_funds: int = 1            # drop names held by < this many in-universe funds
     max_name_weight: float = 0.05
+    max_issuer_weight: float = 0.075
     holding_horizon_q: int = 0              # 0 = full rebalance; N = carry N extra quarters
     min_active_weight_holdings: int = 20    # active_weight needs a diversified book to be meaningful
 
@@ -218,6 +219,61 @@ def _cap_weights(w: pd.Series, cap: float) -> pd.Series:
     return w
 
 
+def _security_groups_for(tickers, security_groups=None) -> pd.Series:
+    idx = pd.Index(tickers).astype(str).str.upper()
+    if security_groups is None:
+        return pd.Series(idx, index=idx)
+    groups = pd.Series(security_groups, dtype="string")
+    groups.index = groups.index.astype(str).str.upper()
+    out = pd.Series(idx, index=idx, dtype="string")
+    mapped = groups.reindex(idx).dropna().astype(str).str.upper()
+    out.loc[mapped.index] = mapped
+    return out.astype(str)
+
+
+def _cap_weights_with_groups(
+    w: pd.Series,
+    max_name_weight: float,
+    max_issuer_weight: float | None,
+    security_groups=None,
+) -> pd.Series:
+    w = _cap_weights(w, max_name_weight)
+    if w.empty or max_issuer_weight is None or max_issuer_weight <= 0 or max_issuer_weight >= 1:
+        return w
+    groups = _security_groups_for(w.index, security_groups).reindex(w.index)
+    if groups.nunique() * max_issuer_weight <= 1.0 + 1e-12:
+        return w
+    raw = w.copy()
+    for _ in range(100):
+        w = _cap_weights(w, max_name_weight)
+        group_sum = w.groupby(groups).sum()
+        over = group_sum[group_sum > max_issuer_weight + 1e-12]
+        if over.empty:
+            break
+        for group, total in over.items():
+            names = groups[groups == group].index
+            w.loc[names] *= max_issuer_weight / total
+        deficit = 1.0 - float(w.sum())
+        if deficit <= 1e-12:
+            break
+        group_sum = w.groupby(groups).sum()
+        name_room = (max_name_weight - w).clip(lower=0.0)
+        group_room = (max_issuer_weight - groups.map(group_sum)).clip(lower=0.0)
+        room = pd.concat([name_room.rename("name"), group_room.rename("group")], axis=1).min(axis=1)
+        eligible = room[room > 1e-12]
+        if eligible.empty:
+            break
+        base = raw.reindex(eligible.index).fillna(0.0).clip(lower=0.0)
+        if base.sum() <= 0:
+            base = eligible
+        add = base / base.sum() * deficit
+        add = pd.concat([add.rename("add"), eligible.rename("room")], axis=1).min(axis=1)
+        w.loc[add.index] += add
+        if abs(1.0 - float(w.sum())) <= 1e-10:
+            break
+    return w / w.sum() if w.sum() > 0 else w
+
+
 def _book_value_pctl(w: pd.Series, vscores: pd.Series | None) -> float:
     if vscores is None:
         return np.nan
@@ -341,7 +397,8 @@ def _apply_rebalance_target(cur: pd.Series,
                             last_in_tgt: dict[str, pd.Timestamp],
                             tgt: pd.Series,
                             cfg: BacktestConfig,
-                            month: pd.Timestamp) -> tuple[pd.Series, float, list[str]]:
+                            month: pd.Timestamp,
+                            security_groups=None) -> tuple[pd.Series, float, list[str]]:
     tgt = tgt / tgt.sum()
     for n in tgt.index:
         last_in_tgt[n] = month
@@ -360,7 +417,12 @@ def _apply_rebalance_target(cur: pd.Series,
         elif H <= 0 or q_gap > H:
             last_in_tgt.pop(n, None)
 
-    eff_s = _cap_weights(pd.Series(eff, dtype=float), cfg.portfolio.max_name_weight)
+    eff_s = _cap_weights_with_groups(
+        pd.Series(eff, dtype=float),
+        cfg.portfolio.max_name_weight,
+        cfg.portfolio.max_issuer_weight,
+        security_groups,
+    )
     alln = eff_s.index.union(cur.index)
     traded = 0.5 * (eff_s.reindex(alln).fillna(0) - cur.reindex(alln).fillna(0)).abs().sum()
     return eff_s, float(traded), carried
@@ -385,6 +447,49 @@ def _portfolio_summary_stats(weights: pd.Series) -> dict[str, float]:
         "hhi": hhi,
         "effective_number": float(1.0 / hhi) if hhi > 0 else 0.0,
     }
+
+
+def _issuer_exposure_summary(weights: pd.Series, security_groups=None) -> dict[str, float | str]:
+    w = weights[weights > 0].astype(float)
+    if w.empty:
+        return {
+            "issuer_groups": 0,
+            "max_issuer_weight": 0.0,
+            "top_issuer_exposures": "",
+            "multi_class_exposures": "",
+        }
+    groups = _security_groups_for(w.index, security_groups).reindex(w.index)
+    issuer_w = w.groupby(groups).sum().sort_values(ascending=False)
+    multi = []
+    for group, names in groups.groupby(groups):
+        tickers = list(names.index)
+        held = [ticker for ticker in tickers if ticker in w.index and w.loc[ticker] > 0]
+        if len(held) > 1:
+            parts = ", ".join(f"{ticker}:{w.loc[ticker]:.2%}" for ticker in sorted(held))
+            multi.append(f"{group}({parts}; total:{issuer_w.loc[group]:.2%})")
+    return {
+        "issuer_groups": int(len(issuer_w)),
+        "max_issuer_weight": float(issuer_w.max()) if not issuer_w.empty else 0.0,
+        "top_issuer_exposures": "; ".join(f"{k}:{v:.2%}" for k, v in issuer_w.head(12).items()),
+        "multi_class_exposures": "; ".join(multi[:12]),
+    }
+
+
+def _constraint_feasibility(weights: pd.Series, cfg: BacktestConfig, security_groups=None) -> dict[str, bool]:
+    w = weights[weights > 0]
+    if w.empty:
+        return {"name_cap_feasible": True, "issuer_cap_feasible": True}
+    groups = _security_groups_for(w.index, security_groups).reindex(w.index)
+    max_name = cfg.portfolio.max_name_weight
+    max_issuer = cfg.portfolio.max_issuer_weight
+    name_ok = max_name is None or max_name <= 0 or max_name >= 1 or len(w) * max_name >= 1.0 - 1e-12
+    issuer_ok = (
+        max_issuer is None
+        or max_issuer <= 0
+        or max_issuer >= 1
+        or groups.nunique() * max_issuer >= 1.0 - 1e-12
+    )
+    return {"name_cap_feasible": bool(name_ok), "issuer_cap_feasible": bool(issuer_ok)}
 
 
 def _trade_summary_stats(before: pd.Series, after: pd.Series) -> dict[str, int]:
@@ -433,7 +538,8 @@ def _apply_monthly_returns(cur: pd.Series,
 
 def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                     value_scores=None, benchmark_weights=None, chars=None,
-                    visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None) -> dict[str, pd.DataFrame]:
+                    visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
+                    security_groups=None) -> dict[str, pd.DataFrame]:
     """Return auditable rebalance summary, holdings, and manager-selection tables."""
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
@@ -470,6 +576,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         tgt = tgt[tgt.index.isin(priced_now)]
         if tgt.sum() <= 0:
             portfolio_stats = _portfolio_summary_stats(cur)
+            issuer_stats = _issuer_exposure_summary(cur, security_groups)
+            feasibility = _constraint_feasibility(cur, cfg, security_groups)
             summary_rows.append({
                 "rebalance_month": m.date().isoformat(),
                 "selected_managers": int(len(selected_versions)),
@@ -480,6 +588,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                 "turnover_one_way": 0.0,
                 "cost_bps": 0.0,
                 **portfolio_stats,
+                **issuer_stats,
+                **feasibility,
                 "traded_names": 0,
                 "buy_names": 0,
                 "sell_names": 0,
@@ -490,9 +600,11 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             })
             continue
 
-        eff, traded, carried = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m)
+        eff, traded, carried = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
         cost_bps = traded * cfg.cost.bps_per_side
         portfolio_stats = _portfolio_summary_stats(eff)
+        issuer_stats = _issuer_exposure_summary(eff, security_groups)
+        feasibility = _constraint_feasibility(eff, cfg, security_groups)
         trade_stats = _trade_summary_stats(cur, eff)
         top = eff.sort_values(ascending=False).head(12)
         summary_rows.append({
@@ -505,16 +617,20 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             "turnover_one_way": float(traded),
             "cost_bps": float(cost_bps),
             **portfolio_stats,
+            **issuer_stats,
+            **feasibility,
             **trade_stats,
             "top_holdings": "; ".join(f"{k}:{v:.2%}" for k, v in top.items()),
             "note": "",
         })
         carried_set = set(carried)
+        groups = _security_groups_for(eff.index, security_groups).reindex(eff.index)
         for rank, (ticker, weight) in enumerate(eff.sort_values(ascending=False).items(), start=1):
             holding_rows.append({
                 "rebalance_month": m.date().isoformat(),
                 "rank": int(rank),
                 "ticker": ticker,
+                "issuer_group": groups.loc[ticker],
                 "weight": float(weight),
                 "is_carried": bool(ticker in carried_set),
             })
@@ -530,7 +646,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
 # --------------------------------------------------------------------------- #
 def run_backtest(holdings, prices, cfg: BacktestConfig,
                  value_scores=None, benchmark_weights=None, chars=None,
-                 visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None) -> pd.Series:
+                 visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
+                 security_groups=None) -> pd.Series:
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
     months = prices.index.sort_values()
@@ -556,7 +673,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
             if tgt.sum() > 0:
-                eff, traded, _ = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m)
+                eff, traded, _ = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
                 net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
                 cur = eff
     return net
@@ -624,14 +741,14 @@ def _fmt_metric(value) -> str:
 
 
 def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=None, benchmark_weights=None,
-                chars=None, visible_versions_cache=None, verbose: bool = False):
+                chars=None, visible_versions_cache=None, security_groups=None, verbose: bool = False):
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
     visible_cache = visible_versions_cache or build_visible_versions_cache(ch, prices.index)
     if verbose:
         print("  marginal-ir 1/? running full stack")
         t0 = time.perf_counter()
     base = attribution(
-        run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache),
+        run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups),
         factors,
         benchmark,
     )
@@ -656,7 +773,7 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
             continue
         cfg2 = replace(cfg, universe=replace(cfg.universe, **{t: False}))
         att = attribution(
-            run_backtest(holdings, prices, cfg2, value_scores, benchmark_weights, ch, visible_cache),
+            run_backtest(holdings, prices, cfg2, value_scores, benchmark_weights, ch, visible_cache, security_groups),
             factors,
             benchmark,
         )

@@ -67,7 +67,7 @@ def _fmt_metric(value) -> str:
 def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
               value_scores=None, benchmark_weights=None, metric="sharpe",
               chars=None, visible_versions_cache=None, verbose: bool = False,
-              include_returns: bool = False) -> pd.DataFrame:
+              include_returns: bool = False, security_groups=None) -> pd.DataFrame:
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
     visible_cache = visible_versions_cache or build_visible_versions_cache(ch, prices.index)
     rows = []
@@ -78,7 +78,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
         if verbose:
             print(f"  grid {i}/{total} running {label}")
             t0 = time.perf_counter()
-        ret = run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache)
+        ret = run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups)
         if include_returns:
             returns_by_config[_label_key(label)] = ret
         att = attribution(ret, factors, benchmark)
@@ -100,7 +100,8 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                  value_scores=None, benchmark_weights=None,
                  train_m=36, test_m=12, select_on="sharpe",
                  chars=None, visible_versions_cache=None, verbose: bool = False,
-                 precomputed_returns: dict[tuple, pd.Series] | None = None):
+                 precomputed_returns: dict[tuple, pd.Series] | None = None,
+                 security_groups=None):
     """Rolling OOS. Returns (oos_returns, fold_log, n_trials)."""
     configs = iter_configs(base, axes)
     n_trials = len(configs)
@@ -129,7 +130,7 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
             if precomputed_returns is not None and _label_key(label) in precomputed_returns:
                 ret = precomputed_returns[_label_key(label)].reindex(tr)
             else:
-                ret = run_backtest(holdings, prices.loc[tr], cfg, value_scores, benchmark_weights, ch, visible_cache)
+                ret = run_backtest(holdings, prices.loc[tr], cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups)
             sc = _periodic_sharpe(_score_series(ret, benchmark.reindex(tr) if benchmark is not None else None, select_on))
             if verbose:
                 print(f"      done in {time.perf_counter() - t0:.1f}s train_{select_on}={_fmt_metric(sc)}")
@@ -142,7 +143,7 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
             te_ret = precomputed_returns[_label_key(best_lbl)].reindex(te)
         else:
             te_ret = run_backtest(holdings, prices.loc[months[:start + train_m + test_m]],
-                                  best, value_scores, benchmark_weights, ch, visible_cache).reindex(te)
+                                  best, value_scores, benchmark_weights, ch, visible_cache, security_groups).reindex(te)
         if verbose:
             print(f"    done test fold {fold_no}/{n_folds} in {time.perf_counter() - t0:.1f}s")
         oos.append(te_ret)

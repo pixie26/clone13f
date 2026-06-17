@@ -13,8 +13,11 @@ NOTE:  edgartools' attribute surface drifts across versions — the 13F parser
 from __future__ import annotations
 import contextlib
 import io
+import json
+import multiprocessing as mp
 from pathlib import Path
 import re
+import tempfile
 import time
 import zipfile
 import numpy as np
@@ -23,6 +26,7 @@ import requests
 
 PRICE_ELIGIBLE_SEC_TYPES = {"SH"}
 YFINANCE_TICKER_RE = r"^[A-Z]{1,6}([.\-][A-Z]{1,2})?$"
+OPENFIGI_SELECTOR_VERSION = 2
 OPENFIGI_US_EQUITY_FILTERS = {
     "currency": "USD",
     "marketSecDes": "Equity",
@@ -30,10 +34,23 @@ OPENFIGI_US_EQUITY_FILTERS = {
 }
 
 
-def _is_yfinance_ticker(value) -> bool:
+def _normalise_yfinance_ticker(value) -> str | None:
     if pd.isna(value):
-        return False
-    return bool(re.fullmatch(YFINANCE_TICKER_RE, str(value).strip().upper()))
+        return None
+    ticker = str(value).strip().upper().replace("/", "-")
+    return ticker if re.fullmatch(YFINANCE_TICKER_RE, ticker) else None
+
+
+def _is_yfinance_ticker(value) -> bool:
+    return _normalise_yfinance_ticker(value) is not None
+
+
+def _openfigi_id_type(identifier: str) -> str:
+    ident = str(identifier).strip().upper()
+    # CINS identifiers look like CUSIPs but start with a letter for non-US
+    # issuers. OpenFIGI returns many foreign-domiciled US-listed 13F names only
+    # when queried as ID_CINS, e.g. MDT, ACN, AON, NXPI.
+    return "ID_CINS" if ident[:1].isalpha() else "ID_CUSIP"
 
 
 def _is_us_openfigi_exchange(value) -> bool:
@@ -48,8 +65,8 @@ def _select_openfigi_ticker(data: list[dict] | None) -> str | None:
     for rec in data:
         if not isinstance(rec, dict):
             continue
-        ticker = rec.get("ticker")
-        if not _is_yfinance_ticker(ticker):
+        ticker = _normalise_yfinance_ticker(rec.get("ticker"))
+        if ticker is None:
             continue
         market_sector = str(rec.get("marketSector", "")).upper()
         exch = str(rec.get("exchCode", "")).upper()
@@ -68,7 +85,7 @@ def _select_openfigi_ticker(data: list[dict] | None) -> str | None:
             score += 2
         if market_sector == "EQUITY":
             score += 1
-        candidates.append((score, str(ticker).strip().upper()))
+        candidates.append((score, ticker))
     if not candidates:
         return None
     candidates.sort(key=lambda x: (-x[0], x[1]))
@@ -85,12 +102,15 @@ def _load_openfigi_cache(cache_path: str | Path | None) -> dict[str, str | None]
     if "cusip" not in df or "ticker" not in df:
         return {}
     out: dict[str, str | None] = {}
-    for row in df[["cusip", "ticker"]].itertuples(index=False):
+    has_selector_version = "selector_version" in df.columns
+    version = df["selector_version"] if has_selector_version else pd.Series([pd.NA] * len(df))
+    for row, selector_version in zip(df[["cusip", "ticker"]].itertuples(index=False), version):
         cusip = str(row.cusip).strip().upper()
-        ticker = None if pd.isna(row.ticker) else str(row.ticker).strip().upper()
-        if ticker is not None and not _is_yfinance_ticker(ticker):
-            ticker = None
-        out[cusip] = ticker
+        ticker = _normalise_yfinance_ticker(row.ticker)
+        if ticker is not None:
+            out[cusip] = ticker
+        elif has_selector_version and pd.notna(selector_version) and int(selector_version) >= OPENFIGI_SELECTOR_VERSION:
+            out[cusip] = None
     return out
 
 
@@ -99,7 +119,15 @@ def _write_openfigi_cache(cache_path: str | Path | None, cache: dict[str, str | 
         return
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [{"cusip": c, "ticker": t} for c, t in sorted(cache.items())]
+    rows = [
+        {
+            "cusip": c,
+            "ticker": t,
+            "id_type": _openfigi_id_type(c),
+            "selector_version": OPENFIGI_SELECTOR_VERSION,
+        }
+        for c, t in sorted(cache.items())
+    ]
     pd.DataFrame(rows).to_parquet(path, index=False)
 
 
@@ -136,14 +164,68 @@ def _yf_download_close(yf, batch: list[str], start: str, end: str) -> pd.DataFra
     return _normalise_close_frame(raw, batch)
 
 
+def _yf_download_close_worker(batch: list[str], start: str, end: str, out_path: str, status_path: str) -> None:
+    try:
+        import yfinance as yf
+
+        close = _yf_download_close(yf, batch, start, end)
+        if not close.empty:
+            close.to_parquet(out_path)
+        Path(status_path).write_text(json.dumps({"ok": True, "empty": bool(close.empty)}), encoding="utf-8")
+    except BaseException as exc:
+        Path(status_path).write_text(
+            json.dumps({"ok": False, "type": type(exc).__name__, "message": str(exc)}),
+            encoding="utf-8",
+        )
+
+
+def _yf_download_close_subprocess(batch: list[str], start: str, end: str, timeout_seconds: int) -> pd.DataFrame:
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = str(Path(tmp) / "close.parquet")
+        status_path = str(Path(tmp) / "status.json")
+        ctx = mp.get_context("spawn")
+        proc = ctx.Process(
+            target=_yf_download_close_worker,
+            args=(batch, start, end, out_path, status_path),
+        )
+        proc.start()
+        proc.join(timeout_seconds)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            raise TimeoutError(
+                f"yfinance batch timed out after {timeout_seconds}s: {batch[0]}..{batch[-1]}"
+            )
+        if not Path(status_path).exists():
+            raise RuntimeError(f"yfinance worker exited without status code={proc.exitcode}")
+        status = json.loads(Path(status_path).read_text(encoding="utf-8"))
+        if not status.get("ok"):
+            raise RuntimeError(f"{status.get('type')}: {status.get('message')}")
+        if status.get("empty") or not Path(out_path).exists():
+            return pd.DataFrame()
+        return pd.read_parquet(out_path)
+
+
+def _yf_download_close_guarded(
+    yf,
+    batch: list[str],
+    start: str,
+    end: str,
+    timeout_seconds: int | None,
+) -> pd.DataFrame:
+    if timeout_seconds and timeout_seconds > 0 and getattr(_yf_download_close, "__module__", __name__) == __name__:
+        return _yf_download_close_subprocess(batch, start, end, timeout_seconds)
+    return _yf_download_close(yf, batch, start, end)
+
+
 def _looks_rate_limited(exc: Exception) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
     return "ratelimit" in text or "rate limit" in text or "too many requests" in text or "429" in text
 
 
-def _yfinance_probe(yf, start: str, end: str) -> str:
+def _yfinance_probe(yf, start: str, end: str, timeout_seconds: int | None = 60) -> str:
     try:
-        close = _yf_download_close(yf, ["SPY", "IWD", "AAPL"], start, end)
+        close = _yf_download_close_guarded(yf, ["SPY", "IWD", "AAPL"], start, end, timeout_seconds)
     except Exception as exc:
         return f"probe_exception={type(exc).__name__}: {exc}"
     if close.empty:
@@ -478,7 +560,7 @@ def cusip_to_ticker(
         batch_no = i // 100 + 1
         print(f"    OpenFIGI batch {batch_no}/{n_batches}: {batch_cusips[0]}..{batch_cusips[-1]}")
         batch = [
-            {"idType": "ID_CUSIP", "idValue": c, **OPENFIGI_US_EQUITY_FILTERS}
+            {"idType": _openfigi_id_type(c), "idValue": c, **OPENFIGI_US_EQUITY_FILTERS}
             for c in batch_cusips
         ]
         r = requests.post(url, json=batch, headers=hdr, timeout=30)
@@ -512,19 +594,78 @@ def cusip_to_ticker(
 
 
 def mapping_diagnostics(holdings: pd.DataFrame, cmap: dict[str, str]) -> dict:
-    mapped = holdings["cusip"].map(cmap).notna()
-    total_value = holdings["value"].sum()
+    h = holdings.copy()
+    h["cusip"] = h["cusip"].astype(str).str.strip().str.upper()
+    if "issuer" not in h:
+        h["issuer"] = ""
+    mapped = h["cusip"].map(cmap).notna()
+    sec_type = h.get("sec_type", pd.Series("SH", index=h.index)).fillna("SH").astype(str).str.upper()
+    share_amount_type = h.get("share_amount_type", pd.Series("", index=h.index)).fillna("").astype(str).str.upper()
+    price_candidate = sec_type.isin(PRICE_ELIGIBLE_SEC_TYPES) & share_amount_type.ne("PRN")
+    total_value = h["value"].sum()
     mapped_value = holdings.loc[mapped, "value"].sum()
+    candidate_value = h.loc[price_candidate, "value"].sum()
+    candidate_mapped_value = h.loc[price_candidate & mapped, "value"].sum()
+
+    by_sec_type: dict[str, dict[str, float | int]] = {}
+    for key, g in h.assign(_mapped=mapped, _sec_type=sec_type).groupby("_sec_type", dropna=False):
+        value = g["value"].sum()
+        mapped_value_sec = g.loc[g["_mapped"], "value"].sum()
+        by_sec_type[str(key)] = {
+            "rows": int(len(g)),
+            "cusips": int(g["cusip"].nunique()),
+            "value": float(value),
+            "mapped_value": float(mapped_value_sec),
+            "value_coverage": float(mapped_value_sec / value) if value else float("nan"),
+        }
+
+    top_unmapped = []
+    missing = h.loc[~mapped].copy()
+    if not missing.empty:
+        missing["_sec_type"] = sec_type.loc[missing.index]
+        missing["_share_amount_type"] = share_amount_type.loc[missing.index]
+        grouped = (
+            missing.groupby(["cusip", "issuer", "_sec_type", "_share_amount_type"], dropna=False)
+            .agg(value=("value", "sum"), rows=("value", "size"))
+            .sort_values("value", ascending=False)
+            .head(25)
+            .reset_index()
+        )
+        top_unmapped = []
+        for row in grouped.to_dict(orient="records"):
+            top_unmapped.append(
+                {
+                    "cusip": str(row["cusip"]),
+                    "issuer": "" if pd.isna(row["issuer"]) else str(row["issuer"]),
+                    "sec_type": str(row["_sec_type"]),
+                    "share_amount_type": str(row["_share_amount_type"]),
+                    "rows": int(row["rows"]),
+                    "value": float(row["value"]),
+                    "pct_total_value": float(row["value"] / total_value) if total_value else float("nan"),
+                }
+            )
+
     return {
         "rows_total": int(len(holdings)),
         "rows_mapped": int(mapped.sum()),
         "rows_unmapped": int((~mapped).sum()),
-        "cusips_total": int(holdings["cusip"].nunique()),
-        "cusips_mapped": int(holdings.loc[mapped, "cusip"].nunique()),
-        "cusips_unmapped": int(holdings.loc[~mapped, "cusip"].nunique()),
+        "cusips_total": int(h["cusip"].nunique()),
+        "cusips_mapped": int(h.loc[mapped, "cusip"].nunique()),
+        "cusips_unmapped": int(h.loc[~mapped, "cusip"].nunique()),
         "value_total": float(total_value),
         "value_mapped": float(mapped_value),
         "value_coverage": float(mapped_value / total_value) if total_value else float("nan"),
+        "price_candidate_rows_total": int(price_candidate.sum()),
+        "price_candidate_rows_mapped": int((price_candidate & mapped).sum()),
+        "price_candidate_cusips_total": int(h.loc[price_candidate, "cusip"].nunique()),
+        "price_candidate_cusips_mapped": int(h.loc[price_candidate & mapped, "cusip"].nunique()),
+        "price_candidate_value_total": float(candidate_value),
+        "price_candidate_value_mapped": float(candidate_mapped_value),
+        "price_candidate_value_coverage": (
+            float(candidate_mapped_value / candidate_value) if candidate_value else float("nan")
+        ),
+        "by_sec_type": by_sec_type,
+        "top_unmapped_by_value": top_unmapped,
         "drop_reason": "unmapped_cusip",
     }
 
@@ -546,12 +687,27 @@ def map_holdings_to_tickers(
         f"{diag['rows_mapped']}/{diag['rows_total']} rows, "
         f"{diag['value_coverage']:.1%} value mapped"
     )
+    candidate_msg = (
+        "CUSIP mapping price-candidate coverage: "
+        f"{diag['price_candidate_cusips_mapped']}/{diag['price_candidate_cusips_total']} CUSIPs, "
+        f"{diag['price_candidate_rows_mapped']}/{diag['price_candidate_rows_total']} rows, "
+        f"{diag['price_candidate_value_coverage']:.1%} long-share value mapped"
+    )
     if strict and diag["value_coverage"] < min_value_coverage:
         raise ValueError(msg)
     if diag["rows_unmapped"]:
         print(f"  [warn] {msg}; dropping unmapped_cusip rows")
+        print(f"  [warn] {candidate_msg}")
+        sample = diag.get("top_unmapped_by_value", [])[:10]
+        if sample:
+            formatted = ", ".join(
+                f"{row['cusip']} {row['issuer']} {row['value']:.0f}"
+                for row in sample
+            )
+            print(f"  [warn] top unmapped CUSIPs by value: {formatted}")
     else:
         print(f"  {msg}")
+        print(f"  {candidate_msg}")
     out = h.dropna(subset=["ticker"]).copy()
     out.attrs["mapping_diagnostics"] = diag
     return out
@@ -644,6 +800,7 @@ def fetch_prices(
     max_consecutive_empty_batches: int = 3,
     use_chart_fallback: bool = True,
     chart_fallback_workers: int = 8,
+    yfinance_batch_timeout_seconds: int | None = 120,
     require_full_window: bool = False,
 ) -> pd.DataFrame:
     ## FRICTION: yfinance has survivorship gaps (delisted names vanish). For a
@@ -696,13 +853,14 @@ def fetch_prices(
     consecutive_empty = 0
     n_batches = int(np.ceil(len(todo) / batch_size)) if todo else 0
     print(f"  price download: {len(todo)} uncached / {len(clean)} requested tickers in {n_batches} batches")
+    stop_yfinance_loop = False
     for i in range(0, len(todo), batch_size):
         batch = todo[i:i + batch_size]
         batch_no = i // batch_size + 1
         print(f"    yfinance batch {batch_no}/{n_batches}: {batch[0]}..{batch[-1]}")
         for attempt in range(max_retries + 1):
             try:
-                close = _yf_download_close(yf, batch, start, end)
+                close = _yf_download_close_guarded(yf, batch, start, end, yfinance_batch_timeout_seconds)
                 if not close.empty:
                     non_nan_close = close.dropna(axis=1, how="all")
                     if non_nan_close.empty:
@@ -730,6 +888,39 @@ def fetch_prices(
                 empty_batch_tickers.append(batch)
                 consecutive_empty += 1
                 break
+            except TimeoutError as exc:
+                failed_batches.append(f"{batch[0]}..{batch[-1]}: {exc}")
+                print(f"    [warn] {exc}")
+                if not use_chart_fallback:
+                    raise RuntimeError(
+                        f"Stopping yfinance download after timed-out batch; "
+                        f"recent failed batches: {failed_batches[-3:]}"
+                    ) from exc
+                remaining = todo[i + batch_size:]
+                fallback_tickers = sorted(set(batch).union(remaining))
+                chart_probe = _yahoo_chart_probe(start, end)
+                if "chart_probe_ok=" not in chart_probe:
+                    raise RuntimeError(
+                        f"Stopping yfinance download after timed-out batch; "
+                        f"Yahoo Chart fallback unavailable: {chart_probe}; "
+                        f"recent failed batches: {failed_batches[-3:]}"
+                    ) from exc
+                print(
+                    "    [warn] yfinance batch timed out. "
+                    f"Switching to Yahoo Chart API fallback for {len(fallback_tickers)} tickers; {chart_probe}"
+                )
+                chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
+                    fallback_tickers,
+                    start,
+                    end,
+                    batch_size=batch_size,
+                    cache_path=cache_path,
+                    max_workers=chart_fallback_workers,
+                )
+                frames.extend(chart_frames)
+                used_chart_fallback = True
+                stop_yfinance_loop = True
+                break
             except Exception as exc:
                 last_attempt = attempt >= max_retries
                 if _looks_rate_limited(exc) and not last_attempt:
@@ -743,8 +934,10 @@ def fetch_prices(
                 failed_batches.append(f"{batch[0]}..{batch[-1]}: {exc}")
                 print(f"    [warn] yfinance batch failed: {batch[0]}..{batch[-1]}: {exc}")
                 break
+        if stop_yfinance_loop:
+            break
         if consecutive_empty >= max_consecutive_empty_batches:
-            probe = _yfinance_probe(yf, start, end)
+            probe = _yfinance_probe(yf, start, end, yfinance_batch_timeout_seconds)
             if "probe_ok=" not in probe:
                 if not use_chart_fallback:
                     raise RuntimeError(
@@ -786,7 +979,7 @@ def fetch_prices(
         time.sleep(0.1)
 
     if not frames:
-        probe = _yfinance_probe(yf, start, end)
+        probe = _yfinance_probe(yf, start, end, yfinance_batch_timeout_seconds)
         detail_parts = []
         if failed_batches:
             detail_parts.append(f"failed batches: {failed_batches[:3]}")
@@ -844,6 +1037,9 @@ def fetch_prices(
         "tickers_refetched_due_to_incomplete_cache": int(len(stale_cached_cols)),
         "tickers_skipped_known_no_close": int(len(coverage_no_close)),
         "used_chart_fallback": bool(used_chart_fallback),
+        "yfinance_batch_timeout_seconds": (
+            int(yfinance_batch_timeout_seconds) if yfinance_batch_timeout_seconds else None
+        ),
         "failed_batches": failed_batches[:10],
         "empty_batches": empty_batches[:10],
         "chart_failed_batches": chart_failed_batches[:10],

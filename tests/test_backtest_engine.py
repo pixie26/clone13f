@@ -6,18 +6,32 @@ import data_adapters as da
 import sweep as sw
 from data_adapters import (
     _is_yfinance_ticker,
+    _load_openfigi_cache,
     _load_price_cache,
     _normalise_close_frame,
+    _openfigi_id_type,
     _parse_ken_french_monthly_csv,
     _select_openfigi_ticker,
+    _write_openfigi_cache,
+    cusip_to_ticker,
     _write_price_cache,
     align_holdings_to_prices,
     map_holdings_to_tickers,
     mapping_diagnostics,
     priceable_holdings,
 )
-from engine import BacktestConfig, PortfolioConfig, UniverseConfig, _cap_weights, attribution, rebalance_trace, run_backtest, target_weights_from_versions
-from run_example import _rebalance_summary_stats
+from engine import (
+    BacktestConfig,
+    PortfolioConfig,
+    UniverseConfig,
+    _cap_weights,
+    _cap_weights_with_groups,
+    attribution,
+    rebalance_trace,
+    run_backtest,
+    target_weights_from_versions,
+)
+from run_example import _rebalance_summary_stats, load_security_groups
 from sweep import deflated_sharpe
 
 
@@ -137,6 +151,17 @@ def test_cap_weights_enforces_feasible_name_cap():
     assert capped.max() <= 0.25 + 1e-12
 
 
+def test_cap_weights_with_groups_limits_share_classes_by_issuer():
+    raw = pd.Series({"GOOG": 0.35, "GOOGL": 0.25, "MSFT": 0.20, "AMZN": 0.12, "META": 0.08})
+    groups = pd.Series({"GOOG": "ALPHABET", "GOOGL": "ALPHABET"})
+
+    capped = _cap_weights_with_groups(raw, max_name_weight=0.40, max_issuer_weight=0.30, security_groups=groups)
+
+    assert capped.sum() == pytest.approx(1.0)
+    assert capped.max() <= 0.40 + 1e-12
+    assert capped.loc[["GOOG", "GOOGL"]].sum() <= 0.30 + 1e-12
+
+
 def test_active_weight_signal_uses_relative_overweight_not_absolute_level():
     latest_versions = pd.DataFrame(
         [
@@ -208,7 +233,16 @@ def test_walk_forward_selects_on_active_sharpe_not_raw_market_return(monkeypatch
         portfolio=PortfolioConfig(idea_signal="level"),
     )
 
-    def fake_run_backtest(holdings, px, cfg, value_scores=None, benchmark_weights=None, chars=None, visible_versions_cache=None):
+    def fake_run_backtest(
+        holdings,
+        px,
+        cfg,
+        value_scores=None,
+        benchmark_weights=None,
+        chars=None,
+        visible_versions_cache=None,
+        security_groups=None,
+    ):
         if cfg.portfolio.idea_signal == "active_weight":
             active = pd.Series([0.01, 0.02, 0.01], index=months).reindex(px.index)
         else:
@@ -408,6 +442,74 @@ def test_rebalance_trace_reports_auditable_rebalance_fields():
     assert set(trace["managers"]["manager"]) == {"m1", "m2"}
 
 
+def test_rebalance_trace_reports_issuer_groups_and_multi_class_exposure():
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": ticker,
+                "value": value,
+                "sec_type": "SH",
+            }
+            for ticker, value in [
+                ("GOOG", 40.0),
+                ("GOOGL", 30.0),
+                ("MSFT", 20.0),
+                ("AMZN", 10.0),
+            ]
+        ]
+    )
+    prices = pd.DataFrame(
+        {ticker: [0.0] for ticker in ["GOOG", "GOOGL", "MSFT", "AMZN"]},
+        index=pd.to_datetime(["2020-01-31"]),
+    )
+    groups = pd.Series({"GOOG": "ALPHABET", "GOOGL": "ALPHABET"})
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(top_n_ideas=4, max_name_weight=0.50, max_issuer_weight=0.40),
+    )
+
+    trace = rebalance_trace(holdings, prices, cfg, security_groups=groups)
+    summary = trace["summary"].iloc[0]
+    held = trace["holdings"].set_index("ticker")
+
+    assert summary["max_issuer_weight"] <= 0.40 + 1e-12
+    assert summary["issuer_groups"] == 3
+    assert bool(summary["name_cap_feasible"]) is True
+    assert bool(summary["issuer_cap_feasible"]) is True
+    assert "ALPHABET" in summary["multi_class_exposures"]
+    assert held.loc["GOOG", "issuer_group"] == "ALPHABET"
+    assert held.loc["GOOGL", "issuer_group"] == "ALPHABET"
+    assert held.loc[["GOOG", "GOOGL"], "weight"].sum() <= 0.40 + 1e-12
+
+
+def test_load_security_groups_uses_override_file(tmp_path):
+    path = tmp_path / "security_overrides.csv"
+    path.write_text(
+        "ticker,issuer_group,asset_type,note\n"
+        "GOOG,ALPHABET,common_stock,Alphabet Class C\n"
+        "GOOGL,ALPHABET,common_stock,Alphabet Class A\n",
+        encoding="utf-8",
+    )
+
+    groups = load_security_groups(["GOOG", "GOOGL", "MSFT"], path)
+
+    assert groups.loc["GOOG"] == "ALPHABET"
+    assert groups.loc["GOOGL"] == "ALPHABET"
+    assert groups.loc["MSFT"] == "MSFT"
+
+
 def test_rebalance_summary_stats_reports_portfolio_and_turnover_summary():
     summary = pd.DataFrame(
         [
@@ -419,12 +521,15 @@ def test_rebalance_summary_stats_reports_portfolio_and_turnover_summary():
                 "turnover_one_way": 0.25,
                 "cost_bps": 3.75,
                 "max_weight": 0.10,
+                "issuer_groups": 10,
                 "top5_weight": 0.45,
                 "top10_weight": 0.80,
                 "effective_number": 9.5,
                 "traded_names": 6,
                 "buy_names": 4,
                 "sell_names": 2,
+                "name_cap_feasible": True,
+                "issuer_cap_feasible": True,
                 "top_holdings": "A:10.00%",
             },
             {
@@ -435,12 +540,15 @@ def test_rebalance_summary_stats_reports_portfolio_and_turnover_summary():
                 "turnover_one_way": 0.40,
                 "cost_bps": 6.0,
                 "max_weight": 0.08,
+                "issuer_groups": 12,
                 "top5_weight": 0.40,
                 "top10_weight": 0.75,
                 "effective_number": 11.0,
                 "traded_names": 5,
                 "buy_names": 3,
                 "sell_names": 1,
+                "name_cap_feasible": True,
+                "issuer_cap_feasible": False,
                 "top_holdings": "B:8.00%",
             },
         ]
@@ -452,6 +560,9 @@ def test_rebalance_summary_stats_reports_portfolio_and_turnover_summary():
     assert stats["avg_effective_names"] == pytest.approx(11)
     assert stats["max_turnover_one_way"] == pytest.approx(0.40)
     assert stats["avg_max_weight"] == pytest.approx(0.09)
+    assert stats["avg_issuer_groups"] == pytest.approx(11)
+    assert stats["name_cap_feasible_ratio"] == pytest.approx(1.0)
+    assert stats["issuer_cap_feasible_ratio"] == pytest.approx(0.5)
     assert stats["last_rebalance_month"] == "2020-02-29"
     assert stats["last_top_holdings"] == "B:8.00%"
 
@@ -461,6 +572,8 @@ def test_mapping_diagnostics_reports_unmapped_value():
         {
             "cusip": ["111111111", "222222222"],
             "value": [75.0, 25.0],
+            "sec_type": ["SH", "SH"],
+            "share_amount_type": ["SH", "SH"],
         }
     )
     cmap = {"111111111": "AAA"}
@@ -471,7 +584,94 @@ def test_mapping_diagnostics_reports_unmapped_value():
     assert diag["cusips_mapped"] == 1
     assert diag["cusips_unmapped"] == 1
     assert diag["value_coverage"] == 0.75
+    assert diag["price_candidate_value_coverage"] == 0.75
+    assert diag["by_sec_type"]["SH"]["value_coverage"] == 0.75
+    assert diag["top_unmapped_by_value"][0]["cusip"] == "222222222"
     assert mapped["ticker"].tolist() == ["AAA"]
+
+
+def test_openfigi_selector_normalizes_share_class_ticker_for_yfinance():
+    data = [
+        {
+            "ticker": "BRK/B",
+            "marketSector": "Equity",
+            "exchCode": "US",
+            "securityType2": "Common Stock",
+        }
+    ]
+
+    assert _select_openfigi_ticker(data) == "BRK-B"
+    assert _is_yfinance_ticker("BRK/B")
+
+
+def test_openfigi_id_type_uses_cins_for_foreign_cusip_like_ids():
+    assert _openfigi_id_type("G5960L103") == "ID_CINS"
+    assert _openfigi_id_type("N6596X109") == "ID_CINS"
+    assert _openfigi_id_type("084670702") == "ID_CUSIP"
+
+
+def test_openfigi_cache_invalidates_legacy_negative_rows(tmp_path):
+    cache_path = tmp_path / "openfigi.parquet"
+    pd.DataFrame(
+        [
+            {"cusip": "084670702", "ticker": None},
+            {"cusip": "02079K305", "ticker": "GOOGL"},
+        ]
+    ).to_parquet(cache_path, index=False)
+
+    loaded = _load_openfigi_cache(cache_path)
+
+    assert loaded == {"02079K305": "GOOGL"}
+    _write_openfigi_cache(cache_path, {"084670702": None})
+    loaded = _load_openfigi_cache(cache_path)
+    assert loaded == {"084670702": None}
+
+
+def test_cusip_to_ticker_uses_cins_id_type_and_normalizes_ticker(monkeypatch, tmp_path):
+    requests_seen = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "data": [
+                        {
+                            "ticker": "BRK/B",
+                            "marketSector": "Equity",
+                            "exchCode": "US",
+                            "securityType2": "Common Stock",
+                        }
+                    ]
+                },
+                {
+                    "data": [
+                        {
+                            "ticker": "MDT",
+                            "marketSector": "Equity",
+                            "exchCode": "US",
+                            "securityType2": "Common Stock",
+                        }
+                    ]
+                },
+            ]
+
+    def fake_post(url, json, headers, timeout):
+        requests_seen.append(json)
+        return FakeResponse()
+
+    monkeypatch.setattr(da.requests, "post", fake_post)
+    monkeypatch.setattr(da.time, "sleep", lambda *_: None)
+
+    out = cusip_to_ticker(["G5960L103", "084670702"], cache_path=tmp_path / "openfigi.parquet")
+
+    jobs = requests_seen[0]
+    assert [job["idType"] for job in jobs] == ["ID_CUSIP", "ID_CINS"]
+    assert out == {"084670702": "BRK-B", "G5960L103": "MDT"}
 
 
 def test_priceable_holdings_drops_prn_and_bond_descriptions():
@@ -707,7 +907,7 @@ def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypat
     def fake_yf_download_close(yf, batch, start, end):
         return pd.DataFrame()
 
-    def fake_yfinance_probe(yf, start, end):
+    def fake_yfinance_probe(yf, start, end, timeout_seconds=None):
         return "probe_empty_close"
 
     def fake_chart_probe(start, end):
@@ -736,6 +936,42 @@ def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypat
     assert returns.attrs["price_diagnostics"]["used_chart_fallback"] is True
     assert returns.attrs["price_diagnostics"]["tickers_with_close"] == 2
     assert returns.iloc[-1].tolist() == pytest.approx([0.1, 0.1])
+
+
+def test_fetch_prices_switches_to_chart_fallback_after_yfinance_timeout(monkeypatch, tmp_path):
+    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
+    chart_batches = []
+
+    def fake_yf_download_close_guarded(yf, batch, start, end, timeout_seconds):
+        raise TimeoutError(f"yfinance batch timed out after {timeout_seconds}s: {batch[0]}..{batch[-1]}")
+
+    def fake_chart_probe(start, end):
+        return "chart_probe_ok=SPY,IWD,AAPL"
+
+    def fake_chart_download_close(batch, start, end, *, max_workers=8):
+        chart_batches.append(tuple(batch))
+        data = {ticker: [100.0, 110.0, 121.0] for ticker in batch}
+        return pd.DataFrame(data, index=dates)
+
+    monkeypatch.setattr(da, "_yf_download_close_guarded", fake_yf_download_close_guarded)
+    monkeypatch.setattr(da, "_yahoo_chart_probe", fake_chart_probe)
+    monkeypatch.setattr(da, "_yahoo_chart_download_close", fake_chart_download_close)
+
+    returns = da.fetch_prices(
+        ["AAPL", "MSFT", "NVDA"],
+        "2025-01-01",
+        "2025-03-31",
+        batch_size=2,
+        max_retries=0,
+        cache_path=tmp_path / "prices.parquet",
+        yfinance_batch_timeout_seconds=1,
+    )
+
+    assert chart_batches == [("AAPL", "MSFT"), ("NVDA",)]
+    assert returns.columns.tolist() == ["AAPL", "MSFT", "NVDA"]
+    assert returns.attrs["price_diagnostics"]["used_chart_fallback"] is True
+    assert returns.attrs["price_diagnostics"]["yfinance_batch_timeout_seconds"] == 1
+    assert "timed out" in returns.attrs["price_diagnostics"]["failed_batches"][0]
 
 
 def test_fetch_prices_keeps_partial_monthly_return_columns(monkeypatch):
