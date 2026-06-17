@@ -49,6 +49,13 @@ def _dd(r: pd.Series) -> pd.Series:
     return c / c.cummax() - 1
 
 
+def _plot_series(ax, series: pd.Series, **kwargs) -> None:
+    s = series.replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return
+    ax.plot(pd.to_datetime(s.index), s.values, **kwargs)
+
+
 def _rolling_alpha(
     ret: pd.Series,
     factors: pd.DataFrame,
@@ -112,10 +119,10 @@ def dashboard(
              ha="left", fontsize=9.5, color="#666")
 
     ax = fig.add_subplot(gs[0, :2])
-    _cum(retA, fill_missing=True).plot(ax=ax, color=A_C, lw=2.2, label="A | thesis stack")
-    _cum(retB, fill_missing=True).plot(ax=ax, color=B_C, lw=1.6, label="B | placebo")
+    _plot_series(ax, _cum(retA, fill_missing=True), color=A_C, lw=2.2, label="A | thesis stack")
+    _plot_series(ax, _cum(retB, fill_missing=True), color=B_C, lw=1.6, label="B | placebo")
     bm_name = getattr(benchmark, "name", None) or "benchmark"
-    _cum(benchmark.reindex(retA.index)).plot(ax=ax, color=BM_C, lw=1.4, ls="--", label=f"benchmark | {bm_name}")
+    _plot_series(ax, _cum(benchmark.reindex(retA.index)), color=BM_C, lw=1.4, ls="--", label=f"benchmark | {bm_name}")
     ax.set_title("Cumulative net return (growth of 1)", fontsize=11, color=INK)
     ax.legend(fontsize=8.5, frameon=False)
     ax.grid(alpha=.25)
@@ -155,8 +162,11 @@ def dashboard(
 
     ax = fig.add_subplot(gs[1, :2])
     d = _dd(retA)
-    ax.fill_between(d.index, d.values, 0, color=A_C, alpha=.25)
-    d.plot(ax=ax, color=A_C, lw=1.2)
+    d_clean = d.replace([np.inf, -np.inf], np.nan).dropna()
+    if not d_clean.empty:
+        x = pd.to_datetime(d_clean.index)
+        ax.fill_between(x, d_clean.values, 0, color=A_C, alpha=.25)
+        ax.plot(x, d_clean.values, color=A_C, lw=1.2)
     ax.set_title("Drawdown | thesis (A)", fontsize=11, color=INK)
     ax.grid(alpha=.25)
     ax.set_xlabel("")
@@ -194,7 +204,7 @@ def dashboard(
 
     ax = fig.add_subplot(gs[2, 2])
     ra = _rolling_alpha(retA, factors)
-    ra.plot(ax=ax, color=ACC, lw=1.4)
+    _plot_series(ax, ra, color=ACC, lw=1.4)
     ax.axhline(0, color=INK, lw=.8)
     ax.set_title("Rolling 12m factor alpha (ann.)", fontsize=10.5, color=INK)
     ax.grid(alpha=.25)
