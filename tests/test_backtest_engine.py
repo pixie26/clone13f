@@ -369,6 +369,199 @@ def test_walk_forward_can_reuse_precomputed_config_returns(monkeypatch):
     assert oos.index.tolist() == [months[-1]]
 
 
+def test_grid_eval_active_sharpe_skips_factor_attribution(monkeypatch):
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    prices = pd.DataFrame({"A": [0.0, 0.0, 0.0]}, index=months)
+    benchmark = pd.Series([0.0, 0.01, 0.0], index=months, name="SPY")
+    base = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="level"),
+    )
+
+    def fake_run_backtest(*args, **kwargs):
+        return pd.Series([0.01, 0.02, 0.03], index=months)
+
+    def fail_attribution(*args, **kwargs):
+        raise AssertionError("active_sharpe grid should not run factor attribution")
+
+    monkeypatch.setattr(sw, "run_backtest", fake_run_backtest)
+    monkeypatch.setattr(sw, "attribution", fail_attribution)
+
+    grid = sw.grid_eval(
+        pd.DataFrame(),
+        prices,
+        pd.DataFrame(index=months),
+        base,
+        {("portfolio", "idea_signal"): ["level"]},
+        benchmark=benchmark,
+        metric="active_sharpe",
+        chars=pd.DataFrame(),
+        visible_versions_cache={},
+        use_selection_cache=False,
+    )
+
+    assert len(grid) == 1
+    assert np.isfinite(grid.loc[0, "active_sharpe"])
+    assert grid.loc[0, "ir"] == grid.loc[0, "active_sharpe"]
+    assert pd.isna(grid.loc[0, "ann_alpha"])
+    assert pd.isna(grid.loc[0, "alpha_t"])
+
+
+def test_grid_eval_factor_metric_runs_attribution(monkeypatch):
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    prices = pd.DataFrame({"A": [0.0, 0.0, 0.0]}, index=months)
+    base = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="level"),
+    )
+    calls = {"attribution": 0}
+
+    def fake_run_backtest(*args, **kwargs):
+        return pd.Series([0.01, 0.02, 0.03], index=months)
+
+    def fake_attribution(*args, **kwargs):
+        calls["attribution"] += 1
+        return {"sharpe": 1.23, "ann_alpha": 0.04, "alpha_t": 2.0, "ir_vs_benchmark": 0.5}
+
+    monkeypatch.setattr(sw, "run_backtest", fake_run_backtest)
+    monkeypatch.setattr(sw, "attribution", fake_attribution)
+
+    grid = sw.grid_eval(
+        pd.DataFrame(),
+        prices,
+        pd.DataFrame(index=months),
+        base,
+        {("portfolio", "idea_signal"): ["level"]},
+        metric="sharpe",
+        chars=pd.DataFrame(),
+        visible_versions_cache={},
+        use_selection_cache=False,
+    )
+
+    assert calls["attribution"] == 1
+    assert grid.loc[0, "sharpe"] == 1.23
+    assert grid.loc[0, "ann_alpha"] == 0.04
+
+
+def test_marginal_ir_uses_active_ir_without_factor_attribution(monkeypatch):
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    prices = pd.DataFrame({"A": [0.0, 0.0, 0.0]}, index=months)
+    benchmark = pd.Series([0.0, 0.01, 0.0], index=months, name="SPY")
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="level"),
+    )
+
+    def fake_run_backtest(*args, **kwargs):
+        return pd.Series([0.01, 0.02, 0.03], index=months)
+
+    def fail_attribution(*args, **kwargs):
+        raise AssertionError("marginal_ir should not run factor attribution")
+
+    monkeypatch.setattr(en, "run_backtest", fake_run_backtest)
+    monkeypatch.setattr(en, "attribution", fail_attribution)
+
+    out = en.marginal_ir(
+        pd.DataFrame(),
+        prices,
+        pd.DataFrame(index=months),
+        cfg,
+        benchmark=benchmark,
+        chars=pd.DataFrame(),
+        visible_versions_cache={},
+    )
+
+    expected = en._active_ir_metric(pd.Series([0.01, 0.02, 0.03], index=months), benchmark)
+    assert out["filter"].tolist() == ["(full stack)"]
+    assert out.loc[0, "metric"] == expected
+
+
+def test_selection_cache_backtest_matches_direct_run():
+    months = pd.date_range("2020-01-31", periods=6, freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-04-15"),
+                "accession_number": "a2",
+                "submission_type": "13F-HR",
+                "ticker": "B",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+        ]
+    )
+    prices = pd.DataFrame(
+        {
+            "A": [0.01, 0.01, 0.01, 0.01, 0.01, 0.01],
+            "B": [0.02, 0.02, 0.02, 0.02, 0.02, 0.02],
+        },
+        index=months,
+    )
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(
+            idea_signal="level",
+            min_consensus_funds=1,
+            max_name_weight=1.0,
+            holding_horizon_q=0,
+        ),
+    )
+    chars = en.manager_characteristics(holdings)
+    visible_cache = en.build_visible_versions_cache(chars, prices.index)
+
+    direct = run_backtest(holdings, prices, cfg, chars=chars, visible_versions_cache=visible_cache)
+    selected = en.build_rebalance_selection_cache(
+        holdings,
+        prices,
+        cfg,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+    )
+    cached = en.run_backtest_from_selection_cache(prices, cfg, selected)
+
+    pd.testing.assert_series_equal(cached, direct)
+
+
 def test_holding_horizon_is_measured_in_quarters_not_rebalance_events():
     rows = [
         ("m1", "2019-12-31", "2020-01-15", "a1", "A"),

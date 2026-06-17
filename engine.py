@@ -699,6 +699,108 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
     return net
 
 
+def build_rebalance_selection_cache(
+    holdings,
+    prices,
+    cfg: BacktestConfig,
+    value_scores=None,
+    benchmark_weights=None,
+    chars=None,
+    visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
+) -> dict[pd.Timestamp, pd.DataFrame]:
+    """Precompute PIT universe selections for each rebalance month.
+
+    This is useful for parameter sweeps where many portfolio rules share the
+    same universe rule. It deliberately caches only the selected filing versions,
+    not the final portfolio target, so portfolio parameters are still evaluated
+    independently.
+    """
+    if chars is None:
+        chars = manager_characteristics(holdings, benchmark_weights)
+    selected_by_month: dict[pd.Timestamp, pd.DataFrame] = {}
+    for m in _rebalance_months(holdings, prices):
+        month = pd.Timestamp(m)
+        latest_versions = visible_versions_cache.get(month) if visible_versions_cache is not None else None
+        if latest_versions is None:
+            latest_versions = _visible_manager_versions(chars, month)
+        selected_by_month[month] = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+    return selected_by_month
+
+
+def build_active_benchmark_weights_cache(
+    holdings,
+    prices,
+    benchmark_weights=None,
+    chars=None,
+    visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
+) -> dict[pd.Timestamp, pd.Series]:
+    """Precompute PIT aggregate 13F book weights used by active_weight ideas."""
+    if chars is None:
+        chars = manager_characteristics(holdings, benchmark_weights)
+    active_by_month: dict[pd.Timestamp, pd.Series] = {}
+    for m in _rebalance_months(holdings, prices):
+        month = pd.Timestamp(m)
+        latest_versions = visible_versions_cache.get(month) if visible_versions_cache is not None else None
+        if latest_versions is None:
+            latest_versions = _visible_manager_versions(chars, month)
+        active_by_month[month] = _aggregate_book_weights(latest_versions["bw"]) if not latest_versions.empty else pd.Series(dtype=float)
+    return active_by_month
+
+
+def run_backtest_from_selection_cache(
+    prices,
+    cfg: BacktestConfig,
+    selected_versions_by_month: dict[pd.Timestamp, pd.DataFrame],
+    active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None,
+    security_groups=None,
+    progress_label: str | None = None,
+    progress_every: int = 10,
+) -> pd.Series:
+    """Run the monthly portfolio simulation from precomputed PIT selections."""
+    months = prices.index.sort_values()
+    rebal_months = {pd.Timestamp(m) for m in selected_versions_by_month}
+    total_rebalances = len(rebal_months)
+
+    cur = pd.Series(dtype=float)
+    last_in_tgt: dict[str, pd.Timestamp] = {}
+    net = pd.Series(0.0, index=months)
+    rebal_no = 0
+    t0 = time.perf_counter()
+
+    for m in months:
+        cur, net.loc[m] = _apply_monthly_returns(cur, prices, m, cfg)
+        month = pd.Timestamp(m)
+        if month in rebal_months:
+            rebal_no += 1
+            selected_versions = selected_versions_by_month.get(month, pd.DataFrame())
+            active_benchmark_weights = None
+            if cfg.portfolio.idea_signal == "active_weight":
+                if active_benchmark_weights_by_month is not None:
+                    active_benchmark_weights = active_benchmark_weights_by_month.get(month)
+                if active_benchmark_weights is None and not selected_versions.empty:
+                    active_benchmark_weights = _aggregate_book_weights(selected_versions["bw"])
+            tgt = target_weights_from_versions(selected_versions, cfg.portfolio, active_benchmark_weights)
+            target_names_before_price_filter = len(tgt)
+            priced_now = prices.columns[prices.loc[m].notna()]
+            tgt = tgt[tgt.index.isin(priced_now)]
+            if tgt.sum() > 0:
+                eff, traded, _ = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
+                net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
+                cur = eff
+            if progress_label and (
+                rebal_no == 1
+                or rebal_no == total_rebalances
+                or (progress_every > 0 and rebal_no % progress_every == 0)
+            ):
+                print(
+                    f"      {progress_label}: rebalance {rebal_no}/{total_rebalances} "
+                    f"{m.date()} selected={len(selected_versions)} "
+                    f"target={target_names_before_price_filter}->{len(tgt)} "
+                    f"held={len(cur)} elapsed={time.perf_counter() - t0:.1f}s"
+                )
+    return net
+
+
 # --------------------------------------------------------------------------- #
 def attribution(port_ret, factors, benchmark=None,
                 factor_cols=("MKT", "SMB", "HML", "RMW", "CMA", "MOM")) -> dict:
@@ -760,29 +862,35 @@ def _fmt_metric(value) -> str:
     return f"{value:.4g}" if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else str(value)
 
 
+def _active_ir_metric(port_ret: pd.Series, benchmark: pd.Series | None = None) -> float:
+    if benchmark is None:
+        r = port_ret.replace([np.inf, -np.inf], np.nan).dropna()
+    else:
+        active = pd.concat([port_ret.rename("ret"), benchmark.reindex(port_ret.index).rename("bench")], axis=1)
+        active = active.replace([np.inf, -np.inf], np.nan).dropna()
+        r = active["ret"] - active["bench"]
+    return float((r.mean() / r.std()) * np.sqrt(12)) if r.std() else np.nan
+
+
 def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=None, benchmark_weights=None,
                 chars=None, visible_versions_cache=None, security_groups=None, verbose: bool = False):
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
-    visible_cache = visible_versions_cache or build_visible_versions_cache(ch, prices.index)
+    visible_cache = visible_versions_cache if visible_versions_cache is not None else build_visible_versions_cache(ch, prices.index)
     if verbose:
         print("  marginal-ir 1/? running full stack")
         t0 = time.perf_counter()
-    base = attribution(
-        run_backtest(
-            holdings,
-            prices,
-            cfg,
-            value_scores,
-            benchmark_weights,
-            ch,
-            visible_cache,
-            security_groups,
-            progress_label="marginal-ir full stack" if verbose else None,
-        ),
-        factors,
-        benchmark,
+    base_ret = run_backtest(
+        holdings,
+        prices,
+        cfg,
+        value_scores,
+        benchmark_weights,
+        ch,
+        visible_cache,
+        security_groups,
+        progress_label="marginal-ir full stack" if verbose else None,
     )
-    bm = base.get("ir_vs_benchmark", base.get("sharpe"))
+    bm = _active_ir_metric(base_ret, benchmark)
     rows = [dict(filter="(full stack)", metric=bm, delta=0.0)]
     if verbose:
         print(f"    done full stack in {time.perf_counter() - t0:.1f}s metric={_fmt_metric(bm)}")
@@ -802,22 +910,18 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
         if not getattr(cfg.universe, t):
             continue
         cfg2 = replace(cfg, universe=replace(cfg.universe, **{t: False}))
-        att = attribution(
-            run_backtest(
-                holdings,
-                prices,
-                cfg2,
-                value_scores,
-                benchmark_weights,
-                ch,
-                visible_cache,
-                security_groups,
-                progress_label=f"marginal-ir -{t}" if verbose else None,
-            ),
-            factors,
-            benchmark,
+        ret = run_backtest(
+            holdings,
+            prices,
+            cfg2,
+            value_scores,
+            benchmark_weights,
+            ch,
+            visible_cache,
+            security_groups,
+            progress_label=f"marginal-ir -{t}" if verbose else None,
         )
-        m = att.get("ir_vs_benchmark", att.get("sharpe"))
+        m = _active_ir_metric(ret, benchmark)
         if verbose:
             print(f"    done -{t} in {time.perf_counter() - t0:.1f}s metric={_fmt_metric(m)}")
         rows.append(dict(filter=f"-{t}", metric=m, delta=(bm - m)))
