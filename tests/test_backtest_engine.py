@@ -34,7 +34,7 @@ from engine import (
     run_backtest,
     target_weights_from_versions,
 )
-from run_example import _rebalance_summary_stats, load_security_groups
+from run_example import _rebalance_summary_stats, load_security_groups, value_unit_continuity_diagnostics
 from sweep import deflated_sharpe
 
 
@@ -301,6 +301,33 @@ def test_active_weight_change_requires_positive_current_overweight():
 
     assert target.index.tolist() == ["A"]
     assert target.loc["A"] == pytest.approx(1.0)
+
+
+def test_active_weight_change_scores_current_overweight_not_weight_product():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.31, "B": 0.30, "C": 0.39}),
+                "prev_bw": pd.Series({"A": 0.30, "B": 0.01, "C": 0.69}),
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.20, "C": 0.70})
+    cfg = PortfolioConfig(
+        idea_signal="active_weight_change",
+        top_n_ideas=1,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark)
+
+    assert target.index.tolist() == ["A"]
 
 
 def test_active_weight_initiation_uses_new_positive_overweights_only():
@@ -674,6 +701,124 @@ def test_selection_cache_backtest_matches_direct_run():
     pd.testing.assert_series_equal(cached, direct)
 
 
+def test_active_selection_cache_requires_explicit_active_benchmark():
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 60.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "B",
+                "value": 40.0,
+                "sec_type": "SH",
+            },
+        ]
+    )
+    prices = pd.DataFrame({"A": [0.01, 0.02, 0.03], "B": [0.0, 0.0, 0.0]}, index=months)
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(
+            idea_signal="active_weight",
+            min_consensus_funds=1,
+            max_name_weight=1.0,
+            min_active_weight_holdings=1,
+        ),
+    )
+    chars = en.manager_characteristics(holdings)
+    visible_cache = en.build_visible_versions_cache(chars, prices.index)
+    selected = en.build_rebalance_selection_cache(
+        holdings,
+        prices,
+        cfg,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+    )
+
+    with pytest.raises(ValueError, match="requires PIT active_benchmark_weights"):
+        en.run_backtest_from_selection_cache(prices, cfg, selected)
+
+
+def test_active_selection_cache_backtest_matches_direct_run_with_same_benchmark():
+    months = pd.date_range("2020-01-31", periods=4, freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": manager,
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": manager,
+                "submission_type": "13F-HR",
+                "ticker": ticker,
+                "value": value,
+                "sec_type": "SH",
+            }
+            for manager, ticker, value in [
+                ("m1", "A", 70.0),
+                ("m1", "B", 30.0),
+                ("m2", "A", 20.0),
+                ("m2", "B", 80.0),
+            ]
+        ]
+    )
+    prices = pd.DataFrame({"A": [0.01, 0.02, 0.03, 0.04], "B": [0.0, 0.0, 0.0, 0.0]}, index=months)
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(
+            idea_signal="active_weight",
+            min_consensus_funds=1,
+            max_name_weight=1.0,
+            min_active_weight_holdings=1,
+        ),
+    )
+    chars = en.manager_characteristics(holdings)
+    visible_cache = en.build_visible_versions_cache(chars, prices.index)
+    selected = en.build_rebalance_selection_cache(
+        holdings,
+        prices,
+        cfg,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+    )
+    active_cache = en.build_active_benchmark_weights_cache(
+        holdings,
+        prices,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+    )
+
+    direct = run_backtest(holdings, prices, cfg, chars=chars, visible_versions_cache=visible_cache)
+    cached = en.run_backtest_from_selection_cache(prices, cfg, selected, active_cache)
+
+    pd.testing.assert_series_equal(cached, direct)
+
+
 def test_holding_horizon_is_measured_in_quarters_not_rebalance_events():
     rows = [
         ("m1", "2019-12-31", "2020-01-15", "a1", "A"),
@@ -719,6 +864,50 @@ def test_holding_horizon_is_measured_in_quarters_not_rebalance_events():
 
     assert "A" in july_holdings["ticker"].tolist()
     assert bool(july_holdings.loc[july_holdings["ticker"].eq("A"), "is_carried"].iat[0]) is True
+
+
+def test_min_portfolio_names_marks_rebalance_invalid_and_moves_to_cash():
+    months = pd.date_range("2020-01-31", periods=3, freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "a1",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 100.0,
+                "sec_type": "SH",
+            }
+        ]
+    )
+    prices = pd.DataFrame({"A": [0.10, 0.10, 0.10]}, index=months)
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(
+            top_n_ideas=1,
+            min_consensus_funds=1,
+            min_portfolio_names=2,
+            max_name_weight=1.0,
+        ),
+    )
+
+    ret = run_backtest(holdings, prices, cfg, capture_rebalance=True)
+    trace = rebalance_trace(holdings, prices, cfg)
+
+    assert ret.eq(0.0).all()
+    assert bool(ret.attrs["rebalance_summary"].loc[0, "valid_rebalance"]) is False
+    assert "target_names_below_min_portfolio_names" in ret.attrs["rebalance_summary"].loc[0, "note"]
+    assert trace["summary"].loc[0, "effective_names"] == 0
+    assert trace["holdings"].empty
 
 
 def test_rebalance_trace_reports_auditable_rebalance_fields():
@@ -927,6 +1116,33 @@ def test_rebalance_summary_stats_reports_portfolio_and_turnover_summary():
     assert stats["issuer_cap_feasible_ratio"] == pytest.approx(0.5)
     assert stats["last_rebalance_month"] == "2020-02-29"
     assert stats["last_top_holdings"] == "B:8.00%"
+
+
+def test_value_unit_continuity_diagnostics_flags_large_cutoff_jump():
+    chars = pd.DataFrame(
+        [
+            {
+                "manager": "BERKSHIRE",
+                "period_date": pd.Timestamp("2022-09-30"),
+                "filing_date": pd.Timestamp("2022-11-14"),
+                "accession_number": "a1",
+                "aum": 100.0,
+            },
+            {
+                "manager": "BERKSHIRE",
+                "period_date": pd.Timestamp("2022-12-31"),
+                "filing_date": pd.Timestamp("2023-02-14"),
+                "accession_number": "a2",
+                "aum": 100000.0,
+            },
+        ]
+    )
+
+    out = value_unit_continuity_diagnostics(chars)
+
+    assert len(out) == 1
+    assert out.loc[0, "manager"] == "BERKSHIRE"
+    assert bool(out.loc[0, "suspicious_unit_jump"]) is True
 
 
 def test_mapping_diagnostics_reports_unmapped_value():
@@ -1426,7 +1642,13 @@ def test_interactive_results_writes_self_contained_html(tmp_path):
                 "top_n_ideas": 3,
                 "min_consensus_funds": 2,
                 "holding_horizon_q": 0,
+                "min_portfolio_names": 10,
                 "max_portfolio_names": 25,
+                "valid_config": True,
+                "invested_month_frac": 0.95,
+                "avg_effective_names": 24.0,
+                "avg_max_weight": 0.05,
+                "name_cap_feasible_ratio": 1.0,
                 "ann_return": 0.12,
                 "ann_vol": 0.20,
                 "max_drawdown": -0.05,
@@ -1445,3 +1667,6 @@ def test_interactive_results_writes_self_contained_html(tmp_path):
     assert "13F Parameter Sweep Results" in text
     assert "active_weight" in text
     assert "growth" in text
+    assert "splitter" in text
+    assert "valid_config" in text
+    assert "invested_month_frac" in text

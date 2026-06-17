@@ -50,11 +50,12 @@ class PortfolioConfig:
     idea_signal: str = "level"              # "level" | "change" | "initiation" | active-weight variants
     consensus_weight: bool = True
     min_consensus_funds: int = 1            # drop names held by < this many in-universe funds
+    min_portfolio_names: int = 0            # mark a rebalance invalid/cash if fewer target names survive
     max_portfolio_names: int | None = None  # cap final aggregate target before weight caps
     max_name_weight: float = 0.05
     max_issuer_weight: float = 0.075
     holding_horizon_q: int = 0              # 0 = full rebalance; N = carry N extra quarters
-    min_active_weight_holdings: int = 20    # active_weight needs a diversified book to be meaningful
+    min_active_weight_holdings: int = 10    # active_weight needs enough book breadth to be meaningful
 
 
 @dataclass
@@ -112,6 +113,24 @@ def _aggregate_book_weights(books) -> pd.Series:
 
 def _needs_active_benchmark_weights(idea_signal: str) -> bool:
     return idea_signal in {"active_weight", "active_weight_change", "active_weight_initiation"}
+
+
+def _require_active_benchmark_weights(
+    cfg: PortfolioConfig,
+    active_benchmark_weights: pd.Series | None,
+) -> pd.Series | None:
+    if not _needs_active_benchmark_weights(cfg.idea_signal):
+        return None
+    if active_benchmark_weights is None or len(active_benchmark_weights) == 0:
+        raise ValueError(
+            f"{cfg.idea_signal} requires PIT active_benchmark_weights; "
+            "do not fall back to selected-manager aggregate weights."
+        )
+    bench = pd.Series(active_benchmark_weights, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    bench = bench[bench > 0]
+    if bench.empty or bench.sum() <= 0:
+        raise ValueError(f"{cfg.idea_signal} requires positive PIT active_benchmark_weights")
+    return bench / bench.sum()
 
 
 def _versioned_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
@@ -347,11 +366,9 @@ def _idea_scores(
         new = cur.index.difference(prev.index) if prev is not None else cur.index
         s = cur.reindex(new).fillna(0.0)
     elif _needs_active_benchmark_weights(cfg.idea_signal):
-        if active_benchmark_weights is None or len(active_benchmark_weights) == 0:
-            return pd.Series(dtype=float)
+        bench = _require_active_benchmark_weights(cfg, active_benchmark_weights)
         if int((cur > 0).sum()) < cfg.min_active_weight_holdings:
             return pd.Series(dtype=float)
-        bench = active_benchmark_weights / active_benchmark_weights.sum()
         active_cur = (cur - bench.reindex(cur.index).fillna(0.0)).clip(lower=0)
         if cfg.idea_signal == "active_weight":
             s = active_cur
@@ -361,7 +378,7 @@ def _idea_scores(
             else:
                 alln = cur.index.union(prev.index)
                 inc = (cur.reindex(alln).fillna(0.0) - prev.reindex(alln).fillna(0.0)).clip(lower=0)
-                s = inc.reindex(cur.index).fillna(0.0) * active_cur.reindex(cur.index).fillna(0.0)
+                s = active_cur[(inc.reindex(cur.index).fillna(0.0) > 0) & (active_cur > 0)]
         elif cfg.idea_signal == "active_weight_initiation":
             new = cur.index.difference(prev.index) if prev is not None else cur.index
             s = active_cur.reindex(new).fillna(0.0)
@@ -374,31 +391,50 @@ def target_weights_from_versions(
     latest_versions: pd.DataFrame,
     cfg: PortfolioConfig,
     active_benchmark_weights: pd.Series | None = None,
+    return_diagnostics: bool = False,
 ) -> pd.Series:
+    diagnostics = {
+        "selected_managers": int(len(latest_versions)),
+        "active_eligible_managers": 0,
+        "zero_contributor_managers": 0,
+        "raw_idea_rows": 0,
+        "raw_idea_names": 0,
+        "consensus_idea_names": 0,
+        "target_names_before_caps": 0,
+    }
     if latest_versions.empty:
-        return pd.Series(dtype=float)
-    if _needs_active_benchmark_weights(cfg.idea_signal) and active_benchmark_weights is None:
-        active_benchmark_weights = _aggregate_book_weights(latest_versions["bw"])
+        empty = pd.Series(dtype=float)
+        return (empty, diagnostics) if return_diagnostics else empty
+    active_benchmark_weights = _require_active_benchmark_weights(cfg, active_benchmark_weights)
     score: dict[str, float] = {}
     count: dict[str, int] = {}
     for cur_row in latest_versions.itertuples(index=False):
         cur = getattr(cur_row, "bw")
         prev = getattr(cur_row, "prev_bw", None)
+        if _needs_active_benchmark_weights(cfg.idea_signal) and int((cur > 0).sum()) >= cfg.min_active_weight_holdings:
+            diagnostics["active_eligible_managers"] += 1
         picks = _idea_scores(cur, prev, cfg, active_benchmark_weights)
+        if picks.empty:
+            diagnostics["zero_contributor_managers"] += 1
+        diagnostics["raw_idea_rows"] += int(len(picks))
         for tkr, wt in picks.items():
             score[tkr] = score.get(tkr, 0.0) + (float(wt) if cfg.consensus_weight else 1.0)
             count[tkr] = count.get(tkr, 0) + 1
+    diagnostics["raw_idea_names"] = int(len(score))
     s = pd.Series(score)
     if s.empty:
-        return s
+        return (s, diagnostics) if return_diagnostics else s
     if cfg.min_consensus_funds > 1:
         keep = pd.Series(count).ge(cfg.min_consensus_funds)
         s = s[keep.reindex(s.index).fillna(False)]
+    diagnostics["consensus_idea_names"] = int(len(s))
     if s.empty:
-        return s
+        return (s, diagnostics) if return_diagnostics else s
     if cfg.max_portfolio_names is not None and cfg.max_portfolio_names > 0:
         s = s.sort_values(ascending=False).head(cfg.max_portfolio_names)
-    return _cap_weights(s, cfg.max_name_weight)
+    diagnostics["target_names_before_caps"] = int(len(s))
+    target = _cap_weights(s, cfg.max_name_weight)
+    return (target, diagnostics) if return_diagnostics else target
 
 
 def target_weights(chars, managers, asof, cfg: PortfolioConfig) -> pd.Series:
@@ -526,6 +562,33 @@ def _trade_summary_stats(before: pd.Series, after: pd.Series) -> dict[str, int]:
     }
 
 
+def _minimum_target_failure(tgt: pd.Series, cfg: BacktestConfig) -> str:
+    min_names = int(cfg.portfolio.min_portfolio_names or 0)
+    if tgt.sum() <= 0:
+        return "no positive target weights"
+    if min_names > 0 and len(tgt) < min_names:
+        return f"target_names_below_min_portfolio_names({len(tgt)}<{min_names})"
+    return ""
+
+
+def _invalid_cash_rebalance(
+    cur: pd.Series,
+    cfg: BacktestConfig,
+    security_groups=None,
+) -> tuple[pd.Series, float, dict[str, float], dict[str, float | str], dict[str, bool], dict[str, int]]:
+    eff = pd.Series(dtype=float)
+    alln = cur.index.union(eff.index)
+    traded = float(0.5 * (eff.reindex(alln).fillna(0.0) - cur.reindex(alln).fillna(0.0)).abs().sum())
+    return (
+        eff,
+        traded,
+        _portfolio_summary_stats(eff),
+        _issuer_exposure_summary(eff, security_groups),
+        _constraint_feasibility(eff, cfg, security_groups),
+        _trade_summary_stats(cur, eff),
+    )
+
+
 def _apply_monthly_returns(cur: pd.Series,
                            prices: pd.DataFrame,
                            month: pd.Timestamp,
@@ -590,34 +653,48 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         for manager in selected_managers:
             manager_rows.append({"rebalance_month": m.date().isoformat(), "manager": manager})
 
-        tgt = target_weights_from_versions(selected_versions, cfg.portfolio, active_benchmark_weights)
+        tgt, idea_diag = target_weights_from_versions(
+            selected_versions,
+            cfg.portfolio,
+            active_benchmark_weights,
+            return_diagnostics=True,
+        )
         target_names_before_price_filter = int(len(tgt))
         priced_now = prices.columns[prices.loc[m].notna()]
         tgt = tgt[tgt.index.isin(priced_now)]
-        if tgt.sum() <= 0:
-            portfolio_stats = _portfolio_summary_stats(cur)
-            issuer_stats = _issuer_exposure_summary(cur, security_groups)
-            feasibility = _constraint_feasibility(cur, cfg, security_groups)
+        invalid_reason = _minimum_target_failure(tgt, cfg)
+        if invalid_reason:
+            eff, traded, portfolio_stats, issuer_stats, feasibility, trade_stats = _invalid_cash_rebalance(
+                cur,
+                cfg,
+                security_groups,
+            )
+            cost_bps = traded * cfg.cost.bps_per_side
             summary_rows.append({
                 "rebalance_month": m.date().isoformat(),
                 "selected_managers": int(len(selected_versions)),
+                "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
+                "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
+                "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
+                "raw_idea_names": int(idea_diag["raw_idea_names"]),
+                "consensus_idea_names": int(idea_diag["consensus_idea_names"]),
                 "target_names": int(len(tgt)),
                 "target_names_before_price_filter": target_names_before_price_filter,
-                "effective_names": int(len(cur)),
+                "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
+                "effective_names": int(len(eff)),
                 "carried_names": 0,
-                "turnover_one_way": 0.0,
-                "cost_bps": 0.0,
+                "valid_rebalance": False,
+                "turnover_one_way": float(traded),
+                "cost_bps": float(cost_bps),
                 **portfolio_stats,
                 **issuer_stats,
                 **feasibility,
-                "traded_names": 0,
-                "buy_names": 0,
-                "sell_names": 0,
-                "increased_names": 0,
-                "decreased_names": 0,
+                **trade_stats,
                 "top_holdings": "",
-                "note": "no positive target weights",
+                "note": invalid_reason,
             })
+            cur = eff
+            last_in_tgt.clear()
             continue
 
         eff, traded, carried = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
@@ -630,10 +707,17 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         summary_rows.append({
             "rebalance_month": m.date().isoformat(),
             "selected_managers": int(len(selected_versions)),
+            "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
+            "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
+            "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
+            "raw_idea_names": int(idea_diag["raw_idea_names"]),
+            "consensus_idea_names": int(idea_diag["consensus_idea_names"]),
             "target_names": int(len(tgt)),
             "target_names_before_price_filter": target_names_before_price_filter,
+            "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
             "effective_names": int(len(eff)),
             "carried_names": int(len(carried)),
+            "valid_rebalance": True,
             "turnover_one_way": float(traded),
             "cost_bps": float(cost_bps),
             **portfolio_stats,
@@ -669,7 +753,8 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                  visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
                  security_groups=None,
                  progress_label: str | None = None,
-                 progress_every: int = 10) -> pd.Series:
+                 progress_every: int = 10,
+                 capture_rebalance: bool = False) -> pd.Series:
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
     months = prices.index.sort_values()
@@ -682,6 +767,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
     net = pd.Series(0.0, index=months)
     rebal_no = 0
     t0 = time.perf_counter()
+    summary_rows: list[dict] = []
 
     for m in months:
         cur, net.loc[m] = _apply_monthly_returns(cur, prices, m, cfg)
@@ -696,14 +782,54 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 else None
             )
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
-            tgt = target_weights_from_versions(selected_versions, cfg.portfolio, active_benchmark_weights)
+            tgt, idea_diag = target_weights_from_versions(
+                selected_versions,
+                cfg.portfolio,
+                active_benchmark_weights,
+                return_diagnostics=True,
+            )
             target_names_before_price_filter = len(tgt)
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
-            if tgt.sum() > 0:
+            invalid_reason = _minimum_target_failure(tgt, cfg)
+            if invalid_reason:
+                eff, traded, portfolio_stats, issuer_stats, feasibility, trade_stats = _invalid_cash_rebalance(
+                    cur,
+                    cfg,
+                    security_groups,
+                )
+                net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
+                cur = eff
+                last_in_tgt.clear()
+            else:
+                before_rebalance = cur.copy()
                 eff, traded, _ = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
                 net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
                 cur = eff
+                portfolio_stats = _portfolio_summary_stats(eff)
+                issuer_stats = _issuer_exposure_summary(eff, security_groups)
+                feasibility = _constraint_feasibility(eff, cfg, security_groups)
+                trade_stats = _trade_summary_stats(before_rebalance, eff)
+            if capture_rebalance:
+                summary_rows.append({
+                    "rebalance_month": m.date().isoformat(),
+                    "selected_managers": int(len(selected_versions)),
+                    "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
+                    "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
+                    "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
+                    "raw_idea_names": int(idea_diag["raw_idea_names"]),
+                    "consensus_idea_names": int(idea_diag["consensus_idea_names"]),
+                    "target_names": int(len(tgt)),
+                    "target_names_before_price_filter": int(target_names_before_price_filter),
+                    "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
+                    "effective_names": int(len(cur)),
+                    "valid_rebalance": not bool(invalid_reason),
+                    **portfolio_stats,
+                    **issuer_stats,
+                    **feasibility,
+                    **trade_stats,
+                    "note": invalid_reason,
+                })
             if progress_label and (
                 rebal_no == 1
                 or rebal_no == total_rebalances
@@ -715,6 +841,8 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                     f"target={target_names_before_price_filter}->{len(tgt)} "
                     f"held={len(cur)} elapsed={time.perf_counter() - t0:.1f}s"
                 )
+    if capture_rebalance:
+        net.attrs["rebalance_summary"] = pd.DataFrame(summary_rows)
     return net
 
 
@@ -774,6 +902,7 @@ def run_backtest_from_selection_cache(
     security_groups=None,
     progress_label: str | None = None,
     progress_every: int = 10,
+    capture_rebalance: bool = False,
 ) -> pd.Series:
     """Run the monthly portfolio simulation from precomputed PIT selections."""
     months = prices.index.sort_values()
@@ -785,6 +914,7 @@ def run_backtest_from_selection_cache(
     net = pd.Series(0.0, index=months)
     rebal_no = 0
     t0 = time.perf_counter()
+    summary_rows: list[dict] = []
 
     for m in months:
         cur, net.loc[m] = _apply_monthly_returns(cur, prices, m, cfg)
@@ -796,16 +926,54 @@ def run_backtest_from_selection_cache(
             if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
                 if active_benchmark_weights_by_month is not None:
                     active_benchmark_weights = active_benchmark_weights_by_month.get(month)
-                if active_benchmark_weights is None and not selected_versions.empty:
-                    active_benchmark_weights = _aggregate_book_weights(selected_versions["bw"])
-            tgt = target_weights_from_versions(selected_versions, cfg.portfolio, active_benchmark_weights)
+            tgt, idea_diag = target_weights_from_versions(
+                selected_versions,
+                cfg.portfolio,
+                active_benchmark_weights,
+                return_diagnostics=True,
+            )
             target_names_before_price_filter = len(tgt)
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
-            if tgt.sum() > 0:
+            invalid_reason = _minimum_target_failure(tgt, cfg)
+            if invalid_reason:
+                eff, traded, portfolio_stats, issuer_stats, feasibility, trade_stats = _invalid_cash_rebalance(
+                    cur,
+                    cfg,
+                    security_groups,
+                )
+                net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
+                cur = eff
+                last_in_tgt.clear()
+            else:
+                before_rebalance = cur.copy()
                 eff, traded, _ = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
                 net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
                 cur = eff
+                portfolio_stats = _portfolio_summary_stats(eff)
+                issuer_stats = _issuer_exposure_summary(eff, security_groups)
+                feasibility = _constraint_feasibility(eff, cfg, security_groups)
+                trade_stats = _trade_summary_stats(before_rebalance, eff)
+            if capture_rebalance:
+                summary_rows.append({
+                    "rebalance_month": m.date().isoformat(),
+                    "selected_managers": int(len(selected_versions)),
+                    "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
+                    "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
+                    "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
+                    "raw_idea_names": int(idea_diag["raw_idea_names"]),
+                    "consensus_idea_names": int(idea_diag["consensus_idea_names"]),
+                    "target_names": int(len(tgt)),
+                    "target_names_before_price_filter": int(target_names_before_price_filter),
+                    "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
+                    "effective_names": int(len(cur)),
+                    "valid_rebalance": not bool(invalid_reason),
+                    **portfolio_stats,
+                    **issuer_stats,
+                    **feasibility,
+                    **trade_stats,
+                    "note": invalid_reason,
+                })
             if progress_label and (
                 rebal_no == 1
                 or rebal_no == total_rebalances
@@ -817,6 +985,8 @@ def run_backtest_from_selection_cache(
                     f"target={target_names_before_price_filter}->{len(tgt)} "
                     f"held={len(cur)} elapsed={time.perf_counter() - t0:.1f}s"
                 )
+    if capture_rebalance:
+        net.attrs["rebalance_summary"] = pd.DataFrame(summary_rows)
     return net
 
 

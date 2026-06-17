@@ -98,6 +98,12 @@ def _fmt_metric(value) -> str:
     return f"{value:.4g}" if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else str(value)
 
 
+def _without_attrs(series: pd.Series) -> pd.Series:
+    out = series.copy()
+    out.attrs = {}
+    return out
+
+
 def _basic_sharpe(returns: pd.Series) -> float:
     r = returns.replace([np.inf, -np.inf], np.nan).dropna()
     return _periodic_sharpe(r) * math.sqrt(12)
@@ -125,6 +131,68 @@ def _return_metrics(returns: pd.Series) -> dict:
         "ann_return": float((1 + r).prod() ** (12 / len(r)) - 1),
         "ann_vol": float(r.std() * math.sqrt(12)),
         "max_drawdown": _max_drawdown(r),
+    }
+
+
+def _rebalance_validity_metrics(summary: pd.DataFrame, cfg: BacktestConfig) -> dict:
+    if summary is None or summary.empty:
+        return {
+            "valid_config": False,
+            "invested_month_frac": 0.0,
+            "valid_rebalance_frac": 0.0,
+            "invalid_rebalance_frac": 1.0,
+            "avg_effective_names": 0.0,
+            "avg_target_names": 0.0,
+            "avg_max_weight": 0.0,
+            "name_cap_feasible_ratio": 0.0,
+            "issuer_cap_feasible_ratio": 0.0,
+            "zero_contributor_manager_frac": np.nan,
+        }
+
+    def mean_col(col: str, default=np.nan) -> float:
+        if col not in summary:
+            return float(default)
+        s = pd.to_numeric(summary[col], errors="coerce").dropna()
+        return float(s.mean()) if not s.empty else float(default)
+
+    invested = pd.to_numeric(summary.get("effective_names", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0)
+    valid = summary.get("valid_rebalance", pd.Series(False, index=summary.index)).astype(bool)
+    name_cap = summary.get("name_cap_feasible", pd.Series(False, index=summary.index)).astype(bool)
+    issuer_cap = summary.get("issuer_cap_feasible", pd.Series(False, index=summary.index)).astype(bool)
+    selected = pd.to_numeric(summary.get("selected_managers", pd.Series(dtype=float)), errors="coerce")
+    zero = pd.to_numeric(summary.get("zero_contributor_managers", pd.Series(dtype=float)), errors="coerce")
+    selected_sum = float(selected.fillna(0).sum())
+    zero_frac = float(zero.fillna(0).sum() / selected_sum) if selected_sum > 0 else np.nan
+    invested_frac = float(invested.mean()) if len(invested) else 0.0
+    valid_frac = float(valid.mean()) if len(valid) else 0.0
+    name_cap_ratio = float(name_cap.mean()) if len(name_cap) else 0.0
+    issuer_cap_ratio = float(issuer_cap.mean()) if len(issuer_cap) else 0.0
+    min_names = int(cfg.portfolio.min_portfolio_names or 0)
+    avg_effective = mean_col("effective_names", 0.0)
+    valid_config = (
+        invested_frac >= 0.80
+        and valid_frac >= 0.80
+        and name_cap_ratio >= 0.80
+        and issuer_cap_ratio >= 0.80
+        and (min_names <= 0 or avg_effective >= min_names)
+    )
+    return {
+        "valid_config": bool(valid_config),
+        "invested_month_frac": invested_frac,
+        "valid_rebalance_frac": valid_frac,
+        "invalid_rebalance_frac": 1.0 - valid_frac,
+        "avg_selected_managers": mean_col("selected_managers", 0.0),
+        "avg_active_eligible_managers": mean_col("active_eligible_managers", 0.0),
+        "avg_zero_contributor_managers": mean_col("zero_contributor_managers", 0.0),
+        "zero_contributor_manager_frac": zero_frac,
+        "avg_raw_idea_names": mean_col("raw_idea_names", 0.0),
+        "avg_consensus_idea_names": mean_col("consensus_idea_names", 0.0),
+        "avg_effective_names": avg_effective,
+        "avg_target_names": mean_col("target_names", 0.0),
+        "avg_max_weight": mean_col("max_weight", 0.0),
+        "avg_max_issuer_weight": mean_col("max_issuer_weight", 0.0),
+        "name_cap_feasible_ratio": name_cap_ratio,
+        "issuer_cap_feasible_ratio": issuer_cap_ratio,
     }
 
 
@@ -178,12 +246,23 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
                 selection_caches[ukey],
                 active_benchmark_cache,
                 security_groups,
+                capture_rebalance=True,
             )
         else:
-            ret = run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups)
+            ret = run_backtest(
+                holdings,
+                prices,
+                cfg,
+                value_scores,
+                benchmark_weights,
+                ch,
+                visible_cache,
+                security_groups,
+                capture_rebalance=True,
+            )
         if include_returns:
-            returns_by_config[_label_key(label)] = ret
-            returns_by_config_id[_config_id(label)] = ret
+            returns_by_config[_label_key(label)] = _without_attrs(ret)
+            returns_by_config_id[_config_id(label)] = _without_attrs(ret)
         active_sharpe = _periodic_sharpe(active_return_stream(ret, benchmark)) * math.sqrt(12)
         return_metrics = _return_metrics(ret)
         if run_attribution:
@@ -210,6 +289,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
             **return_metrics,
             **row_metrics,
             "active_sharpe": active_sharpe,
+            **_rebalance_validity_metrics(ret.attrs.get("rebalance_summary"), cfg),
         })
     out = pd.DataFrame(rows)
     if include_returns:
@@ -250,7 +330,7 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                 print(f"    train config {i}/{n_trials} {label}")
                 t0 = time.perf_counter()
             if precomputed_returns is not None and _label_key(label) in precomputed_returns:
-                ret = precomputed_returns[_label_key(label)].reindex(tr)
+                ret = _without_attrs(precomputed_returns[_label_key(label)].reindex(tr))
             else:
                 ret = run_backtest(holdings, prices.loc[tr], cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups)
             sc = _periodic_sharpe(_score_series(ret, benchmark.reindex(tr) if benchmark is not None else None, select_on))
@@ -262,10 +342,11 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
             print(f"    selected {best_lbl} train_{select_on}={_fmt_metric(best_score)}; running test window")
             t0 = time.perf_counter()
         if precomputed_returns is not None and _label_key(best_lbl) in precomputed_returns:
-            te_ret = precomputed_returns[_label_key(best_lbl)].reindex(te)
+            te_ret = _without_attrs(precomputed_returns[_label_key(best_lbl)].reindex(te))
         else:
             te_ret = run_backtest(holdings, prices.loc[months[:start + train_m + test_m]],
                                   best, value_scores, benchmark_weights, ch, visible_cache, security_groups).reindex(te)
+            te_ret = _without_attrs(te_ret)
         if verbose:
             print(f"    done test fold {fold_no}/{n_folds} in {time.perf_counter() - t0:.1f}s")
         oos.append(te_ret)

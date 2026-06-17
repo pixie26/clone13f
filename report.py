@@ -241,11 +241,27 @@ def interactive_results(
     table_cols = [
         "config_id",
         "aum_band",
+        "use_concentration",
+        "use_low_turnover",
+        "use_value_tilt",
         "idea_signal",
         "top_n_ideas",
         "min_consensus_funds",
         "holding_horizon_q",
+        "min_portfolio_names",
         "max_portfolio_names",
+        "min_active_weight_holdings",
+        "valid_config",
+        "invested_month_frac",
+        "valid_rebalance_frac",
+        "invalid_rebalance_frac",
+        "avg_effective_names",
+        "avg_target_names",
+        "avg_max_weight",
+        "avg_max_issuer_weight",
+        "name_cap_feasible_ratio",
+        "issuer_cap_feasible_ratio",
+        "zero_contributor_manager_frac",
         "total_return",
         "ann_return",
         "ann_vol",
@@ -302,19 +318,39 @@ def interactive_results(
     header {{ padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }}
     h1 {{ margin: 0 0 6px; font-size: 20px; font-weight: 650; }}
     .sub {{ color: var(--muted); font-size: 13px; }}
-    main {{ display: grid; grid-template-columns: 380px 1fr; gap: 16px; padding: 16px 20px 24px; }}
+    main {{
+      display: grid;
+      grid-template-columns: minmax(300px, var(--left-panel-width, 420px)) 8px minmax(0, 1fr);
+      gap: 8px;
+      padding: 16px 20px 24px;
+      align-items: start;
+      overflow-x: auto;
+    }}
     aside, section {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }}
-    aside {{ padding: 14px; max-height: calc(100vh - 105px); overflow: auto; }}
+    aside {{ padding: 14px; max-height: calc(100vh - 105px); overflow: auto; min-width: 0; }}
     section {{ padding: 14px; min-width: 0; }}
+    #splitter {{
+      align-self: stretch;
+      min-height: calc(100vh - 105px);
+      border-radius: 8px;
+      cursor: col-resize;
+      background: linear-gradient(to right, transparent 0 2px, var(--line) 2px 6px, transparent 6px 8px);
+      opacity: 0.85;
+      touch-action: none;
+    }}
+    #splitter:hover, body.dragging-splitter #splitter {{ background: linear-gradient(to right, transparent 0 2px, var(--accent) 2px 6px, transparent 6px 8px); opacity: 1; }}
+    body.dragging-splitter {{ cursor: col-resize; user-select: none; }}
     .filters {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }}
     label {{ display: grid; gap: 4px; font-size: 12px; color: var(--muted); }}
     select {{ width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--ink); }}
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    #results {{ min-width: 1120px; }}
     th, td {{ padding: 7px 6px; border-bottom: 1px solid #eceef3; text-align: right; white-space: nowrap; }}
     th {{ position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; cursor: pointer; }}
     td:first-child, th:first-child {{ text-align: left; }}
     tr {{ cursor: pointer; }}
     tr.active {{ background: #eaf4ef; }}
+    tr.invalid {{ color: #8b3b34; background: #fff7f5; }}
     .summary {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; margin-bottom: 14px; }}
     .metric {{ border: 1px solid #eceef3; border-radius: 8px; padding: 10px; }}
     .metric span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }}
@@ -324,7 +360,11 @@ def interactive_results(
     .legend {{ display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin: 8px 0 0; }}
     .key {{ display: inline-flex; align-items: center; gap: 6px; }}
     .swatch {{ width: 18px; height: 3px; display: inline-block; }}
-    @media (max-width: 980px) {{ main {{ grid-template-columns: 1fr; }} aside {{ max-height: none; }} }}
+    @media (max-width: 760px) {{
+      main {{ grid-template-columns: 1fr; }}
+      #splitter {{ display: none; }}
+      aside {{ max-height: none; }}
+    }}
   </style>
 </head>
 <body>
@@ -337,6 +377,7 @@ def interactive_results(
       <div class="filters" id="filters"></div>
       <table id="results"></table>
     </aside>
+    <div id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize left and right panels" title="Drag to resize panels; double-click to reset"></div>
     <section>
       <div class="summary" id="summary"></div>
       <div class="chart-wrap">
@@ -351,8 +392,8 @@ def interactive_results(
   </main>
   <script>
     const DATA = {payload_json};
-    const filterFields = ["aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "max_portfolio_names"];
-    const tableFields = ["aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "max_portfolio_names", "ann_return", "active_sharpe", "max_drawdown"];
+    const filterFields = ["valid_config", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "use_concentration", "use_low_turnover", "use_value_tilt"];
+    const tableFields = ["valid_config", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "ann_return", "active_sharpe", "invested_month_frac", "avg_effective_names", "avg_max_weight", "name_cap_feasible_ratio", "max_drawdown"];
     let sortField = "active_sharpe";
     let sortDir = -1;
     let selectedId = null;
@@ -364,16 +405,22 @@ def interactive_results(
       return String(v);
     }}
 
+    function isPctField(field) {{
+      return ["ann_return", "ann_vol", "max_drawdown", "total_return", "invested_month_frac", "valid_rebalance_frac", "invalid_rebalance_frac", "avg_max_weight", "avg_max_issuer_weight", "name_cap_feasible_ratio", "issuer_cap_feasible_ratio", "zero_contributor_manager_frac"].includes(field);
+    }}
+
     function initFilters() {{
       const root = document.getElementById("filters");
       root.innerHTML = "";
       for (const field of filterFields) {{
+        if (!DATA.records.some(r => Object.prototype.hasOwnProperty.call(r, field))) continue;
         const values = [...new Set(DATA.records.map(r => r[field]).filter(v => v !== null && v !== undefined))];
         const label = document.createElement("label");
         label.textContent = field;
         const select = document.createElement("select");
         select.dataset.field = field;
         select.innerHTML = `<option value="">All</option>` + values.map(v => `<option value="${{v}}">${{v}}</option>`).join("");
+        if (field === "valid_config" && values.includes(true)) select.value = "true";
         select.addEventListener("change", render);
         label.appendChild(select);
         root.appendChild(label);
@@ -395,8 +442,8 @@ def interactive_results(
     function renderTable(rows) {{
       const table = document.getElementById("results");
       const head = `<thead><tr>${{tableFields.map(f => `<th data-field="${{f}}">${{f}}</th>`).join("")}}</tr></thead>`;
-      const body = rows.map(row => `<tr data-id="${{row.config_id}}" class="${{row.config_id === selectedId ? "active" : ""}}">
-        ${{tableFields.map(f => `<td>${{fmt(row[f], ["ann_return", "max_drawdown"].includes(f))}}</td>`).join("")}}
+      const body = rows.map(row => `<tr data-id="${{row.config_id}}" class="${{row.config_id === selectedId ? "active" : ""}} ${{row.valid_config === false ? "invalid" : ""}}">
+        ${{tableFields.map(f => `<td>${{fmt(row[f], isPctField(f))}}</td>`).join("")}}
       </tr>`).join("");
       table.innerHTML = head + `<tbody>${{body}}</tbody>`;
       table.querySelectorAll("th").forEach(th => th.addEventListener("click", () => {{
@@ -443,13 +490,47 @@ def interactive_results(
 
     function renderSummary(row) {{
       const items = [
+        ["Valid config", fmt(row.valid_config)],
         ["Total return", fmt(row.total_return, true)],
         ["Ann. return", fmt(row.ann_return, true)],
-        ["Ann. vol", fmt(row.ann_vol, true)],
-        ["Max drawdown", fmt(row.max_drawdown, true)],
+        ["Invested months", fmt(row.invested_month_frac, true)],
+        ["Avg names", fmt(row.avg_effective_names)],
+        ["Name cap OK", fmt(row.name_cap_feasible_ratio, true)],
         ["Active Sharpe", fmt(row.active_sharpe)],
       ];
       document.getElementById("summary").innerHTML = items.map(([k, v]) => `<div class="metric"><span>${{k}}</span><strong>${{v}}</strong></div>`).join("");
+    }}
+
+    function initSplitter() {{
+      const splitter = document.getElementById("splitter");
+      const root = document.documentElement;
+      if (!splitter) return;
+      const saved = localStorage.getItem("sweepLeftPanelWidth");
+      if (saved) root.style.setProperty("--left-panel-width", saved);
+      let dragging = false;
+      splitter.addEventListener("pointerdown", event => {{
+        dragging = true;
+        splitter.setPointerCapture(event.pointerId);
+        document.body.classList.add("dragging-splitter");
+      }});
+      splitter.addEventListener("pointermove", event => {{
+        if (!dragging) return;
+        const left = Math.max(300, Math.min(760, event.clientX - 20));
+        const value = `${{left}}px`;
+        root.style.setProperty("--left-panel-width", value);
+        localStorage.setItem("sweepLeftPanelWidth", value);
+      }});
+      function stopDrag(event) {{
+        dragging = false;
+        document.body.classList.remove("dragging-splitter");
+        try {{ splitter.releasePointerCapture(event.pointerId); }} catch (_) {{}}
+      }}
+      splitter.addEventListener("pointerup", stopDrag);
+      splitter.addEventListener("pointercancel", stopDrag);
+      splitter.addEventListener("dblclick", () => {{
+        localStorage.removeItem("sweepLeftPanelWidth");
+        root.style.removeProperty("--left-panel-width");
+      }});
     }}
 
     function render() {{
@@ -460,6 +541,7 @@ def interactive_results(
       if (row) {{ renderSummary(row); renderChart(row); }}
     }}
 
+    initSplitter();
     initFilters();
     render();
   </script>

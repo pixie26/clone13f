@@ -404,7 +404,7 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
             "active_share_active": bool(cfg.universe.use_active_share and benchmark_weights is not None),
             "active_weight_signal": _needs_active_benchmark_weights(cfg.portfolio.idea_signal),
             "active_weight_benchmark": (
-                "PIT equal-manager aggregate of all visible latest 13F books at each rebalance"
+                "visible_13f_aggregate: PIT equal-manager aggregate of all visible latest 13F books at each rebalance"
                 if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
                 else None
             ),
@@ -449,6 +449,7 @@ def _dashboard_parameter_summary(
             f"min_consensus_funds={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
             f"max_portfolio_names={p.max_portfolio_names}, "
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
+            f"min_portfolio_names={p.min_portfolio_names}, "
             f"min_active_weight_holdings={p.min_active_weight_holdings}"
         ),
         "Execution/cost": (
@@ -564,6 +565,62 @@ def write_sweep_outputs(
     return outputs
 
 
+def value_unit_continuity_diagnostics(
+    chars: pd.DataFrame,
+    *,
+    cutoff: str | pd.Timestamp = "2023-01-01",
+) -> pd.DataFrame:
+    """Check for suspicious AUM jumps around the historical SEC value-unit cutoff."""
+    columns = [
+        "manager",
+        "prev_period_date",
+        "period_date",
+        "prev_filing_date",
+        "filing_date",
+        "prev_aum",
+        "aum",
+        "aum_ratio",
+        "abs_log10_ratio",
+        "suspicious_unit_jump",
+    ]
+    if chars is None or chars.empty:
+        return pd.DataFrame(columns=columns)
+    cutoff = pd.Timestamp(cutoff)
+    latest = (
+        chars.sort_values(["manager", "period_date", "filing_date", "accession_number"])
+        .groupby(["manager", "period_date"], as_index=False)
+        .tail(1)
+        .sort_values(["manager", "period_date"])
+    )
+    rows: list[dict[str, Any]] = []
+    for manager, g in latest.groupby("manager", sort=False):
+        g = g.sort_values("period_date")
+        prev = None
+        for row in g.itertuples(index=False):
+            if prev is not None and pd.Timestamp(prev.filing_date) < cutoff <= pd.Timestamp(row.filing_date):
+                prev_aum = float(prev.aum)
+                aum = float(row.aum)
+                ratio = aum / prev_aum if prev_aum > 0 else np.nan
+                abs_log10_ratio = abs(float(np.log10(ratio))) if ratio and np.isfinite(ratio) and ratio > 0 else np.nan
+                rows.append({
+                    "manager": manager,
+                    "prev_period_date": pd.Timestamp(prev.period_date).date().isoformat(),
+                    "period_date": pd.Timestamp(row.period_date).date().isoformat(),
+                    "prev_filing_date": pd.Timestamp(prev.filing_date).date().isoformat(),
+                    "filing_date": pd.Timestamp(row.filing_date).date().isoformat(),
+                    "prev_aum": prev_aum,
+                    "aum": aum,
+                    "aum_ratio": ratio,
+                    "abs_log10_ratio": abs_log10_ratio,
+                    "suspicious_unit_jump": bool(pd.notna(ratio) and (ratio >= 50.0 or ratio <= 0.02)),
+                })
+            prev = row
+    out = pd.DataFrame(rows, columns=columns)
+    if not out.empty:
+        out = out.sort_values("abs_log10_ratio", ascending=False, na_position="last")
+    return out
+
+
 def _pct(value: float) -> str:
     return f"{value:.1%}" if pd.notna(value) else "n/a"
 
@@ -574,8 +631,14 @@ def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
     out: dict[str, Any] = {"rebalance_months": int(len(summary))}
     numeric_cols = [
         "selected_managers",
+        "active_eligible_managers",
+        "zero_contributor_managers",
+        "raw_idea_rows",
+        "raw_idea_names",
+        "consensus_idea_names",
         "effective_names",
         "target_names",
+        "target_names_before_caps",
         "carried_names",
         "turnover_one_way",
         "cost_bps",
@@ -603,6 +666,18 @@ def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
             s = summary[col].astype(bool)
             out[f"{col}_months"] = int(s.sum())
             out[f"{col}_ratio"] = float(s.mean()) if len(s) else float("nan")
+    if "valid_rebalance" in summary:
+        s = summary["valid_rebalance"].astype(bool)
+        out["valid_rebalance_months"] = int(s.sum())
+        out["valid_rebalance_ratio"] = float(s.mean()) if len(s) else float("nan")
+        out["invalid_rebalance_months"] = int((~s).sum())
+    if "effective_names" in summary:
+        invested = pd.to_numeric(summary["effective_names"], errors="coerce").fillna(0).gt(0)
+        out["invested_month_frac"] = float(invested.mean()) if len(invested) else float("nan")
+    if {"zero_contributor_managers", "selected_managers"}.issubset(summary.columns):
+        zero = pd.to_numeric(summary["zero_contributor_managers"], errors="coerce").fillna(0).sum()
+        selected = pd.to_numeric(summary["selected_managers"], errors="coerce").fillna(0).sum()
+        out["zero_contributor_manager_frac"] = float(zero / selected) if selected > 0 else float("nan")
     out["last_rebalance_month"] = str(last.get("rebalance_month", ""))
     out["last_effective_names"] = int(last.get("effective_names", 0) or 0)
     out["last_turnover_one_way"] = float(last.get("turnover_one_way", 0.0) or 0.0)
@@ -625,6 +700,17 @@ def _print_rebalance_summary(stats: dict[str, Any]) -> None:
         f"{stats.get('avg_effective_names', float('nan')):.1f}/"
         f"{stats.get('max_effective_names', float('nan')):.0f}"
     )
+    if "valid_rebalance_ratio" in stats:
+        print(
+            "  valid/invested months  "
+            f"{_pct(stats.get('valid_rebalance_ratio', float('nan')))}/"
+            f"{_pct(stats.get('invested_month_frac', float('nan')))}"
+        )
+    if "zero_contributor_manager_frac" in stats:
+        print(
+            "  zero contributor mgrs  "
+            f"{_pct(stats.get('zero_contributor_manager_frac', float('nan')))}"
+        )
     print(
         "  traded names avg/max   "
         f"{stats.get('avg_traded_names', float('nan')):.1f}/"
@@ -689,6 +775,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         universe=UniverseConfig(
             min_aum=0.5e9,
             max_aum=5e9,
+            use_concentration=False,
             min_top_n_weight=0.50,
             max_holdings=40,
             turnover_quantile=0.34,
@@ -700,10 +787,11 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             idea_signal="active_weight",
             top_n_ideas=3,
             min_consensus_funds=2,
+            min_portfolio_names=10,
             max_portfolio_names=25,
             holding_horizon_q=0,
             max_name_weight=0.05,
-            min_active_weight_holdings=20,
+            min_active_weight_holdings=10,
         ),
     )
     cfg_b = BacktestConfig(
@@ -729,7 +817,14 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         ("portfolio", "top_n_ideas"): [3, 5],
         ("portfolio", "min_consensus_funds"): [2, 5],
         ("portfolio", "holding_horizon_q"): [0, 1],
+        ("portfolio", "min_portfolio_names"): [10, 20],
         ("portfolio", "max_portfolio_names"): [25, 50],
+        ("portfolio", "min_active_weight_holdings"): [10],
+        ("universe", "use_concentration"): [False, True],
+        # Keep these fixed in the default Cartesian sweep to avoid exploding
+        # runtime; marginal-IR still evaluates their isolated impact.
+        ("universe", "use_low_turnover"): [True],
+        ("universe", "use_value_tilt"): [True],
     }
     train_m, test_m = 48, 12
     return cfg_a, cfg_b, axes, train_m, test_m
@@ -784,8 +879,9 @@ def _print_startup_parameters(
             "  thesis portfolio      "
             f"idea_signal={p.idea_signal}, top_n_ideas={p.top_n_ideas}, "
             f"min_consensus={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
-            f"max_portfolio_names={p.max_portfolio_names}, "
+            f"min_portfolio_names={p.min_portfolio_names}, max_portfolio_names={p.max_portfolio_names}, "
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
+            f"min_active_weight_holdings={p.min_active_weight_holdings}, "
             f"missing_price_policy={cfg_a.missing_price_policy}, cost={c.bps_per_side:.1f}bps"
         )
     if cfg_b is not None:
@@ -1006,6 +1102,15 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     print(f"  Saved rebalance managers: {rebalance_outputs['managers']}")
     print(f"  Saved rebalance rules:    {rebalance_outputs['rules']}")
     _print_rebalance_summary(rebalance_outputs.get("summary_stats", {}))
+    print("[6/6] Writing value-unit diagnostics")
+    value_diag = value_unit_continuity_diagnostics(chars)
+    value_diag_path = out_dir / "value_unit_diagnostics.csv"
+    value_diag.to_csv(value_diag_path, index=False)
+    suspicious_value_unit_jumps = int(value_diag["suspicious_unit_jump"].sum()) if not value_diag.empty else 0
+    print(
+        f"  Saved value-unit diagnostics: {value_diag_path} "
+        f"({suspicious_value_unit_jumps} suspicious cutoff jumps)"
+    )
     manifest_payload = {
         "mode": mode,
         "live_config": LIVE_CONFIG if mode == "live" else None,
@@ -1026,6 +1131,11 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             "price_diagnostics": prices.attrs.get("price_diagnostics"),
             "security_overrides_path": LIVE_CONFIG.get("security_overrides_path", "data/security_overrides.csv"),
             "issuer_group_count": int(security_groups.nunique()),
+            "value_unit_diagnostics": {
+                "path": str(value_diag_path),
+                "rows": int(len(value_diag)),
+                "suspicious_unit_jumps": suspicious_value_unit_jumps,
+            },
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
         "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),
