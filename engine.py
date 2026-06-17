@@ -304,10 +304,11 @@ def filter_universe_versions(latest_versions: pd.DataFrame, cfg: UniverseConfig,
         if len(t) >= 3:
             keep &= latest["turnover"].le(t.quantile(cfg.turnover_quantile)).reindex(keep.index).fillna(False)
     if cfg.use_value_tilt and value_scores is not None:
+        candidates = latest.loc[keep]
         vp = {m: _book_value_pctl(r["bw"], value_scores.loc[r["period_date"]]
                                   if r["period_date"] in value_scores.index else None)
-              for m, r in latest.iterrows()}
-        keep &= pd.Series(vp).ge(cfg.value_tilt_min_pctl).reindex(keep.index).fillna(False)
+              for m, r in candidates.iterrows()}
+        keep &= pd.Series(vp).ge(cfg.value_tilt_min_pctl).reindex(keep.index, fill_value=False).astype(bool)
     return latest.loc[keep.values].reset_index(drop=True)
 
 
@@ -647,19 +648,26 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
 def run_backtest(holdings, prices, cfg: BacktestConfig,
                  value_scores=None, benchmark_weights=None, chars=None,
                  visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
-                 security_groups=None) -> pd.Series:
+                 security_groups=None,
+                 progress_label: str | None = None,
+                 progress_every: int = 10) -> pd.Series:
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
     months = prices.index.sort_values()
-    rebal_months = set(_rebalance_months(holdings, prices))
+    rebal_month_list = _rebalance_months(holdings, prices)
+    rebal_months = set(rebal_month_list)
+    total_rebalances = len(rebal_month_list)
 
     cur = pd.Series(dtype=float)
     last_in_tgt: dict[str, pd.Timestamp] = {}
     net = pd.Series(0.0, index=months)
+    rebal_no = 0
+    t0 = time.perf_counter()
 
     for m in months:
         cur, net.loc[m] = _apply_monthly_returns(cur, prices, m, cfg)
         if m in rebal_months:
+            rebal_no += 1
             latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
             if latest_versions is None:
                 latest_versions = _visible_manager_versions(chars, m)
@@ -670,12 +678,24 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
             )
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
             tgt = target_weights_from_versions(selected_versions, cfg.portfolio, active_benchmark_weights)
+            target_names_before_price_filter = len(tgt)
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
             if tgt.sum() > 0:
                 eff, traded, _ = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
                 net.loc[m] -= traded * cfg.cost.bps_per_side / 1e4
                 cur = eff
+            if progress_label and (
+                rebal_no == 1
+                or rebal_no == total_rebalances
+                or (progress_every > 0 and rebal_no % progress_every == 0)
+            ):
+                print(
+                    f"      {progress_label}: rebalance {rebal_no}/{total_rebalances} "
+                    f"{m.date()} selected={len(selected_versions)} "
+                    f"target={target_names_before_price_filter}->{len(tgt)} "
+                    f"held={len(cur)} elapsed={time.perf_counter() - t0:.1f}s"
+                )
     return net
 
 
@@ -748,7 +768,17 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
         print("  marginal-ir 1/? running full stack")
         t0 = time.perf_counter()
     base = attribution(
-        run_backtest(holdings, prices, cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups),
+        run_backtest(
+            holdings,
+            prices,
+            cfg,
+            value_scores,
+            benchmark_weights,
+            ch,
+            visible_cache,
+            security_groups,
+            progress_label="marginal-ir full stack" if verbose else None,
+        ),
         factors,
         benchmark,
     )
@@ -773,7 +803,17 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
             continue
         cfg2 = replace(cfg, universe=replace(cfg.universe, **{t: False}))
         att = attribution(
-            run_backtest(holdings, prices, cfg2, value_scores, benchmark_weights, ch, visible_cache, security_groups),
+            run_backtest(
+                holdings,
+                prices,
+                cfg2,
+                value_scores,
+                benchmark_weights,
+                ch,
+                visible_cache,
+                security_groups,
+                progress_label=f"marginal-ir -{t}" if verbose else None,
+            ),
             factors,
             benchmark,
         )

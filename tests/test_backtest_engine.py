@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 import data_adapters as da
+import engine as en
 import sweep as sw
 from data_adapters import (
     _is_yfinance_ticker,
@@ -27,6 +28,7 @@ from engine import (
     _cap_weights,
     _cap_weights_with_groups,
     attribution,
+    filter_universe_versions,
     rebalance_trace,
     run_backtest,
     target_weights_from_versions,
@@ -160,6 +162,61 @@ def test_cap_weights_with_groups_limits_share_classes_by_issuer():
     assert capped.sum() == pytest.approx(1.0)
     assert capped.max() <= 0.40 + 1e-12
     assert capped.loc[["GOOG", "GOOGL"]].sum() <= 0.30 + 1e-12
+
+
+def test_value_tilt_only_scores_previously_filtered_candidates(monkeypatch):
+    calls = []
+    latest = pd.DataFrame(
+        [
+            {
+                "manager": "too_large",
+                "hist_q": 4,
+                "aum": 100.0,
+                "top10_weight": 0.90,
+                "n_holdings": 5,
+                "put_weight": 0.0,
+                "active_share": np.nan,
+                "turnover": 0.1,
+                "period_date": pd.Timestamp("2020-03-31"),
+                "bw": pd.Series({"A": 1.0}),
+            },
+            {
+                "manager": "candidate",
+                "hist_q": 4,
+                "aum": 10.0,
+                "top10_weight": 0.90,
+                "n_holdings": 5,
+                "put_weight": 0.0,
+                "active_share": np.nan,
+                "turnover": 0.1,
+                "period_date": pd.Timestamp("2020-03-31"),
+                "bw": pd.Series({"B": 1.0}),
+            },
+        ]
+    )
+    cfg = UniverseConfig(
+        min_aum=0.0,
+        max_aum=30.0,
+        min_history_quarters=1,
+        use_size_band=True,
+        use_concentration=False,
+        use_low_turnover=False,
+        use_hedge_filter=False,
+        use_value_tilt=True,
+        value_tilt_min_pctl=0.50,
+    )
+    value_scores = pd.DataFrame({"A": [1.0], "B": [1.0]}, index=[pd.Timestamp("2020-03-31")])
+
+    def fake_book_value_pctl(w, vscores):
+        calls.append(tuple(w.index))
+        return 1.0
+
+    monkeypatch.setattr(en, "_book_value_pctl", fake_book_value_pctl)
+
+    selected = filter_universe_versions(latest, cfg, value_scores)
+
+    assert selected["manager"].tolist() == ["candidate"]
+    assert calls == [("B",)]
 
 
 def test_active_weight_signal_uses_relative_overweight_not_absolute_level():
@@ -910,7 +967,7 @@ def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypat
     def fake_yfinance_probe(yf, start, end, timeout_seconds=None):
         return "probe_empty_close"
 
-    def fake_chart_probe(start, end):
+    def fake_chart_probe(start, end, timeout_seconds=None):
         return "chart_probe_ok=SPY,IWD,AAPL"
 
     def fake_chart_download_close(batch, start, end, *, max_workers=8):
@@ -945,7 +1002,7 @@ def test_fetch_prices_switches_to_chart_fallback_after_yfinance_timeout(monkeypa
     def fake_yf_download_close_guarded(yf, batch, start, end, timeout_seconds):
         raise TimeoutError(f"yfinance batch timed out after {timeout_seconds}s: {batch[0]}..{batch[-1]}")
 
-    def fake_chart_probe(start, end):
+    def fake_chart_probe(start, end, timeout_seconds=None):
         return "chart_probe_ok=SPY,IWD,AAPL"
 
     def fake_chart_download_close(batch, start, end, *, max_workers=8):
@@ -972,6 +1029,47 @@ def test_fetch_prices_switches_to_chart_fallback_after_yfinance_timeout(monkeypa
     assert returns.attrs["price_diagnostics"]["used_chart_fallback"] is True
     assert returns.attrs["price_diagnostics"]["yfinance_batch_timeout_seconds"] == 1
     assert "timed out" in returns.attrs["price_diagnostics"]["failed_batches"][0]
+
+
+def test_yahoo_chart_fallback_splits_timed_out_batches(monkeypatch, tmp_path):
+    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
+    calls = []
+
+    def fake_yf_download_close_guarded(yf, batch, start, end, timeout_seconds):
+        return pd.DataFrame()
+
+    def fake_yfinance_probe(yf, start, end, timeout_seconds=None):
+        return "probe_empty_close"
+
+    def fake_chart_probe(start, end, timeout_seconds=None):
+        return "chart_probe_ok=SPY,IWD,AAPL"
+
+    def fake_chart_guarded(batch, start, end, *, max_workers, timeout_seconds):
+        calls.append(tuple(batch))
+        if len(batch) > 1:
+            raise TimeoutError(f"Yahoo Chart batch timed out after {timeout_seconds}s: {batch[0]}..{batch[-1]}")
+        return pd.DataFrame({batch[0]: [100.0, 110.0, 121.0]}, index=dates)
+
+    monkeypatch.setattr(da, "_yf_download_close_guarded", fake_yf_download_close_guarded)
+    monkeypatch.setattr(da, "_yfinance_probe", fake_yfinance_probe)
+    monkeypatch.setattr(da, "_yahoo_chart_probe", fake_chart_probe)
+    monkeypatch.setattr(da, "_yahoo_chart_download_close_guarded", fake_chart_guarded)
+
+    returns = da.fetch_prices(
+        ["AAPL", "MSFT"],
+        "2025-01-01",
+        "2025-03-31",
+        batch_size=2,
+        max_retries=0,
+        max_consecutive_empty_batches=1,
+        cache_path=tmp_path / "prices.parquet",
+        chart_fallback_batch_timeout_seconds=1,
+    )
+
+    assert calls == [("AAPL", "MSFT"), ("AAPL",), ("MSFT",)]
+    assert returns.columns.tolist() == ["AAPL", "MSFT"]
+    assert returns.attrs["price_diagnostics"]["used_chart_fallback"] is True
+    assert returns.attrs["price_diagnostics"]["chart_fallback_batch_timeout_seconds"] == 1
 
 
 def test_fetch_prices_keeps_partial_monthly_return_columns(monkeypatch):

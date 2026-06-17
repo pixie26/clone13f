@@ -316,9 +316,92 @@ def _yahoo_chart_download_close(
     return close.sort_index()
 
 
-def _yahoo_chart_probe(start: str, end: str) -> str:
+def _yahoo_chart_download_close_worker(
+    batch: list[str],
+    start: str,
+    end: str,
+    max_workers: int,
+    out_path: str,
+    status_path: str,
+) -> None:
     try:
-        close = _yahoo_chart_download_close(["SPY", "IWD", "AAPL"], start, end, max_workers=3)
+        close = _yahoo_chart_download_close(batch, start, end, max_workers=max_workers)
+        if not close.empty:
+            close.to_parquet(out_path)
+        Path(status_path).write_text(json.dumps({"ok": True, "empty": bool(close.empty)}), encoding="utf-8")
+    except BaseException as exc:
+        Path(status_path).write_text(
+            json.dumps({"ok": False, "type": type(exc).__name__, "message": str(exc)}),
+            encoding="utf-8",
+        )
+
+
+def _yahoo_chart_download_close_subprocess(
+    batch: list[str],
+    start: str,
+    end: str,
+    *,
+    max_workers: int,
+    timeout_seconds: int,
+) -> pd.DataFrame:
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = str(Path(tmp) / "chart_close.parquet")
+        status_path = str(Path(tmp) / "chart_status.json")
+        ctx = mp.get_context("spawn")
+        proc = ctx.Process(
+            target=_yahoo_chart_download_close_worker,
+            args=(batch, start, end, max_workers, out_path, status_path),
+        )
+        proc.start()
+        proc.join(timeout_seconds)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(5)
+            raise TimeoutError(
+                f"Yahoo Chart batch timed out after {timeout_seconds}s: {batch[0]}..{batch[-1]}"
+            )
+        if not Path(status_path).exists():
+            raise RuntimeError(f"Yahoo Chart worker exited without status code={proc.exitcode}")
+        status = json.loads(Path(status_path).read_text(encoding="utf-8"))
+        if not status.get("ok"):
+            raise RuntimeError(f"{status.get('type')}: {status.get('message')}")
+        if status.get("empty") or not Path(out_path).exists():
+            return pd.DataFrame()
+        return pd.read_parquet(out_path)
+
+
+def _yahoo_chart_download_close_guarded(
+    batch: list[str],
+    start: str,
+    end: str,
+    *,
+    max_workers: int,
+    timeout_seconds: int | None,
+) -> pd.DataFrame:
+    if (
+        timeout_seconds
+        and timeout_seconds > 0
+        and getattr(_yahoo_chart_download_close, "__module__", __name__) == __name__
+    ):
+        return _yahoo_chart_download_close_subprocess(
+            batch,
+            start,
+            end,
+            max_workers=max_workers,
+            timeout_seconds=timeout_seconds,
+        )
+    return _yahoo_chart_download_close(batch, start, end, max_workers=max_workers)
+
+
+def _yahoo_chart_probe(start: str, end: str, timeout_seconds: int | None = 60) -> str:
+    try:
+        close = _yahoo_chart_download_close_guarded(
+            ["SPY", "IWD", "AAPL"],
+            start,
+            end,
+            max_workers=3,
+            timeout_seconds=timeout_seconds,
+        )
     except Exception as exc:
         return f"chart_probe_exception={type(exc).__name__}: {exc}"
     if close.empty:
@@ -329,6 +412,50 @@ def _yahoo_chart_probe(start: str, end: str) -> str:
     return f"chart_probe_ok={','.join(map(str, non_empty))}"
 
 
+def _fetch_yahoo_chart_batch_resilient(
+    batch: list[str],
+    start: str,
+    end: str,
+    *,
+    max_workers: int,
+    timeout_seconds: int | None,
+    split_threshold: int = 10,
+) -> tuple[list[pd.DataFrame], list[str], int]:
+    if not batch:
+        return [], [], 0
+    try:
+        close = _yahoo_chart_download_close_guarded(
+            batch,
+            start,
+            end,
+            max_workers=max_workers,
+            timeout_seconds=timeout_seconds,
+        )
+        return ([close] if not close.empty else []), [], 0
+    except TimeoutError as exc:
+        if len(batch) == 1:
+            return [], [f"{batch[0]}: {exc}"], 1
+        chunk_size = max(1, min(split_threshold, len(batch) // 2))
+        frames: list[pd.DataFrame] = []
+        failures: list[str] = []
+        timeouts = 1
+        for j in range(0, len(batch), chunk_size):
+            child_frames, child_failures, child_timeouts = _fetch_yahoo_chart_batch_resilient(
+                batch[j:j + chunk_size],
+                start,
+                end,
+                max_workers=max_workers,
+                timeout_seconds=timeout_seconds,
+                split_threshold=max(1, split_threshold // 2),
+            )
+            frames.extend(child_frames)
+            failures.extend(child_failures)
+            timeouts += child_timeouts
+        return frames, failures, timeouts
+    except Exception as exc:
+        return [], [f"{batch[0]}..{batch[-1]}: {type(exc).__name__}: {exc}"], 0
+
+
 def _fetch_yahoo_chart_batches(
     tickers: list[str],
     start: str,
@@ -337,6 +464,7 @@ def _fetch_yahoo_chart_batches(
     batch_size: int,
     cache_path: str | Path | None,
     max_workers: int,
+    batch_timeout_seconds: int | None = 90,
 ) -> tuple[list[pd.DataFrame], list[str]]:
     frames: list[pd.DataFrame] = []
     failed_batches: list[str] = []
@@ -346,16 +474,40 @@ def _fetch_yahoo_chart_batches(
         batch = tickers[i:i + batch_size]
         batch_no = i // batch_size + 1
         print(f"    yahoo-chart batch {batch_no}/{n_batches}: {batch[0]}..{batch[-1]}")
-        close = _yahoo_chart_download_close(batch, start, end, max_workers=max_workers)
+        t0 = time.perf_counter()
+        batch_frames, batch_failures, batch_timeouts = _fetch_yahoo_chart_batch_resilient(
+            batch,
+            start,
+            end,
+            max_workers=max_workers,
+            timeout_seconds=batch_timeout_seconds,
+        )
+        close = (
+            pd.concat(batch_frames, axis=1).loc[:, lambda x: ~x.columns.duplicated()].sort_index()
+            if batch_frames
+            else pd.DataFrame()
+        )
         non_nan_close = close.dropna(axis=1, how="all") if not close.empty else close
+        if batch_failures:
+            failed_batches.extend(batch_failures)
+        elapsed = time.perf_counter() - t0
         if non_nan_close.empty:
             failed_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
+            print(
+                f"      yahoo-chart batch {batch_no}/{n_batches}: "
+                f"0/{len(batch)} close columns in {elapsed:.1f}s"
+            )
         else:
             frames.append(non_nan_close)
             _write_price_cache(cache_path, non_nan_close)
             _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched")
             no_close_in_batch = sorted(set(batch) - set(non_nan_close.columns))
             _write_price_coverage(cache_path, no_close_in_batch, start, end, "no_close")
+            print(
+                f"      yahoo-chart batch {batch_no}/{n_batches}: "
+                f"{len(non_nan_close.columns)}/{len(batch)} close columns in {elapsed:.1f}s"
+                + (f"; split_timeouts={batch_timeouts}" if batch_timeouts else "")
+            )
         time.sleep(0.1)
     return frames, failed_batches
 
@@ -800,6 +952,7 @@ def fetch_prices(
     max_consecutive_empty_batches: int = 3,
     use_chart_fallback: bool = True,
     chart_fallback_workers: int = 8,
+    chart_fallback_batch_timeout_seconds: int | None = 90,
     yfinance_batch_timeout_seconds: int | None = 120,
     require_full_window: bool = False,
 ) -> pd.DataFrame:
@@ -898,7 +1051,7 @@ def fetch_prices(
                     ) from exc
                 remaining = todo[i + batch_size:]
                 fallback_tickers = sorted(set(batch).union(remaining))
-                chart_probe = _yahoo_chart_probe(start, end)
+                chart_probe = _yahoo_chart_probe(start, end, chart_fallback_batch_timeout_seconds)
                 if "chart_probe_ok=" not in chart_probe:
                     raise RuntimeError(
                         f"Stopping yfinance download after timed-out batch; "
@@ -916,6 +1069,7 @@ def fetch_prices(
                     batch_size=batch_size,
                     cache_path=cache_path,
                     max_workers=chart_fallback_workers,
+                    batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
                 )
                 frames.extend(chart_frames)
                 used_chart_fallback = True
@@ -945,7 +1099,7 @@ def fetch_prices(
                         f"{consecutive_empty} consecutive empty batches; {probe}; "
                         f"recent empty batches: {empty_batches[-max_consecutive_empty_batches:]}"
                     )
-                chart_probe = _yahoo_chart_probe(start, end)
+                chart_probe = _yahoo_chart_probe(start, end, chart_fallback_batch_timeout_seconds)
                 if "chart_probe_ok=" not in chart_probe:
                     raise RuntimeError(
                         "Stopping yfinance download after "
@@ -967,6 +1121,7 @@ def fetch_prices(
                     batch_size=batch_size,
                     cache_path=cache_path,
                     max_workers=chart_fallback_workers,
+                    batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
                 )
                 frames.extend(chart_frames)
                 used_chart_fallback = True
@@ -1039,6 +1194,9 @@ def fetch_prices(
         "used_chart_fallback": bool(used_chart_fallback),
         "yfinance_batch_timeout_seconds": (
             int(yfinance_batch_timeout_seconds) if yfinance_batch_timeout_seconds else None
+        ),
+        "chart_fallback_batch_timeout_seconds": (
+            int(chart_fallback_batch_timeout_seconds) if chart_fallback_batch_timeout_seconds else None
         ),
         "failed_batches": failed_batches[:10],
         "empty_batches": empty_batches[:10],
