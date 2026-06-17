@@ -393,6 +393,33 @@ def test_max_portfolio_names_caps_aggregate_target_before_weight_caps():
     assert target.sum() == pytest.approx(1.0)
 
 
+def test_target_weights_applies_eligible_tickers_before_top_n_selection():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"STALE": 0.40, "A": 0.30, "B": 0.20, "C": 0.10}),
+                "prev_bw": None,
+            }
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="level",
+        top_n_ideas=4,
+        min_consensus_funds=1,
+        max_portfolio_names=3,
+        max_name_weight=1.0,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, eligible_tickers=["A", "B", "C"])
+
+    assert target.index.tolist() == ["A", "B", "C"]
+    assert target.sum() == pytest.approx(1.0)
+
+
 def test_iter_configs_supports_paired_aum_band_axis():
     base = BacktestConfig()
 
@@ -1524,6 +1551,91 @@ def test_fetch_prices_full_window_refetches_short_cache_even_with_coverage_metad
     assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 1
     assert loaded["SPY"].dropna().index.min() == pd.Timestamp("2015-01-31")
     assert loaded.loc[pd.Timestamp("2015-01-31"), "SPY"] == 200.0
+
+
+def test_fetch_prices_refetches_short_cache_even_with_coverage_metadata_by_default(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    _write_price_cache(
+        cache_path,
+        pd.DataFrame({"AAPL": [600.0, 610.0]}, index=pd.to_datetime(["2025-01-31", "2025-02-28"])),
+    )
+    da._write_price_coverage(cache_path, ["AAPL"], "2015-01-01", "2026-03-31", "fetched")
+    requested_dates = pd.to_datetime(["2015-01-31", "2015-02-28", "2026-03-31"])
+    calls = []
+
+    def fake_yf_download_close(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame({"AAPL": [20.0, 22.0, 220.0]}, index=requested_dates)
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+
+    returns = da.fetch_prices(
+        ["AAPL"],
+        "2015-01-01",
+        "2026-03-31",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+    )
+    loaded = _load_price_cache(cache_path, "2015-01-01", "2026-03-31")
+
+    assert calls == [(("AAPL",), "2015-01-01", "2026-03-31")]
+    assert returns.attrs["price_diagnostics"]["tickers_from_cache"] == 0
+    assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 1
+    assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_false_coverage"] == 1
+    assert loaded["AAPL"].dropna().index.min() == pd.Timestamp("2015-01-31")
+    assert loaded.loc[pd.Timestamp("2015-01-31"), "AAPL"] == 20.0
+
+
+def test_fetch_prices_patches_partial_yfinance_history_with_chart(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    yf_dates = pd.to_datetime(["2025-01-31", "2025-02-28"])
+    chart_dates = pd.to_datetime(["2015-01-31", "2015-02-28", "2026-03-31"])
+    chart_calls = []
+
+    def fake_yf_download_close(yf, batch, start, end):
+        return pd.DataFrame({"AAPL": [600.0, 610.0]}, index=yf_dates)
+
+    def fake_chart_guarded(batch, start, end, *, max_workers, timeout_seconds):
+        chart_calls.append((tuple(batch), start, end))
+        return pd.DataFrame({"AAPL": [20.0, 22.0, 220.0]}, index=chart_dates)
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+    monkeypatch.setattr(da, "_yahoo_chart_download_close_guarded", fake_chart_guarded)
+
+    returns = da.fetch_prices(
+        ["AAPL"],
+        "2015-01-01",
+        "2026-03-31",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+    )
+    loaded = _load_price_cache(cache_path, "2015-01-01", "2026-03-31")
+
+    assert chart_calls == [(("AAPL",), "2015-01-01", "2026-03-31")]
+    assert returns.attrs["price_diagnostics"]["used_chart_fallback"] is True
+    assert returns.attrs["price_diagnostics"]["partial_history_patched_tickers"] == ["AAPL"]
+    assert loaded["AAPL"].dropna().index.min() == pd.Timestamp("2015-01-31")
+    assert loaded.loc[pd.Timestamp("2015-01-31"), "AAPL"] == 20.0
+
+
+def test_price_cache_audit_flags_false_full_coverage(tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    _write_price_cache(
+        cache_path,
+        pd.DataFrame({"AAPL": [600.0, 610.0]}, index=pd.to_datetime(["2025-01-31", "2025-02-28"])),
+    )
+    da._write_price_coverage(cache_path, ["AAPL"], "2015-01-01", "2026-03-31", "fetched")
+
+    audit = da.audit_price_cache_coverage(cache_path, "2015-01-01", "2026-03-31", ["AAPL"])
+
+    row = audit.iloc[0]
+    assert row["ticker"] == "AAPL"
+    assert row["actual_first_close"] == pd.Timestamp("2025-01-31")
+    assert row["actual_spans_requested_window"] == False
+    assert row["coverage_status"] == "fetched"
+    assert row["false_full_coverage"] == True
 
 
 def test_fetch_prices_uses_chart_fallback_when_yfinance_probe_is_empty(monkeypatch, tmp_path):

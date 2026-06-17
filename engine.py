@@ -353,7 +353,13 @@ def _idea_scores(
     prev: pd.Series | None,
     cfg: PortfolioConfig,
     active_benchmark_weights: pd.Series | None = None,
+    eligible_tickers=None,
 ) -> pd.Series:
+    if eligible_tickers is not None:
+        eligible = pd.Index(eligible_tickers).astype(str).str.upper()
+        cur = cur[cur.index.astype(str).str.upper().isin(eligible)]
+        if prev is not None:
+            prev = prev[prev.index.astype(str).str.upper().isin(eligible)]
     if cfg.idea_signal == "level":
         s = cur
     elif cfg.idea_signal == "change":
@@ -391,6 +397,7 @@ def target_weights_from_versions(
     latest_versions: pd.DataFrame,
     cfg: PortfolioConfig,
     active_benchmark_weights: pd.Series | None = None,
+    eligible_tickers=None,
     return_diagnostics: bool = False,
 ) -> pd.Series:
     diagnostics = {
@@ -411,9 +418,13 @@ def target_weights_from_versions(
     for cur_row in latest_versions.itertuples(index=False):
         cur = getattr(cur_row, "bw")
         prev = getattr(cur_row, "prev_bw", None)
-        if _needs_active_benchmark_weights(cfg.idea_signal) and int((cur > 0).sum()) >= cfg.min_active_weight_holdings:
+        cur_diag = cur
+        if eligible_tickers is not None:
+            eligible = pd.Index(eligible_tickers).astype(str).str.upper()
+            cur_diag = cur[cur.index.astype(str).str.upper().isin(eligible)]
+        if _needs_active_benchmark_weights(cfg.idea_signal) and int((cur_diag > 0).sum()) >= cfg.min_active_weight_holdings:
             diagnostics["active_eligible_managers"] += 1
-        picks = _idea_scores(cur, prev, cfg, active_benchmark_weights)
+        picks = _idea_scores(cur, prev, cfg, active_benchmark_weights, eligible_tickers)
         if picks.empty:
             diagnostics["zero_contributor_managers"] += 1
         diagnostics["raw_idea_rows"] += int(len(picks))
@@ -653,14 +664,15 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         for manager in selected_managers:
             manager_rows.append({"rebalance_month": m.date().isoformat(), "manager": manager})
 
+        priced_now = prices.columns[prices.loc[m].notna()]
         tgt, idea_diag = target_weights_from_versions(
             selected_versions,
             cfg.portfolio,
             active_benchmark_weights,
+            eligible_tickers=priced_now,
             return_diagnostics=True,
         )
         target_names_before_price_filter = int(len(tgt))
-        priced_now = prices.columns[prices.loc[m].notna()]
         tgt = tgt[tgt.index.isin(priced_now)]
         invalid_reason = _minimum_target_failure(tgt, cfg)
         if invalid_reason:
@@ -782,14 +794,15 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 else None
             )
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+            priced_now = prices.columns[prices.loc[m].notna()]
             tgt, idea_diag = target_weights_from_versions(
                 selected_versions,
                 cfg.portfolio,
                 active_benchmark_weights,
+                eligible_tickers=priced_now,
                 return_diagnostics=True,
             )
             target_names_before_price_filter = len(tgt)
-            priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
             invalid_reason = _minimum_target_failure(tgt, cfg)
             if invalid_reason:
@@ -928,14 +941,15 @@ def run_backtest_from_selection_cache(
             if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
                 if active_benchmark_weights_by_month is not None:
                     active_benchmark_weights = active_benchmark_weights_by_month.get(month)
+            priced_now = prices.columns[prices.loc[m].notna()]
             tgt, idea_diag = target_weights_from_versions(
                 selected_versions,
                 cfg.portfolio,
                 active_benchmark_weights,
+                eligible_tickers=priced_now,
                 return_diagnostics=True,
             )
             target_names_before_price_filter = len(tgt)
-            priced_now = prices.columns[prices.loc[m].notna()]
             tgt = tgt[tgt.index.isin(priced_now)]
             invalid_reason = _minimum_target_failure(tgt, cfg)
             if invalid_reason:

@@ -7,7 +7,7 @@ Key fixes vs the initial version:
   - start/end are treated as REPORT-PERIOD bounds; we download all filing-window
     archives that can contain those report periods, then filter period_date.
   - Dates are parsed with explicit SEC formats, avoiding pandas dateutil warnings.
-  - Amendments are de-duplicated: latest filing per (CIK, report period) wins.
+  - Amendments are retained as separate filing versions for point-in-time use.
   - Stable manager key is CIK; manager_name is kept separately for display.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ import pandas as pd
 SEC_13F_BASE = "https://www.sec.gov/files/structureddata/data/form-13f-data-sets/"
 SEC_13F_LANDING = "https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets"
 PARSED_CACHE_VERSION = "v2"
-PROCESSED_UNIVERSE_CACHE_VERSION = "u1"
+PROCESSED_UNIVERSE_CACHE_VERSION = "u2"
 
 # Fallback only. The downloader first tries to scrape the official SEC landing page.
 LEGACY_URL_PATTERN = SEC_13F_BASE + "{y}q{q}_form13f.zip"
@@ -401,34 +401,32 @@ def coarse_prefilter(holdings: pd.DataFrame,
                      max_put_weight=0.10) -> pd.DataFrame:
     """Coarse, point-in-time filing-level screen before the engine's final screen."""
     h = holdings.copy()
-    # Screen on one filing version per (cik, period). If original and amended
-    # accessions are both present, summing all rows doubles AUM and dilutes PUT
-    # weight. Use the latest accession for screening stats, then keep all
-    # versions of surviving periods so the engine can still apply filing-date PIT.
+    # This is only a broad prefilter. Score each accession separately so
+    # original+amendment rows are never summed together. If any version of a
+    # (cik, period) passes, keep every version for that period; the engine later
+    # decides which filing version was visible at each rebalance date.
     key = ["cik", "period_date"]
+    version_key = key + ["accession_number"] if "accession_number" in h.columns else key
     if "accession_number" in h.columns:
-        versions = (
-            h[key + ["filing_date", "accession_number"]]
-            .drop_duplicates()
-            .sort_values(key + ["filing_date", "accession_number"])
-        )
-        latest_acc = versions.groupby(key, as_index=False).tail(1)[key + ["accession_number"]]
-        hv = h.merge(latest_acc, on=key + ["accession_number"], how="inner")
+        hv = h.dropna(subset=["accession_number"]).copy()
     else:
         hv = h
 
-    g = hv[hv.sec_type == "SH"].groupby(key)
+    g = hv[hv.sec_type == "SH"].groupby(version_key, dropna=False)
     stats = g.agg(aum=("value", "sum"), n=("cusip", "nunique")).reset_index()
-    tot = hv.groupby(key)["value"].sum().rename("tot").reset_index()
-    putv = (hv[hv.sec_type == "PUT"].groupby(key)["value"].sum()
+    tot = hv.groupby(version_key, dropna=False)["value"].sum().rename("tot").reset_index()
+    putv = (hv[hv.sec_type == "PUT"].groupby(version_key, dropna=False)["value"].sum()
             .rename("putv").reset_index())
-    stats = (stats.merge(tot, on=key, how="left")
-                  .merge(putv, on=key, how="left")
+    stats = (stats.merge(tot, on=version_key, how="left")
+                  .merge(putv, on=version_key, how="left")
                   .fillna({"putv": 0}))
     stats["put_w"] = stats["putv"] / stats["tot"].replace(0, np.nan)
-    ok = stats[(stats.aum.between(min_aum, max_aum)) &
-               (stats.n <= max_holdings) &
-               (stats.put_w.fillna(0) <= max_put_weight)][key]
+    ok = (
+        stats[(stats.aum.between(min_aum, max_aum)) &
+              (stats.n <= max_holdings) &
+              (stats.put_w.fillna(0) <= max_put_weight)][key]
+        .drop_duplicates()
+    )
     kept = h.merge(ok, on=key, how="inner")
     n_before = holdings[key].drop_duplicates().shape[0]
     n_after = ok.shape[0]

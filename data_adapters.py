@@ -27,6 +27,7 @@ import requests
 PRICE_ELIGIBLE_SEC_TYPES = {"SH"}
 YFINANCE_TICKER_RE = r"^[A-Z]{1,6}([.\-][A-Z]{1,2})?$"
 OPENFIGI_SELECTOR_VERSION = 2
+PRICE_COVERAGE_SCHEMA_VERSION = 2
 OPENFIGI_US_EQUITY_FILTERS = {
     "currency": "USD",
     "marketSecDes": "Equity",
@@ -500,7 +501,7 @@ def _fetch_yahoo_chart_batches(
         else:
             frames.append(non_nan_close)
             _write_price_cache(cache_path, non_nan_close)
-            _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched")
+            _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched", non_nan_close)
             no_close_in_batch = sorted(set(batch) - set(non_nan_close.columns))
             _write_price_coverage(cache_path, no_close_in_batch, start, end, "no_close")
             print(
@@ -552,24 +553,67 @@ def _load_price_coverage(cache_path: str | Path | None) -> pd.DataFrame:
     cov["start"] = pd.to_datetime(cov["start"])
     cov["end"] = pd.to_datetime(cov["end"])
     cov["status"] = cov["status"].astype(str)
+    for col in ("actual_first_close", "actual_last_close"):
+        if col not in cov:
+            cov[col] = pd.NaT
+        cov[col] = pd.to_datetime(cov[col], errors="coerce")
+    if "rows" not in cov:
+        cov["rows"] = pd.NA
+    if "coverage_schema_version" not in cov:
+        cov["coverage_schema_version"] = 1
     return cov
 
 
-def _write_price_coverage(cache_path: str | Path | None, tickers, start: str, end: str, status: str) -> None:
+def _price_coverage_rows(tickers, start: str, end: str, status: str, px: pd.DataFrame | None = None) -> list[dict]:
+    clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
+    if not clean:
+        return []
+    price_frame = pd.DataFrame()
+    if px is not None and not px.empty:
+        price_frame = px.copy()
+        price_frame.index = pd.to_datetime(price_frame.index)
+        price_frame.columns = [str(c).strip().upper() for c in price_frame.columns]
+    rows = []
+    for ticker in clean:
+        actual_first = pd.NaT
+        actual_last = pd.NaT
+        n_rows = 0
+        if ticker in price_frame:
+            s = price_frame[ticker].dropna()
+            n_rows = int(len(s))
+            if n_rows:
+                actual_first = s.index.min()
+                actual_last = s.index.max()
+        rows.append({
+            "ticker": ticker,
+            "start": pd.Timestamp(start),
+            "end": pd.Timestamp(end),
+            "status": status,
+            "actual_first_close": actual_first,
+            "actual_last_close": actual_last,
+            "rows": n_rows,
+            "coverage_schema_version": PRICE_COVERAGE_SCHEMA_VERSION,
+        })
+    return rows
+
+
+def _write_price_coverage(
+    cache_path: str | Path | None,
+    tickers,
+    start: str,
+    end: str,
+    status: str,
+    px: pd.DataFrame | None = None,
+) -> None:
     path = _price_coverage_cache_path(cache_path)
     if path is None:
         return
-    clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
-    if not clean:
+    rows = _price_coverage_rows(tickers, start, end, status, px)
+    if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     current = _load_price_coverage(cache_path)
-    new = pd.DataFrame({
-        "ticker": clean,
-        "start": pd.Timestamp(start),
-        "end": pd.Timestamp(end),
-        "status": status,
-    })
+    new = pd.DataFrame(rows)
     out = new if current.empty else pd.concat([current, new], ignore_index=True)
     out = (out.sort_values(["ticker", "start", "end", "status"])
               .drop_duplicates(["ticker", "start", "end", "status"], keep="last"))
@@ -601,6 +645,108 @@ def _series_spans_requested_window(s: pd.Series, start: str, end: str) -> bool:
     if len(first_required) == 0:
         return False
     return monthly.index.min() <= first_required[0] and monthly.index.max() >= first_required[-1]
+
+
+def _better_close_history(
+    current: pd.Series | None,
+    candidate: pd.Series,
+    start: str,
+    end: str,
+) -> bool:
+    cand = candidate.dropna()
+    if cand.empty:
+        return False
+    if current is None:
+        return True
+    cur = current.dropna()
+    if cur.empty:
+        return True
+    if _series_spans_requested_window(cand, start, end) and not _series_spans_requested_window(cur, start, end):
+        return True
+    return cand.index.min() < cur.index.min() or cand.index.max() > cur.index.max() or len(cand) > len(cur)
+
+
+def _patch_partial_close_with_chart(
+    close: pd.DataFrame,
+    start: str,
+    end: str,
+    *,
+    max_workers: int,
+    timeout_seconds: int | None,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    if close.empty:
+        return close, [], []
+    partial = sorted(
+        c for c in close.columns
+        if not _series_spans_requested_window(close[c], start, end)
+    )
+    if not partial:
+        return close, [], []
+    try:
+        chart = _yahoo_chart_download_close_guarded(
+            partial,
+            start,
+            end,
+            max_workers=max_workers,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        return close, [], [f"partial_history_chart_patch_failed: {type(exc).__name__}: {exc}"]
+    if chart.empty:
+        return close, [], ["partial_history_chart_patch_empty"]
+    chart = chart.dropna(axis=1, how="all")
+    if chart.empty:
+        return close, [], ["partial_history_chart_patch_all_nan"]
+    patched = close.copy()
+    improved = []
+    for ticker in sorted(set(partial).intersection(chart.columns)):
+        if _better_close_history(patched[ticker] if ticker in patched else None, chart[ticker], start, end):
+            patched = patched.reindex(patched.index.union(chart[ticker].dropna().index))
+            patched = patched.drop(columns=[ticker], errors="ignore")
+            patched[ticker] = chart[ticker]
+            improved.append(ticker)
+    return patched.sort_index(), improved, []
+
+
+def audit_price_cache_coverage(
+    cache_path: str | Path | None,
+    start: str,
+    end: str,
+    tickers=None,
+) -> pd.DataFrame:
+    """Compare coverage metadata with the actual cached close history."""
+    clean = None
+    if tickers is not None:
+        clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
+    px = _load_price_cache(cache_path, start, end)
+    cov = _load_price_coverage(cache_path)
+    if clean is None:
+        clean = sorted(set(px.columns).union(cov["ticker"].tolist() if not cov.empty else []))
+    rows = []
+    for ticker in clean:
+        s = px[ticker].dropna() if ticker in px else pd.Series(dtype=float)
+        actual_first = s.index.min() if not s.empty else pd.NaT
+        actual_last = s.index.max() if not s.empty else pd.NaT
+        spans = _series_spans_requested_window(s, start, end)
+        c = cov[cov["ticker"].eq(ticker)] if not cov.empty else pd.DataFrame()
+        covering = c[
+            (c["start"] <= pd.Timestamp(start))
+            & (c["end"] >= pd.Timestamp(end))
+        ] if not c.empty else pd.DataFrame()
+        status = ",".join(sorted(covering["status"].dropna().astype(str).unique())) if not covering.empty else ""
+        false_full_coverage = bool(("fetched" in status.split(",")) and not spans)
+        rows.append({
+            "ticker": ticker,
+            "requested_start": pd.Timestamp(start),
+            "requested_end": pd.Timestamp(end),
+            "actual_first_close": actual_first,
+            "actual_last_close": actual_last,
+            "cached_rows": int(len(s)),
+            "actual_spans_requested_window": bool(spans),
+            "coverage_status": status,
+            "false_full_coverage": false_full_coverage,
+        })
+    return pd.DataFrame(rows)
 
 
 def _write_price_cache(cache_path: str | Path | None, px: pd.DataFrame) -> None:
@@ -970,16 +1116,17 @@ def fetch_prices(
     cache_px = _load_price_cache(cache_path, start, end)
     coverage = _load_price_coverage(cache_path)
     coverage_fetched = _coverage_covers(coverage, clean, start, end, statuses=("fetched",))
-    coverage_no_close = _coverage_covers(coverage, clean, start, end, statuses=("no_close",))
+    # Treat cached no_close rows as diagnostics only. Free Yahoo endpoints can
+    # omit individual tickers during partial/rate-limited responses, so this is
+    # not strong enough evidence to skip future download attempts.
+    coverage_no_close: set[str] = set()
     cache_symbol_cols = sorted(set(clean).intersection(cache_px.columns)) if not cache_px.empty else []
     cached_cols = sorted(
         t for t in cache_symbol_cols
-        if (
-            _series_spans_requested_window(cache_px[t], start, end)
-            or (not require_full_window and t in coverage_fetched)
-        )
+        if _series_spans_requested_window(cache_px[t], start, end)
     )
     stale_cached_cols = sorted(set(cache_symbol_cols) - set(cached_cols))
+    false_coverage_cols = sorted(set(stale_cached_cols).intersection(coverage_fetched))
     frames: list[pd.DataFrame] = []
     if cached_cols:
         cached_px = cache_px[cached_cols].dropna(axis=1, how="all")
@@ -993,6 +1140,12 @@ def fetch_prices(
             f"refetching {len(stale_cached_cols)} tickers whose cached history does not cover "
             f"{start} to {end}; sample: {sample}"
         )
+    if false_coverage_cols:
+        sample = ", ".join(false_coverage_cols[:20])
+        print(
+            "  [warn] yfinance cache coverage metadata disagrees with actual cached history for "
+            f"{len(false_coverage_cols)} tickers; refetching; sample: {sample}"
+        )
     if coverage_no_close:
         sample = ", ".join(sorted(coverage_no_close)[:20])
         print(f"  yfinance cache: {len(coverage_no_close)} tickers previously fetched with no close data; sample: {sample}")
@@ -1002,6 +1155,8 @@ def fetch_prices(
     empty_batches: list[str] = []
     empty_batch_tickers: list[list[str]] = []
     chart_failed_batches: list[str] = []
+    partial_history_patched: list[str] = []
+    partial_history_patch_failures: list[str] = []
     used_chart_fallback = False
     consecutive_empty = 0
     n_batches = int(np.ceil(len(todo) / batch_size)) if todo else 0
@@ -1021,9 +1176,28 @@ def fetch_prices(
                         empty_batch_tickers.append(batch)
                         consecutive_empty += 1
                     else:
+                        if use_chart_fallback:
+                            patched_close, improved, patch_failures = _patch_partial_close_with_chart(
+                                non_nan_close,
+                                start,
+                                end,
+                                max_workers=chart_fallback_workers,
+                                timeout_seconds=chart_fallback_batch_timeout_seconds,
+                            )
+                            if improved:
+                                sample = ", ".join(improved[:10])
+                                print(
+                                    "    [warn] yfinance returned partial history; "
+                                    f"patched {len(improved)} tickers via Yahoo Chart; sample: {sample}"
+                                )
+                                non_nan_close = patched_close.dropna(axis=1, how="all")
+                                partial_history_patched.extend(improved)
+                                used_chart_fallback = True
+                            if patch_failures:
+                                partial_history_patch_failures.extend(patch_failures[:5])
                         frames.append(non_nan_close)
                         _write_price_cache(cache_path, non_nan_close)
-                        _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched")
+                        _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched", non_nan_close)
                         no_close_in_batch = sorted(set(batch) - set(non_nan_close.columns))
                         _write_price_coverage(cache_path, no_close_in_batch, start, end, "no_close")
                         consecutive_empty = 0
@@ -1190,6 +1364,8 @@ def fetch_prices(
         "invalid_tickers_skipped": int(dropped),
         "tickers_from_cache": int(len(cached_cols)),
         "tickers_refetched_due_to_incomplete_cache": int(len(stale_cached_cols)),
+        "tickers_refetched_due_to_false_coverage": int(len(false_coverage_cols)),
+        "false_coverage_tickers": false_coverage_cols[:50],
         "tickers_skipped_known_no_close": int(len(coverage_no_close)),
         "used_chart_fallback": bool(used_chart_fallback),
         "yfinance_batch_timeout_seconds": (
@@ -1201,6 +1377,8 @@ def fetch_prices(
         "failed_batches": failed_batches[:10],
         "empty_batches": empty_batches[:10],
         "chart_failed_batches": chart_failed_batches[:10],
+        "partial_history_patched_tickers": sorted(set(partial_history_patched))[:50],
+        "partial_history_patch_failures": partial_history_patch_failures[:10],
     }
     return returns
 

@@ -71,6 +71,35 @@ def test_coarse_prefilter_screens_latest_accession_not_sum_of_amendments():
     assert kept["accession_number"].tolist() == ["orig", "amend"]
 
 
+def test_coarse_prefilter_keeps_all_versions_when_any_accession_passes():
+    holdings = pd.DataFrame(
+        [
+            {
+                "cik": "1",
+                "period_date": pd.Timestamp("2025-03-31"),
+                "filing_date": pd.Timestamp("2025-05-01"),
+                "accession_number": "orig",
+                "cusip": "111111111",
+                "value": 20e9,
+                "sec_type": "SH",
+            },
+            {
+                "cik": "1",
+                "period_date": pd.Timestamp("2025-03-31"),
+                "filing_date": pd.Timestamp("2025-06-15"),
+                "accession_number": "amend-too-large",
+                "cusip": "111111111",
+                "value": 40e9,
+                "sec_type": "SH",
+            },
+        ]
+    )
+
+    kept = coarse_prefilter(holdings, min_aum=1e9, max_aum=30e9, max_holdings=60)
+
+    assert kept["accession_number"].tolist() == ["orig", "amend-too-large"]
+
+
 def test_build_holdings_universe_uses_processed_universe_cache(monkeypatch, tmp_path):
     payload = _zip_with_tsvs(
         {
