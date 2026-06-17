@@ -633,26 +633,7 @@ def _print_rebalance_summary(stats: dict[str, Any]) -> None:
         print(f"  latest multi-class     {multi}")
 
 
-def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_tickers: int = 200) -> pathlib.Path:
-    if mode == "synthetic":
-        holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
-    elif mode == "live-smoke":
-        return run_live_smoke(output_root, cusip_limit=smoke_cusips, ticker_limit=smoke_tickers)
-    else:
-        holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(LIVE_CONFIG)
-
-    print("[2/6] Computing per-manager characteristics")
-    t_step = time.perf_counter()
-    chars = manager_characteristics(holdings, bench_w)
-    print(f"    {len(chars)} manager-filing-version rows in {time.perf_counter() - t_step:.1f}s")
-    t_step = time.perf_counter()
-    visible_cache = build_visible_versions_cache(chars, prices.index)
-    print(f"    {len(visible_cache)} month-end visible-version snapshots in {time.perf_counter() - t_step:.1f}s")
-    security_groups = load_security_groups(
-        prices.columns,
-        LIVE_CONFIG.get("security_overrides_path", "data/security_overrides.csv"),
-    )
-
+def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, int]:
     cfg_a = BacktestConfig(
         universe=UniverseConfig(
             min_aum=1e9,
@@ -681,6 +662,115 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
             use_value_tilt=False,
         ),
         portfolio=PortfolioConfig(idea_signal="level", min_consensus_funds=1, holding_horizon_q=0),
+    )
+    axes = {
+        ("portfolio", "idea_signal"): ["level", "change", "initiation", "active_weight"],
+        ("portfolio", "min_consensus_funds"): [1, 2],
+        ("portfolio", "top_n_ideas"): [5, 8],
+        ("universe", "turnover_quantile"): [0.34, 0.50],
+    }
+    train_m, test_m = 48, 12
+    return cfg_a, cfg_b, axes, train_m, test_m
+
+
+def _print_startup_parameters(
+    *,
+    mode: str,
+    output_root: pathlib.Path,
+    cfg_a: BacktestConfig | None = None,
+    cfg_b: BacktestConfig | None = None,
+    axes: dict | None = None,
+    train_m: int | None = None,
+    test_m: int | None = None,
+    smoke_cusips: int | None = None,
+    smoke_tickers: int | None = None,
+) -> None:
+    print("\nRun Parameters")
+    print(f"  mode                  {mode}")
+    print(f"  output_root           {output_root}")
+    if mode in {"live", "live-smoke"}:
+        print(f"  SEC history start     {LIVE_CONFIG.get('sec_history_start')}")
+        print(f"  price window          {LIVE_CONFIG.get('start')} -> {LIVE_CONFIG.get('end')}")
+        print(f"  benchmark             {LIVE_CONFIG.get('benchmark_ticker')}")
+        print(f"  SEC identity          {LIVE_CONFIG.get('identity')}")
+        print(f"  OpenFIGI key          {'env/config present' if LIVE_CONFIG.get('openfigi_key') or os.environ.get('OPENFIGI_API_KEY') else 'missing'}")
+        print(f"  OpenFIGI cache        {LIVE_CONFIG.get('openfigi_cache_path')}")
+        print(f"  price cache           {LIVE_CONFIG.get('price_cache_path')}")
+        print(f"  security overrides    {LIVE_CONFIG.get('security_overrides_path')}")
+        print(
+            "  live universe         "
+            f"min_aum={LIVE_CONFIG.get('min_aum'):.0f}, "
+            f"max_aum={LIVE_CONFIG.get('max_aum'):.0f}, "
+            f"max_holdings={LIVE_CONFIG.get('max_holdings')}, "
+            f"max_put_weight={LIVE_CONFIG.get('max_put_weight'):.0%}"
+        )
+    if mode == "live-smoke":
+        print(f"  smoke CUSIPs          {smoke_cusips}")
+        print(f"  smoke tickers         {smoke_tickers}")
+    if cfg_a is not None:
+        u = cfg_a.universe
+        p = cfg_a.portfolio
+        c = cfg_a.cost
+        print(
+            "  thesis universe       "
+            f"min_aum={u.min_aum:.0f}, max_aum={u.max_aum:.0f}, "
+            f"max_holdings={u.max_holdings}, min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
+            f"turnover_q={u.turnover_quantile}, min_history_q={u.min_history_quarters}, "
+            f"hedge_put_max={u.hedge_put_max_weight:.0%}, value_tilt_min={u.value_tilt_min_pctl:.0%}"
+        )
+        print(
+            "  thesis portfolio      "
+            f"idea_signal={p.idea_signal}, top_n_ideas={p.top_n_ideas}, "
+            f"min_consensus={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
+            f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
+            f"missing_price_policy={cfg_a.missing_price_policy}, cost={c.bps_per_side:.1f}bps"
+        )
+    if cfg_b is not None:
+        print(
+            "  placebo portfolio     "
+            f"idea_signal={cfg_b.portfolio.idea_signal}, "
+            f"min_consensus={cfg_b.portfolio.min_consensus_funds}, "
+            f"holding_horizon_q={cfg_b.portfolio.holding_horizon_q}"
+        )
+    if axes is not None:
+        axis_text = "; ".join(f"{scope}.{field}={list(values)}" for (scope, field), values in axes.items())
+        print(f"  sweep axes            {axis_text}")
+        print(f"  sweep trials          {int(np.prod([len(v) for v in axes.values()]))}")
+    if train_m is not None and test_m is not None:
+        print(f"  walk-forward          train={train_m}m, test={test_m}m, select_on=active_sharpe")
+    print("")
+
+
+def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_tickers: int = 200) -> pathlib.Path:
+    cfg_a, cfg_b, axes, train_m, test_m = _default_run_configs()
+    _print_startup_parameters(
+        mode=mode,
+        output_root=output_root,
+        cfg_a=None if mode == "live-smoke" else cfg_a,
+        cfg_b=None if mode == "live-smoke" else cfg_b,
+        axes=None if mode == "live-smoke" else axes,
+        train_m=None if mode == "live-smoke" else train_m,
+        test_m=None if mode == "live-smoke" else test_m,
+        smoke_cusips=smoke_cusips,
+        smoke_tickers=smoke_tickers,
+    )
+    if mode == "synthetic":
+        holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
+    elif mode == "live-smoke":
+        return run_live_smoke(output_root, cusip_limit=smoke_cusips, ticker_limit=smoke_tickers)
+    else:
+        holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(LIVE_CONFIG)
+
+    print("[2/6] Computing per-manager characteristics")
+    t_step = time.perf_counter()
+    chars = manager_characteristics(holdings, bench_w)
+    print(f"    {len(chars)} manager-filing-version rows in {time.perf_counter() - t_step:.1f}s")
+    t_step = time.perf_counter()
+    visible_cache = build_visible_versions_cache(chars, prices.index)
+    print(f"    {len(visible_cache)} month-end visible-version snapshots in {time.perf_counter() - t_step:.1f}s")
+    security_groups = load_security_groups(
+        prices.columns,
+        LIVE_CONFIG.get("security_overrides_path", "data/security_overrides.csv"),
     )
 
     print("[3/6] Running thesis and placebo backtests")
@@ -721,12 +811,6 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     print(ablation.to_string(index=False))
 
     print("\n[5/6] Grid eval and walk-forward sweep")
-    axes = {
-        ("portfolio", "idea_signal"): ["level", "change", "initiation", "active_weight"],
-        ("portfolio", "min_consensus_funds"): [1, 2],
-        ("portfolio", "top_n_ideas"): [5, 8],
-        ("universe", "turnover_quantile"): [0.34, 0.50],
-    }
     t_step = time.perf_counter()
     grid = grid_eval(
         holdings,
@@ -746,7 +830,6 @@ def run(mode: str, output_root: pathlib.Path, *, smoke_cusips: int = 300, smoke_
     )
     grid_returns = grid.attrs.get("returns_by_config")
     print(f"  grid eval total time {time.perf_counter() - t_step:.1f}s")
-    train_m, test_m = 48, 12
     required_m = train_m + test_m
     if len(prices) >= required_m:
         oos_ret, wf_log, n_trials = walk_forward(
