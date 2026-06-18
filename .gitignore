@@ -7,6 +7,8 @@ reports/
 artifacts/
 data/processed/manager_classification.*.parquet
 data/processed/manager_classification.*.meta.json
+data/processed/idiosyncratic_vol.*.parquet
+data/processed/idiosyncratic_vol.*.meta.json
 openfigi_cache.parquet
 yfinance_close_cache.parquet
 yfinance_close_cache_coverage.parquet

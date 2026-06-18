@@ -26,6 +26,7 @@ try:
         build_visible_versions_cache,
         manager_characteristics,
         _needs_active_benchmark_weights,
+        _needs_idiosyncratic_vol,
         run_backtest,
         run_backtest_from_selection_cache,
     )
@@ -38,6 +39,7 @@ except ImportError:
         build_visible_versions_cache,
         manager_characteristics,
         _needs_active_benchmark_weights,
+        _needs_idiosyncratic_vol,
         run_backtest,
         run_backtest_from_selection_cache,
     )
@@ -99,6 +101,12 @@ def _manager_filter_kwargs(manager_classification=None, manager_overrides=None) 
     if manager_overrides is not None:
         out["manager_overrides"] = manager_overrides
     return out
+
+
+def _idio_vol_kwargs(cfg: BacktestConfig, idiosyncratic_vol_by_month=None) -> dict:
+    if _needs_idiosyncratic_vol(cfg.portfolio.idea_signal):
+        return {"idiosyncratic_vol_by_month": idiosyncratic_vol_by_month}
+    return {}
 
 
 def _periodic_sharpe(r: pd.Series) -> float:
@@ -253,6 +261,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
               chars=None, visible_versions_cache=None, verbose: bool = False,
               include_returns: bool = False, security_groups=None,
               active_benchmark_weights_by_month=None,
+              idiosyncratic_vol_by_month=None,
               manager_classification=None,
               manager_overrides=None,
               include_factor_metrics: bool | None = None,
@@ -314,6 +323,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
                 active_benchmark_cache,
                 security_groups,
                 capture_rebalance=True,
+                **_idio_vol_kwargs(cfg, idiosyncratic_vol_by_month),
             )
         else:
             ret = run_backtest(
@@ -326,8 +336,9 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
                 visible_versions_cache=visible_cache,
                 security_groups=security_groups,
                 active_benchmark_weights_by_month=active_benchmark_weights_by_month,
-                **_manager_filter_kwargs(manager_classification, manager_overrides),
                 capture_rebalance=True,
+                **_manager_filter_kwargs(manager_classification, manager_overrides),
+                **_idio_vol_kwargs(cfg, idiosyncratic_vol_by_month),
             )
         if include_returns:
             returns_by_config[_label_key(label)] = _without_attrs(ret)
@@ -381,6 +392,7 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                  precomputed_returns: dict[tuple, pd.Series] | None = None,
                  security_groups=None,
                  active_benchmark_weights_by_month=None,
+                 idiosyncratic_vol_by_month=None,
                  manager_classification=None,
                  manager_overrides=None):
     """Rolling OOS. Returns (oos_returns, fold_log, n_trials)."""
@@ -422,6 +434,7 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                     security_groups=security_groups,
                     active_benchmark_weights_by_month=active_benchmark_weights_by_month,
                     **_manager_filter_kwargs(manager_classification, manager_overrides),
+                    **_idio_vol_kwargs(cfg, idiosyncratic_vol_by_month),
                 )
             sc = _periodic_sharpe(_score_series(ret, benchmark.reindex(tr) if benchmark is not None else None, select_on))
             if verbose:
@@ -445,6 +458,7 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                 security_groups=security_groups,
                 active_benchmark_weights_by_month=active_benchmark_weights_by_month,
                 **_manager_filter_kwargs(manager_classification, manager_overrides),
+                **_idio_vol_kwargs(best, idiosyncratic_vol_by_month),
             ).reindex(te)
             te_ret = _without_attrs(te_ret)
         if verbose:

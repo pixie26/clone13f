@@ -28,7 +28,9 @@ from engine import (
     PortfolioConfig,
     UniverseConfig,
     _needs_active_benchmark_weights,
+    _needs_idiosyncratic_vol,
     attribution,
+    build_idiosyncratic_vol_cache,
     build_visible_versions_cache,
     manager_characteristics,
     marginal_ir,
@@ -72,6 +74,13 @@ LIVE_CONFIG = {
     "active_benchmark_source": "visible_13f_aggregate",
     "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
     "active_benchmark_max_stale_days": 45,
+    "idio_vol_cache_dir": "data/processed",
+    "idio_vol_window_months": 24,
+    "idio_vol_min_obs": 24,
+    "idio_vol_floor": 0.10,
+    "idio_vol_cap": 0.80,
+    "idio_vol_winsor_lower": 0.05,
+    "idio_vol_winsor_upper": 0.95,
 }
 
 
@@ -511,6 +520,11 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
                 if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
                 else None
             ),
+            "cps_ir_signal": _needs_idiosyncratic_vol(cfg.portfolio.idea_signal),
+            "cps_ir_method_note": (
+                "positive active overweight times PIT trailing CAPM residual vol; "
+                "24m/default floor/cap/winsor settings are heuristic guardrails"
+            ),
         },
     }
 
@@ -555,7 +569,8 @@ def _dashboard_parameter_summary(
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
             f"min_portfolio_names={p.min_portfolio_names}, "
             f"min_active_weight_holdings={p.min_active_weight_holdings}, "
-            f"active_benchmark={cfg.active_benchmark_source}"
+            f"active_benchmark={cfg.active_benchmark_source}, "
+            f"cps_idio_vol=CAPM 24m heuristic floor/cap/winsor"
         ),
         "Execution/cost": (
             f"rebalance=month-end after filing_date visibility, missing_price_policy={cfg.missing_price_policy}, "
@@ -585,6 +600,7 @@ def write_rebalance_outputs(
     visible_versions_cache=None,
     security_groups=None,
     active_benchmark_weights_by_month=None,
+    idiosyncratic_vol_by_month=None,
     manager_classification=None,
     manager_overrides=None,
 ) -> dict[str, Any]:
@@ -600,6 +616,7 @@ def write_rebalance_outputs(
         active_benchmark_weights_by_month=active_benchmark_weights_by_month,
         manager_classification=manager_classification,
         manager_overrides=manager_overrides,
+        idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
     )
     outputs: dict[str, str] = {}
     for name, df in trace.items():
@@ -783,6 +800,173 @@ def _read_manager_classification_cache(cache_path: pathlib.Path, meta_path: path
     return classification
 
 
+def _signals_need_idiosyncratic_vol(cfgs: list[BacktestConfig], axes: dict | None = None) -> bool:
+    for cfg in cfgs:
+        if cfg is not None and _needs_idiosyncratic_vol(cfg.portfolio.idea_signal):
+            return True
+    if axes:
+        for (scope, field), values in axes.items():
+            if scope == "portfolio" and field == "idea_signal":
+                if any(_needs_idiosyncratic_vol(str(v)) for v in values):
+                    return True
+    return False
+
+
+def _idio_vol_cache_key(
+    *,
+    prices: pd.DataFrame,
+    factors: pd.DataFrame,
+    months,
+    live_config: dict,
+) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "schema_version": 1,
+        "engine_py": _file_hash("engine.py"),
+        "prices_hash": _hash_matrix_for_cache(prices),
+        "factors_hash": _hash_matrix_for_cache(factors),
+        "months_hash": _hash_matrix_for_cache(pd.DataFrame(index=pd.Index(pd.to_datetime(months)), data={"x": 1})),
+        "window_months": int(live_config.get("idio_vol_window_months", 24)),
+        "min_obs": int(live_config.get("idio_vol_min_obs", 24)),
+        "floor": float(live_config.get("idio_vol_floor", 0.10)),
+        "cap": float(live_config.get("idio_vol_cap", 0.80)),
+        "winsor_lower": float(live_config.get("idio_vol_winsor_lower", 0.05)),
+        "winsor_upper": float(live_config.get("idio_vol_winsor_upper", 0.95)),
+        "model": "capm",
+        "pit_rule": "uses returns strictly before asof month",
+    }
+    key = hashlib.sha256(json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")).hexdigest()[:16]
+    return key, payload
+
+
+def _idio_vol_cache_to_frame(cache: dict[pd.Timestamp, pd.Series]) -> pd.DataFrame:
+    rows = []
+    for month, vol in sorted(cache.items()):
+        s = pd.Series(vol, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+        for ticker, value in s.items():
+            rows.append({
+                "month_end": pd.Timestamp(month).to_period("M").to_timestamp("M"),
+                "ticker": str(ticker).upper(),
+                "idio_vol": float(value),
+            })
+    return pd.DataFrame(rows, columns=["month_end", "ticker", "idio_vol"])
+
+
+def _idio_vol_frame_to_cache(frame: pd.DataFrame) -> dict[pd.Timestamp, pd.Series]:
+    if frame is None or frame.empty:
+        return {}
+    work = frame.copy()
+    work["month_end"] = pd.to_datetime(work["month_end"]).dt.to_period("M").dt.to_timestamp("M")
+    work["ticker"] = work["ticker"].astype(str).str.upper()
+    work["idio_vol"] = pd.to_numeric(work["idio_vol"], errors="coerce")
+    work = work.dropna(subset=["month_end", "ticker", "idio_vol"])
+    out: dict[pd.Timestamp, pd.Series] = {}
+    for month, sub in work.groupby("month_end", sort=True):
+        s = sub.groupby("ticker")["idio_vol"].last().astype(float)
+        out[pd.Timestamp(month)] = s[s > 0].sort_index()
+    return out
+
+
+def _idio_vol_summary(
+    cache: dict[pd.Timestamp, pd.Series],
+    *,
+    prices: pd.DataFrame,
+    cache_hit: bool,
+    cache_path: pathlib.Path,
+    meta_path: pathlib.Path,
+    cache_key: str,
+    cache_key_payload: dict[str, Any],
+    elapsed_sec: float,
+) -> dict[str, Any]:
+    month_counts = pd.Series({pd.Timestamp(k): len(v) for k, v in cache.items()}, dtype=float)
+    requested = int(len(prices.columns))
+    avg_coverage = float((month_counts / requested).mean()) if requested and len(month_counts) else 0.0
+    return {
+        "model": "capm",
+        "window_months": int(cache_key_payload["window_months"]),
+        "min_obs": int(cache_key_payload["min_obs"]),
+        "floor": float(cache_key_payload["floor"]),
+        "cap": float(cache_key_payload["cap"]),
+        "winsor_lower": float(cache_key_payload["winsor_lower"]),
+        "winsor_upper": float(cache_key_payload["winsor_upper"]),
+        "method_note": "24m window and vol floor/cap/winsorization are pragmatic guardrails, not academic calibration.",
+        "cache_key": cache_key,
+        "cache_hit": bool(cache_hit),
+        "cache_path": str(cache_path),
+        "cache_meta_path": str(meta_path),
+        "cache_key_payload": cache_key_payload,
+        "elapsed_sec": float(elapsed_sec),
+        "months": int(len(cache)),
+        "avg_ticker_coverage_frac": avg_coverage,
+        "min_tickers": int(month_counts.min()) if len(month_counts) else 0,
+        "median_tickers": float(month_counts.median()) if len(month_counts) else 0.0,
+        "max_tickers": int(month_counts.max()) if len(month_counts) else 0,
+    }
+
+
+def _idiosyncratic_vol_artifacts(
+    *,
+    prices: pd.DataFrame,
+    factors: pd.DataFrame,
+    months,
+    live_config: dict,
+    required: bool,
+) -> tuple[dict[pd.Timestamp, pd.Series] | None, dict[str, Any]]:
+    if not required:
+        return None, {"required": False, "note": "no CPS-IR signal requested"}
+    t0 = time.perf_counter()
+    cache_key, cache_key_payload = _idio_vol_cache_key(
+        prices=prices,
+        factors=factors,
+        months=months,
+        live_config=live_config,
+    )
+    cache_dir = pathlib.Path(live_config.get("idio_vol_cache_dir", "data/processed"))
+    cache_path = cache_dir / f"idiosyncratic_vol.{cache_key}.parquet"
+    meta_path = cache_dir / f"idiosyncratic_vol.{cache_key}.meta.json"
+    cache_hit = cache_path.exists() and meta_path.exists()
+    if cache_hit:
+        print(f"  idio-vol cache hit: {cache_path}")
+        frame = pd.read_parquet(cache_path)
+        cache = _idio_vol_frame_to_cache(frame)
+    else:
+        print(f"  idio-vol cache miss: {cache_path}")
+        cache = build_idiosyncratic_vol_cache(
+            prices,
+            factors,
+            months,
+            window_months=int(live_config.get("idio_vol_window_months", 24)),
+            min_obs=int(live_config.get("idio_vol_min_obs", 24)),
+            floor=float(live_config.get("idio_vol_floor", 0.10)),
+            cap=float(live_config.get("idio_vol_cap", 0.80)),
+            winsor_lower=float(live_config.get("idio_vol_winsor_lower", 0.05)),
+            winsor_upper=float(live_config.get("idio_vol_winsor_upper", 0.95)),
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _idio_vol_cache_to_frame(cache).to_parquet(cache_path, index=False)
+        meta_path.write_text(
+            json.dumps({"cache_key_payload": cache_key_payload}, indent=2, sort_keys=True, default=_json_default),
+            encoding="utf-8",
+        )
+    summary = _idio_vol_summary(
+        cache,
+        prices=prices,
+        cache_hit=cache_hit,
+        cache_path=cache_path,
+        meta_path=meta_path,
+        cache_key=cache_key,
+        cache_key_payload=cache_key_payload,
+        elapsed_sec=time.perf_counter() - t0,
+    )
+    print(
+        "  idio-vol cache: "
+        f"months={summary['months']} median_tickers={summary['median_tickers']:.0f} "
+        f"avg_coverage={summary['avg_ticker_coverage_frac']:.1%} "
+        f"({'hit' if cache_hit else 'built'}) in {summary['elapsed_sec']:.1f}s"
+    )
+    print("  [info] idio-vol method: 24m CAPM residual vol; floor/cap/winsor settings are heuristic guardrails")
+    return cache, summary
+
+
 def _manager_filter_artifacts(
     *,
     out_dir: pathlib.Path,
@@ -928,6 +1112,7 @@ def write_manager_filter_acceptance(
     visible_versions_cache=None,
     security_groups=None,
     active_benchmark_weights_by_month=None,
+    idiosyncratic_vol_by_month=None,
     manager_classification=None,
     manager_overrides=None,
 ) -> dict[str, Any]:
@@ -946,6 +1131,7 @@ def write_manager_filter_acceptance(
             active_benchmark_weights_by_month,
             manager_classification,
             manager_overrides,
+            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
         )
         trace = rebalance_trace(
             holdings,
@@ -959,6 +1145,7 @@ def write_manager_filter_acceptance(
             active_benchmark_weights_by_month=active_benchmark_weights_by_month,
             manager_classification=manager_classification,
             manager_overrides=manager_overrides,
+            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
         )
         att = attribution(ret, factors, benchmark)
         diag = _trace_core_diagnostics(trace)
@@ -1265,6 +1452,9 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             "active_weight",
             "active_weight_change",
             "active_weight_initiation",
+            "cps_ir",
+            "cps_ir_change",
+            "cps_ir_initiation",
         ],
         ("portfolio", "top_n_ideas"): [5, 10],
         ("portfolio", "min_consensus_funds"): [2, 5],
@@ -1315,6 +1505,7 @@ def _print_startup_parameters(
         print(f"  price cache           {live_cfg.get('price_cache_path')}")
         print(f"  price source          {price_source or live_cfg.get('price_source')}")
         print(f"  security overrides    {live_cfg.get('security_overrides_path')}")
+        print(f"  exclude fund-like     {live_cfg.get('exclude_fund_like_holdings')}")
         print(f"  active benchmark      {live_cfg.get('active_benchmark_source')}")
         if live_cfg.get("active_benchmark_source") not in {"visible_13f_aggregate", "13f_aggregate"}:
             print(f"  active bench weights  {live_cfg.get('active_benchmark_weights_path')}")
@@ -1355,6 +1546,14 @@ def _print_startup_parameters(
             f"missing_price_policy={cfg_a.missing_price_policy}, cost={c.bps_per_side:.1f}bps"
         )
         print(f"  thesis active bench   {cfg_a.active_benchmark_source}")
+        print(
+            "  CPS idio vol          "
+            f"model=capm, window={live_cfg.get('idio_vol_window_months')}m, "
+            f"min_obs={live_cfg.get('idio_vol_min_obs')}, "
+            f"floor={live_cfg.get('idio_vol_floor'):.0%}, cap={live_cfg.get('idio_vol_cap'):.0%}, "
+            f"winsor={live_cfg.get('idio_vol_winsor_lower'):.0%}/{live_cfg.get('idio_vol_winsor_upper'):.0%} "
+            "(heuristic)"
+        )
     if cfg_b is not None:
         print(
             "  placebo portfolio     "
@@ -1477,6 +1676,13 @@ def run(
         months=prices.index,
         cfg=cfg_a,
     )
+    idiosyncratic_vol_by_month, idio_vol_summary = _idiosyncratic_vol_artifacts(
+        prices=prices,
+        factors=factors,
+        months=prices.index,
+        live_config=live_config,
+        required=_signals_need_idiosyncratic_vol([cfg_a, cfg_b], None if skip_sweep else axes),
+    )
 
     print("[3/6] Running thesis and placebo backtests")
     t_step = time.perf_counter()
@@ -1494,6 +1700,7 @@ def run(
         manager_classification,
         manager_overrides,
         capture_rebalance=True,
+        idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
     )
     print(f"    thesis backtest done in {time.perf_counter() - t_step:.1f}s")
     t_placebo = time.perf_counter()
@@ -1510,6 +1717,7 @@ def run(
         active_benchmark_weights_by_month,
         manager_classification,
         manager_overrides,
+        idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
     )
     print(f"    placebo backtest done in {time.perf_counter() - t_placebo:.1f}s")
     print("    attribution running")
@@ -1585,6 +1793,7 @@ def run(
         visible_versions_cache=visible_cache,
         security_groups=security_groups,
         active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+        idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
         manager_classification=manager_classification,
         manager_overrides=manager_overrides,
     )
@@ -1607,6 +1816,7 @@ def run(
             visible_versions_cache=visible_cache,
             security_groups=security_groups,
             active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
             manager_classification=manager_classification,
             manager_overrides=manager_overrides,
             verbose=True,
@@ -1650,6 +1860,7 @@ def run(
             include_returns=True,
             security_groups=security_groups,
             active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
             manager_classification=manager_classification,
             manager_overrides=manager_overrides,
             checkpoint_dir=out_dir,
@@ -1676,6 +1887,7 @@ def run(
             precomputed_returns=grid_returns,
             security_groups=security_groups,
             active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
             manager_classification=manager_classification,
             manager_overrides=manager_overrides,
         )
@@ -1755,6 +1967,7 @@ def run(
         visible_versions_cache=visible_cache,
         security_groups=security_groups,
         active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+        idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
         manager_classification=manager_classification,
         manager_overrides=manager_overrides,
     )
@@ -1802,6 +2015,7 @@ def run(
             },
             "manager_classification": manager_classification_summary,
             "manager_filter_acceptance": manager_filter_acceptance,
+            "idiosyncratic_vol": idio_vol_summary,
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
         "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),
@@ -1846,7 +2060,7 @@ def parse_args() -> argparse.Namespace:
         "--active-benchmark-source",
         choices=["visible_13f_aggregate", "spy_holdings"],
         default=None,
-        help="Benchmark used for active_weight signals. Live default is visible_13f_aggregate.",
+        help="Benchmark used for active_weight/CPS-IR signals. visible_13f_aggregate is a diagnostic peer-13F proxy.",
     )
     parser.add_argument(
         "--active-benchmark-weights",

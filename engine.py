@@ -117,8 +117,24 @@ def _aggregate_book_weights(books) -> pd.Series:
     return total / total.sum() if total.sum() > 0 else total
 
 
+_ACTIVE_WEIGHT_SIGNALS = {
+    "active_weight",
+    "active_weight_change",
+    "active_weight_initiation",
+}
+_CPS_IR_SIGNALS = {
+    "cps_ir",
+    "cps_ir_change",
+    "cps_ir_initiation",
+}
+
+
 def _needs_active_benchmark_weights(idea_signal: str) -> bool:
-    return idea_signal in {"active_weight", "active_weight_change", "active_weight_initiation"}
+    return idea_signal in _ACTIVE_WEIGHT_SIGNALS or idea_signal in _CPS_IR_SIGNALS
+
+
+def _needs_idiosyncratic_vol(idea_signal: str) -> bool:
+    return idea_signal in _CPS_IR_SIGNALS
 
 
 def _active_benchmark_source(cfg: BacktestConfig | str | None) -> str:
@@ -173,6 +189,152 @@ def _require_active_benchmark_weights(
     if bench.empty or bench.sum() <= 0:
         raise ValueError(f"{cfg.idea_signal} requires positive PIT active_benchmark_weights")
     return bench / bench.sum()
+
+
+def _require_idiosyncratic_vol(
+    cfg: PortfolioConfig,
+    idiosyncratic_vol: pd.Series | None,
+) -> pd.Series | None:
+    if not _needs_idiosyncratic_vol(cfg.idea_signal):
+        return None
+    if idiosyncratic_vol is None:
+        raise ValueError(
+            f"{cfg.idea_signal} requires PIT idiosyncratic_vol_by_month; "
+            "do not fill missing residual-vol coverage with zero."
+        )
+    if len(idiosyncratic_vol) == 0:
+        return pd.Series(dtype=float)
+    vol = pd.Series(idiosyncratic_vol, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    vol = vol[vol > 0]
+    if vol.empty:
+        raise ValueError(f"{cfg.idea_signal} requires positive PIT idiosyncratic volatility")
+    return vol
+
+
+def _idiosyncratic_vol_for_month(
+    cfg: BacktestConfig,
+    month,
+    idiosyncratic_vol_by_month: dict[pd.Timestamp, pd.Series] | None = None,
+) -> pd.Series | None:
+    if not _needs_idiosyncratic_vol(cfg.portfolio.idea_signal):
+        return None
+    if idiosyncratic_vol_by_month is None:
+        raise ValueError(
+            f"{cfg.portfolio.idea_signal} requires idiosyncratic_vol_by_month; "
+            "build a PIT residual-vol cache before running CPS-IR signals."
+        )
+    vol = idiosyncratic_vol_by_month.get(pd.Timestamp(month))
+    if vol is None:
+        raise ValueError(f"{cfg.portfolio.idea_signal} has no idiosyncratic vol for {pd.Timestamp(month).date()}")
+    return vol
+
+
+def _capm_residual_vol_window(
+    returns_window: pd.DataFrame,
+    factors_window: pd.DataFrame,
+    *,
+    min_obs: int,
+) -> pd.Series:
+    """Vectorized CAPM residual volatility for one trailing window.
+
+    The input returns are monthly returns. The output is annualized residual
+    volatility. Missing ticker-month returns are left missing and each ticker
+    must independently pass min_obs.
+    """
+    if returns_window.empty or "MKT" not in factors_window:
+        return pd.Series(dtype=float)
+    y = returns_window.astype(float)
+    f = factors_window.reindex(y.index).copy()
+    x = pd.to_numeric(f["MKT"], errors="coerce")
+    rf = pd.to_numeric(f["RF"], errors="coerce") if "RF" in f else pd.Series(0.0, index=f.index)
+    y = y.sub(rf, axis=0)
+
+    valid = y.notna() & x.notna().to_numpy()[:, None]
+    n = valid.sum(axis=0).astype(float)
+    enough = n >= int(min_obs)
+    if not bool(enough.any()):
+        return pd.Series(dtype=float)
+
+    x_arr = x.to_numpy(dtype=float)
+    x_df = pd.DataFrame(
+        np.repeat(x_arr[:, None], y.shape[1], axis=1),
+        index=y.index,
+        columns=y.columns,
+    )
+    x_masked = x_df.where(valid)
+    y_masked = y.where(valid)
+    x_mean = x_masked.sum(axis=0) / n
+    y_mean = y_masked.sum(axis=0) / n
+    xy_mean = (x_masked * y_masked).sum(axis=0) / n
+    xx_mean = (x_masked * x_masked).sum(axis=0) / n
+    x_var = xx_mean - x_mean * x_mean
+    usable = enough & x_var.gt(0)
+    if not bool(usable.any()):
+        return pd.Series(dtype=float)
+
+    beta = (xy_mean - x_mean * y_mean) / x_var
+    alpha = y_mean - beta * x_mean
+    fitted = x_df.mul(beta, axis=1).add(alpha, axis=1)
+    resid = (y - fitted).where(valid)
+    vol = resid.std(axis=0, skipna=True, ddof=2) * np.sqrt(12)
+    return vol[usable.reindex(vol.index).fillna(False)].replace([np.inf, -np.inf], np.nan).dropna()
+
+
+def build_idiosyncratic_vol_cache(
+    prices: pd.DataFrame,
+    factors: pd.DataFrame,
+    months=None,
+    *,
+    window_months: int = 24,
+    min_obs: int = 24,
+    floor: float = 0.10,
+    cap: float = 0.80,
+    winsor_lower: float = 0.05,
+    winsor_upper: float = 0.95,
+) -> dict[pd.Timestamp, pd.Series]:
+    """Build month -> PIT CAPM residual-vol series for CPS-style idea ranking.
+
+    Uses only returns strictly before each month. The 24-month default and
+    floor/cap/winsorization are pragmatic guardrails, not calibrated academic
+    constants; they are surfaced in run manifests.
+    """
+    if factors is None or factors.empty or "MKT" not in factors:
+        raise ValueError("CAPM idiosyncratic vol requires factors with an MKT column")
+    rets = prices.replace([np.inf, -np.inf], np.nan).copy()
+    rets.index = pd.to_datetime(rets.index).to_period("M").to_timestamp("M")
+    rets = rets.sort_index()
+    fac = factors.replace([np.inf, -np.inf], np.nan).copy()
+    fac.index = pd.to_datetime(fac.index).to_period("M").to_timestamp("M")
+    fac = fac.sort_index()
+    if months is None:
+        month_index = rets.index
+    else:
+        month_index = pd.Index(pd.to_datetime(months)).to_period("M").to_timestamp("M").sort_values()
+    out: dict[pd.Timestamp, pd.Series] = {}
+    for month in month_index:
+        hist_idx = rets.index[rets.index < pd.Timestamp(month)]
+        if len(hist_idx) <= 0:
+            out[pd.Timestamp(month)] = pd.Series(dtype=float)
+            continue
+        hist_idx = hist_idx[-int(window_months):]
+        vol = _capm_residual_vol_window(
+            rets.loc[hist_idx],
+            fac.reindex(hist_idx),
+            min_obs=int(min_obs),
+        )
+        if not vol.empty:
+            if winsor_lower is not None and winsor_upper is not None and len(vol) >= 5:
+                lo = vol.quantile(float(winsor_lower))
+                hi = vol.quantile(float(winsor_upper))
+                if pd.notna(lo) and pd.notna(hi) and hi >= lo:
+                    vol = vol.clip(lower=float(lo), upper=float(hi))
+            if floor is not None:
+                vol = vol.clip(lower=float(floor))
+            if cap is not None:
+                vol = vol.clip(upper=float(cap))
+            vol = vol[vol > 0]
+        out[pd.Timestamp(month)] = vol.sort_index()
+    return out
 
 
 def _versioned_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
@@ -473,6 +635,7 @@ def _idea_scores(
     prev: pd.Series | None,
     cfg: PortfolioConfig,
     active_benchmark_weights: pd.Series | None = None,
+    idiosyncratic_vol: pd.Series | None = None,
     eligible_tickers=None,
 ) -> pd.Series:
     if eligible_tickers is not None:
@@ -508,6 +671,24 @@ def _idea_scores(
         elif cfg.idea_signal == "active_weight_initiation":
             new = cur.index.difference(prev.index) if prev is not None else cur.index
             s = active_cur.reindex(new).fillna(0.0)
+        elif _needs_idiosyncratic_vol(cfg.idea_signal):
+            vol = _require_idiosyncratic_vol(cfg, idiosyncratic_vol)
+            cps_score = (active_cur * vol.reindex(active_cur.index)).replace([np.inf, -np.inf], np.nan).dropna()
+            cps_score = cps_score[cps_score > 0]
+            if cfg.idea_signal == "cps_ir":
+                s = cps_score
+            elif cfg.idea_signal == "cps_ir_change":
+                if prev is None:
+                    s = cps_score
+                else:
+                    alln = cur.index.union(prev.index)
+                    inc = (cur.reindex(alln).fillna(0.0) - prev.reindex(alln).fillna(0.0)).clip(lower=0)
+                    s = cps_score[(inc.reindex(cps_score.index).fillna(0.0) > 0) & (cps_score > 0)]
+            elif cfg.idea_signal == "cps_ir_initiation":
+                new = cur.index.difference(prev.index) if prev is not None else cur.index
+                s = cps_score.reindex(new).dropna()
+            else:
+                raise ValueError(cfg.idea_signal)
     else:
         raise ValueError(cfg.idea_signal)
     return s[s > 0].sort_values(ascending=False).head(cfg.top_n_ideas)
@@ -517,6 +698,7 @@ def target_weights_from_versions(
     latest_versions: pd.DataFrame,
     cfg: PortfolioConfig,
     active_benchmark_weights: pd.Series | None = None,
+    idiosyncratic_vol: pd.Series | None = None,
     eligible_tickers=None,
     return_diagnostics: bool = False,
 ) -> pd.Series:
@@ -528,11 +710,15 @@ def target_weights_from_versions(
         "raw_idea_names": 0,
         "consensus_idea_names": 0,
         "target_names_before_caps": 0,
+        "idio_vol_covered_names": 0,
     }
     if latest_versions.empty:
         empty = pd.Series(dtype=float)
         return (empty, diagnostics) if return_diagnostics else empty
     active_benchmark_weights = _require_active_benchmark_weights(cfg, active_benchmark_weights)
+    idiosyncratic_vol = _require_idiosyncratic_vol(cfg, idiosyncratic_vol)
+    if idiosyncratic_vol is not None:
+        diagnostics["idio_vol_covered_names"] = int(len(idiosyncratic_vol))
     score: dict[str, float] = {}
     count: dict[str, int] = {}
     for cur_row in latest_versions.itertuples(index=False):
@@ -544,7 +730,7 @@ def target_weights_from_versions(
             cur_diag = cur[cur.index.astype(str).str.upper().isin(eligible)]
         if _needs_active_benchmark_weights(cfg.idea_signal) and int((cur_diag > 0).sum()) >= cfg.min_active_weight_holdings:
             diagnostics["active_eligible_managers"] += 1
-        picks = _idea_scores(cur, prev, cfg, active_benchmark_weights, eligible_tickers)
+        picks = _idea_scores(cur, prev, cfg, active_benchmark_weights, idiosyncratic_vol, eligible_tickers)
         if picks.empty:
             diagnostics["zero_contributor_managers"] += 1
         diagnostics["raw_idea_rows"] += int(len(picks))
@@ -756,7 +942,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                     security_groups=None,
                     active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None,
                     manager_classification: pd.DataFrame | None = None,
-                    manager_overrides: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
+                    manager_overrides: pd.DataFrame | None = None,
+                    idiosyncratic_vol_by_month: dict[pd.Timestamp, pd.Series] | None = None) -> dict[str, pd.DataFrame]:
     """Return auditable rebalance summary, holdings, and manager-selection tables."""
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
@@ -784,6 +971,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             latest_versions,
             active_benchmark_weights_by_month,
         )
+        idiosyncratic_vol = _idiosyncratic_vol_for_month(cfg, m, idiosyncratic_vol_by_month)
         selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
         selected_versions = _apply_manager_type_filter(
             selected_versions,
@@ -814,6 +1002,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             selected_versions,
             cfg.portfolio,
             active_benchmark_weights,
+            idiosyncratic_vol,
             eligible_tickers=priced_now,
             return_diagnostics=True,
         )
@@ -840,6 +1029,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                 "target_names": int(len(tgt)),
                 "target_names_before_price_filter": target_names_before_price_filter,
                 "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
+                "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
                 "effective_names": int(len(eff)),
                 "carried_names": 0,
                 "valid_rebalance": False,
@@ -876,6 +1066,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             "target_names": int(len(tgt)),
             "target_names_before_price_filter": target_names_before_price_filter,
             "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
+            "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
             "effective_names": int(len(eff)),
             "carried_names": int(len(carried)),
             "valid_rebalance": True,
@@ -918,7 +1109,8 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                  manager_overrides: pd.DataFrame | None = None,
                  progress_label: str | None = None,
                  progress_every: int = 10,
-                 capture_rebalance: bool = False) -> pd.Series:
+                 capture_rebalance: bool = False,
+                 idiosyncratic_vol_by_month: dict[pd.Timestamp, pd.Series] | None = None) -> pd.Series:
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
     months = prices.index.sort_values()
@@ -947,6 +1139,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 latest_versions,
                 active_benchmark_weights_by_month,
             )
+            idiosyncratic_vol = _idiosyncratic_vol_for_month(cfg, m, idiosyncratic_vol_by_month)
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
             selected_versions = _apply_manager_type_filter(
                 selected_versions,
@@ -961,6 +1154,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 selected_versions,
                 cfg.portfolio,
                 active_benchmark_weights,
+                idiosyncratic_vol,
                 eligible_tickers=priced_now,
                 return_diagnostics=True,
             )
@@ -999,6 +1193,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                     "target_names": int(len(tgt)),
                     "target_names_before_price_filter": int(target_names_before_price_filter),
                     "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
+                    "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
                     "effective_names": int(len(cur)),
                     "valid_rebalance": not bool(invalid_reason),
                     "turnover_one_way": float(traded),
@@ -1104,6 +1299,7 @@ def run_backtest_from_selection_cache(
     progress_label: str | None = None,
     progress_every: int = 10,
     capture_rebalance: bool = False,
+    idiosyncratic_vol_by_month: dict[pd.Timestamp, pd.Series] | None = None,
 ) -> pd.Series:
     """Run the monthly portfolio simulation from precomputed PIT selections."""
     months = prices.index.sort_values()
@@ -1129,11 +1325,13 @@ def run_backtest_from_selection_cache(
             if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
                 if active_benchmark_weights_by_month is not None:
                     active_benchmark_weights = active_benchmark_weights_by_month.get(month)
+            idiosyncratic_vol = _idiosyncratic_vol_for_month(cfg, month, idiosyncratic_vol_by_month)
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt, idea_diag = target_weights_from_versions(
                 selected_versions,
                 cfg.portfolio,
                 active_benchmark_weights,
+                idiosyncratic_vol,
                 eligible_tickers=priced_now,
                 return_diagnostics=True,
             )
@@ -1172,6 +1370,7 @@ def run_backtest_from_selection_cache(
                     "target_names": int(len(tgt)),
                     "target_names_before_price_filter": int(target_names_before_price_filter),
                     "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
+                    "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
                     "effective_names": int(len(cur)),
                     "valid_rebalance": not bool(invalid_reason),
                     "turnover_one_way": float(traded),
@@ -1274,7 +1473,8 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
                 active_benchmark_weights_by_month=None,
                 manager_classification: pd.DataFrame | None = None,
                 manager_overrides: pd.DataFrame | None = None,
-                verbose: bool = False):
+                verbose: bool = False,
+                idiosyncratic_vol_by_month=None):
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
     visible_cache = visible_versions_cache if visible_versions_cache is not None else build_visible_versions_cache(ch, prices.index)
     if verbose:
@@ -1292,6 +1492,7 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
         active_benchmark_weights_by_month,
         manager_classification,
         manager_overrides,
+        idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
         progress_label="marginal-ir full stack" if verbose else None,
     )
     bm = _active_ir_metric(base_ret, benchmark)
@@ -1326,6 +1527,7 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
             active_benchmark_weights_by_month,
             manager_classification,
             manager_overrides,
+            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
             progress_label=f"marginal-ir -{t}" if verbose else None,
         )
         m = _active_ir_metric(ret, benchmark)

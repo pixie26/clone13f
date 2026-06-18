@@ -359,6 +359,179 @@ def test_active_weight_initiation_uses_new_positive_overweights_only():
     assert target.loc["C"] == pytest.approx(1.0)
 
 
+def test_cps_ir_scores_positive_overweight_times_idio_vol():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.12, "B": 0.11, "C": 0.77}),
+                "prev_bw": None,
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.10, "C": 0.80})
+    idio_vol = pd.Series({"A": 0.20, "B": 0.80, "C": 0.40})
+    cfg = PortfolioConfig(
+        idea_signal="cps_ir",
+        top_n_ideas=1,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark, idio_vol)
+
+    assert target.index.tolist() == ["B"]
+    assert target.loc["B"] == pytest.approx(1.0)
+
+
+def test_cps_ir_change_requires_positive_increase_and_overweight():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.20, "B": 0.21, "C": 0.59}),
+                "prev_bw": pd.Series({"A": 0.10, "B": 0.22, "C": 0.68}),
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.10, "C": 0.80})
+    idio_vol = pd.Series({"A": 0.20, "B": 0.80, "C": 0.40})
+    cfg = PortfolioConfig(
+        idea_signal="cps_ir_change",
+        top_n_ideas=2,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark, idio_vol)
+
+    assert target.index.tolist() == ["A"]
+
+
+def test_cps_ir_initiation_requires_new_positive_overweight():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.20, "B": 0.30, "C": 0.50}),
+                "prev_bw": pd.Series({"A": 0.50, "C": 0.50}),
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.10, "C": 0.80})
+    idio_vol = pd.Series({"A": 0.80, "B": 0.20, "C": 0.40})
+    cfg = PortfolioConfig(
+        idea_signal="cps_ir_initiation",
+        top_n_ideas=2,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg, benchmark, idio_vol)
+
+    assert target.index.tolist() == ["B"]
+
+
+def test_cps_ir_requires_idiosyncratic_vol_not_zero_fill():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2020-03-31"),
+                "filing_date": pd.Timestamp("2020-05-15"),
+                "accession_number": "a1",
+                "bw": pd.Series({"A": 0.20, "B": 0.30, "C": 0.50}),
+                "prev_bw": None,
+            }
+        ]
+    )
+    benchmark = pd.Series({"A": 0.10, "B": 0.10, "C": 0.80})
+    cfg = PortfolioConfig(
+        idea_signal="cps_ir",
+        top_n_ideas=1,
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+        min_active_weight_holdings=3,
+    )
+
+    with pytest.raises(ValueError, match="requires PIT idiosyncratic_vol_by_month"):
+        target_weights_from_versions(latest_versions, cfg, benchmark)
+
+
+def test_idiosyncratic_vol_cache_uses_only_months_before_asof():
+    idx = pd.date_range("2020-01-31", periods=30, freq="ME")
+    factors = pd.DataFrame(
+        {
+            "MKT": np.linspace(-0.03, 0.04, len(idx)),
+            "RF": [0.001] * len(idx),
+        },
+        index=idx,
+    )
+    returns = pd.DataFrame(
+        {
+            "A": factors["RF"] + 1.2 * factors["MKT"] + np.linspace(-0.01, 0.01, len(idx)),
+            "B": factors["RF"] + 0.8 * factors["MKT"] + np.sin(np.arange(len(idx))) * 0.01,
+        },
+        index=idx,
+    )
+    asof_month = pd.Timestamp("2022-06-30")
+    baseline = en.build_idiosyncratic_vol_cache(
+        returns,
+        factors,
+        [asof_month],
+        window_months=24,
+        min_obs=12,
+        floor=0.0,
+        cap=10.0,
+        winsor_lower=0.0,
+        winsor_upper=1.0,
+    )[asof_month]
+    changed_future = returns.copy()
+    changed_future.loc[pd.Timestamp("2022-06-30"), "A"] = 9.99
+    changed_future.loc[pd.Timestamp("2022-06-30"), "B"] = -9.99
+    changed = en.build_idiosyncratic_vol_cache(
+        changed_future,
+        factors,
+        [asof_month],
+        window_months=24,
+        min_obs=12,
+        floor=0.0,
+        cap=10.0,
+        winsor_lower=0.0,
+        winsor_upper=1.0,
+    )[asof_month]
+
+    pd.testing.assert_series_equal(changed, baseline)
+
+
+def test_idiosyncratic_vol_cache_drops_insufficient_history():
+    idx = pd.date_range("2020-01-31", periods=6, freq="ME")
+    factors = pd.DataFrame({"MKT": [0.01, 0.02, -0.01, 0.00, 0.03, -0.02], "RF": [0.0] * 6}, index=idx)
+    returns = pd.DataFrame({"A": [0.01, 0.02, 0.00, 0.03, -0.01, 0.02]}, index=idx)
+
+    cache = en.build_idiosyncratic_vol_cache(
+        returns,
+        factors,
+        [pd.Timestamp("2020-06-30")],
+        window_months=24,
+        min_obs=24,
+    )
+
+    assert cache[pd.Timestamp("2020-06-30")].empty
+
+
 def test_max_portfolio_names_caps_aggregate_target_before_weight_caps():
     latest_versions = pd.DataFrame(
         [

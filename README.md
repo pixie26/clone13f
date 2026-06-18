@@ -10,7 +10,7 @@ This repository is intended as a reproducible systematic research sandbox, not a
 - Handles filing-date visibility and amendment versions in the backtest path.
 - Maps CUSIPs through OpenFIGI, with cache support and coverage diagnostics.
 - Downloads monthly returns from yfinance, with cache support and Yahoo Chart API fallback.
-- Supports idea signals such as `level`, `change`, `initiation`, `active_weight`, `active_weight_change`, and `active_weight_initiation`.
+- Supports idea signals such as `level`, `change`, `initiation`, `active_weight`, `active_weight_change`, `active_weight_initiation`, `cps_ir`, `cps_ir_change`, and `cps_ir_initiation`.
 - Supports PIT manager-type filtering with `all`, `exclude_dirty`, and `dedicated_like` modes.
 - Runs thesis vs placebo backtests, marginal-IR ablations, grid sweeps, walk-forward selection, and deflated Sharpe checks.
 - Writes dashboard PNGs, interactive sweep HTML, sweep CSVs, rebalance audit CSVs, rule summaries, and run manifests under `reports/`.
@@ -70,9 +70,12 @@ Full live run:
 python -B run_example.py --mode live
 ```
 
-The live thesis default uses `active_benchmark_source="visible_13f_aggregate"`
-for `active_weight` signals. This avoids requiring a separate historical SPY
-constituent-weight dataset.
+The live thesis default currently uses
+`active_benchmark_source="visible_13f_aggregate"` for active-weight signals.
+Treat this as a diagnostic peer-13F/crowding proxy, not a true market-cap
+benchmark. A proper thesis active-weight benchmark requires point-in-time market
+capitalization or index-constituent weights; the repository does not currently
+include that data.
 
 The live thesis default uses `manager_filter_mode="dedicated_like"`, while
 `all` remains the untouched baseline. Manager filtering modes:
@@ -122,6 +125,31 @@ python -B run_example.py --mode live --equity-only
 
 ETF/fund-like 13F rows are excluded by default in live mode. The `--equity-only`
 flag remains as an explicit way to request the same setting.
+
+CPS-style implied-IR signals are available as diagnostics:
+
+- `cps_ir`
+- `cps_ir_change`
+- `cps_ir_initiation`
+
+They rank positive active overweight by:
+
+```text
+cps_score = positive_active_overweight * trailing_CAPM_residual_vol
+```
+
+Residual volatility is point-in-time: by default it uses the prior 24 monthly
+returns, requires 24 observations, and never uses the as-of month itself. The
+24-month window plus the 10%/80% floor/cap and 5%/95% winsorization are pragmatic
+guardrails, not academically calibrated constants. They are written to the run
+manifest and should be treated as research assumptions.
+
+Future v2 data/research items:
+
+- Add PIT market-cap data and a `manager_held_mcap` benchmark.
+- Add true historical SPY/SPX constituent-weight support.
+- Evaluate FF5+MOM residual volatility with longer windows.
+- Add ADV/Bushee enrichment for manager-type classification.
 
 The live default uses `--price-source chart` through `LIVE_CONFIG` to avoid
 `yfinance` hangs on restricted networks. To compare against yfinance manually:
