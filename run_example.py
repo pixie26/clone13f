@@ -59,7 +59,7 @@ LIVE_CONFIG = {
     "exclude_fund_like_holdings": True,
     "fund_ticker_exclusions_path": "data/fund_ticker_exclusions.csv",
     "refresh_openfigi_metadata": False,
-    "active_benchmark_source": "spy_holdings",
+    "active_benchmark_source": "visible_13f_aggregate",
     "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
     "active_benchmark_max_stale_days": 45,
 }
@@ -1433,7 +1433,7 @@ def parse_args() -> argparse.Namespace:
         "--active-benchmark-source",
         choices=["visible_13f_aggregate", "spy_holdings"],
         default=None,
-        help="Benchmark used for active_weight signals. Live default is spy_holdings.",
+        help="Benchmark used for active_weight signals. Live default is visible_13f_aggregate.",
     )
     parser.add_argument(
         "--active-benchmark-weights",

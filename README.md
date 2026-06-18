@@ -67,12 +67,16 @@ Full live run:
 python -B run_example.py --mode live
 ```
 
-The live thesis default uses `active_benchmark_source="spy_holdings"` for
-`active_weight` signals. Prepare a point-in-time monthly SPY/S&P 500 weight file
-at `data/processed/benchmark_weights_spy.parquet` or pass a path explicitly:
+The live thesis default uses `active_benchmark_source="visible_13f_aggregate"`
+for `active_weight` signals. This avoids requiring a separate historical SPY
+constituent-weight dataset.
+
+Optionally, you can run active weights against point-in-time SPY/S&P 500 weights
+by preparing `data/processed/benchmark_weights_spy.parquet` or passing a path
+explicitly:
 
 ```powershell
-python -B run_example.py --mode live --active-benchmark-weights data/processed/benchmark_weights_spy.parquet
+python -B run_example.py --mode live --active-benchmark-source spy_holdings --active-benchmark-weights data/processed/benchmark_weights_spy.parquet
 ```
 
 The file may be CSV, Parquet, or XLSX, and must contain long-form columns:
@@ -91,8 +95,7 @@ historical tests.
 
 The repository does not auto-generate historical SPY constituent weights. A
 current holdings download cannot be used for past months without look-ahead
-bias. If you need to run before preparing the PIT SPY weight file, explicitly use
-the older 13F aggregate proxy:
+bias.
 
 ```powershell
 python -B run_example.py --mode live --active-benchmark-source visible_13f_aggregate
