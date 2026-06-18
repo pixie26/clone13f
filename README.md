@@ -84,15 +84,19 @@ month_end,ticker,weight
 ```
 
 Weights can be decimals or percentages. The loader normalizes tickers such as
-`BRK.B` to `BRK-B`. The default requires one point-in-time snapshot for each
-rebalance month and fails if a month is missing, so a current SPY snapshot is not
-silently backfilled into historical tests.
+`BRK.B` to `BRK-B`. The default allows a recent prior-month snapshot for rare
+missing months (`active_benchmark_max_stale_days=45`) and fails if coverage is
+older than that, so a current SPY snapshot is not silently backfilled into
+historical tests.
 
 ETF-excluded equity-only live run:
 
 ```powershell
 python -B run_example.py --mode live --equity-only
 ```
+
+ETF/fund-like 13F rows are excluded by default in live mode. The `--equity-only`
+flag remains as an explicit way to request the same setting.
 
 The live default uses `--price-source chart` through `LIVE_CONFIG` to avoid
 `yfinance` hangs on restricted networks. To compare against yfinance manually:

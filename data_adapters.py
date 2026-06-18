@@ -146,7 +146,7 @@ def benchmark_weights_by_month(
     weight_table: pd.DataFrame,
     months,
     *,
-    max_stale_days: int = 0,
+    max_stale_days: int = 45,
 ) -> dict[pd.Timestamp, pd.Series]:
     """Build month->weights using the latest benchmark file date known by month."""
     if weight_table.empty:

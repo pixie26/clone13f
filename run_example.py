@@ -56,12 +56,12 @@ LIVE_CONFIG = {
     "price_cache_path": "yfinance_close_cache.parquet",
     "price_source": "chart",
     "security_overrides_path": "data/security_overrides.csv",
-    "exclude_fund_like_holdings": False,
+    "exclude_fund_like_holdings": True,
     "fund_ticker_exclusions_path": "data/fund_ticker_exclusions.csv",
     "refresh_openfigi_metadata": False,
     "active_benchmark_source": "spy_holdings",
     "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
-    "active_benchmark_max_stale_days": 0,
+    "active_benchmark_max_stale_days": 45,
 }
 
 

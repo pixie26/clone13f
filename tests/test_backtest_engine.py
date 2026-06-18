@@ -1664,7 +1664,7 @@ def test_benchmark_weights_by_month_rejects_uncovered_history(tmp_path):
         da.benchmark_weights_by_month(table, pd.to_datetime(["2020-01-31", "2020-02-29"]))
 
 
-def test_benchmark_weights_by_month_requires_same_month_by_default(tmp_path):
+def test_benchmark_weights_by_month_allows_recent_prior_month_by_default(tmp_path):
     path = tmp_path / "spy_weights.csv"
     pd.DataFrame(
         {
@@ -1675,10 +1675,31 @@ def test_benchmark_weights_by_month_requires_same_month_by_default(tmp_path):
     ).to_csv(path, index=False)
     table = da.load_benchmark_weight_table(path)
 
-    with pytest.raises(ValueError, match="2020-02-29"):
+    weights = da.benchmark_weights_by_month(
+        table,
+        pd.to_datetime(["2020-01-31", "2020-02-29", "2020-03-31"]),
+        max_stale_days=45,
+    )
+
+    assert weights[pd.Timestamp("2020-02-29")].loc["AAPL"] == pytest.approx(1.0)
+
+
+def test_benchmark_weights_by_month_rejects_old_prior_snapshot(tmp_path):
+    path = tmp_path / "spy_weights.csv"
+    pd.DataFrame(
+        {
+            "month_end": ["2020-01-31"],
+            "ticker": ["AAPL"],
+            "weight": [1.0],
+        }
+    ).to_csv(path, index=False)
+    table = da.load_benchmark_weight_table(path)
+
+    with pytest.raises(ValueError, match="2020-03-31"):
         da.benchmark_weights_by_month(
             table,
-            pd.to_datetime(["2020-01-31", "2020-02-29", "2020-03-31"]),
+            pd.to_datetime(["2020-03-31"]),
+            max_stale_days=45,
         )
 
 
