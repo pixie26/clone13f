@@ -1584,6 +1584,7 @@ def test_fetch_prices_refetches_cached_ticker_when_cache_does_not_cover_window(m
         batch_size=1,
         max_retries=0,
         cache_path=cache_path,
+        use_chart_fallback=False,
     )
 
     assert calls == [(("AAPL",), "2015-01-01", "2026-03-31")]
@@ -1658,6 +1659,105 @@ def test_fetch_prices_refetches_short_cache_even_with_coverage_metadata_by_defau
     assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_false_coverage"] == 1
     assert loaded["AAPL"].dropna().index.min() == pd.Timestamp("2015-01-31")
     assert loaded.loc[pd.Timestamp("2015-01-31"), "AAPL"] == 20.0
+
+
+def test_fetch_prices_reuses_trusted_partial_history_cache(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    partial = pd.DataFrame(
+        {"AAAU": [10.0, 11.0, 12.0]},
+        index=pd.to_datetime(["2018-08-31", "2018-09-30", "2026-03-31"]),
+    )
+    _write_price_cache(cache_path, partial)
+    da._write_price_coverage(cache_path, ["AAAU"], "2015-01-01", "2026-03-31", "fetched", partial)
+    calls = []
+
+    def fake_yf_download_close(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+
+    returns = da.fetch_prices(
+        ["AAAU"],
+        "2015-01-01",
+        "2026-03-31",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+        use_chart_fallback=False,
+    )
+
+    assert calls == []
+    assert "AAAU" in returns.columns
+    assert returns.attrs["price_diagnostics"]["tickers_from_cache"] == 1
+    assert returns.attrs["price_diagnostics"]["tickers_from_trusted_partial_cache"] == 1
+    assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 0
+
+
+def test_fetch_prices_does_not_use_partial_cache_when_full_window_required(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    partial = pd.DataFrame(
+        {"SPY": [600.0, 610.0]},
+        index=pd.to_datetime(["2025-01-31", "2026-03-31"]),
+    )
+    _write_price_cache(cache_path, partial)
+    da._write_price_coverage(cache_path, ["SPY"], "2015-01-01", "2026-03-31", "fetched", partial)
+    requested_dates = pd.to_datetime(["2015-01-31", "2015-02-28", "2026-03-31"])
+    calls = []
+
+    def fake_yf_download_close(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame({"SPY": [200.0, 220.0, 660.0]}, index=requested_dates)
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+
+    returns = da.fetch_prices(
+        ["SPY"],
+        "2015-01-01",
+        "2026-03-31",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+        require_full_window=True,
+    )
+
+    assert calls == [(("SPY",), "2015-01-01", "2026-03-31")]
+    assert returns.attrs["price_diagnostics"]["tickers_from_trusted_partial_cache"] == 0
+    assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 1
+
+
+def test_fetch_prices_refetches_stale_partial_history_cache(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    stale_partial = pd.DataFrame(
+        {"AAAU": [10.0, 11.0]},
+        index=pd.to_datetime(["2018-08-31", "2025-12-31"]),
+    )
+    _write_price_cache(cache_path, stale_partial)
+    da._write_price_coverage(cache_path, ["AAAU"], "2015-01-01", "2026-03-31", "fetched", stale_partial)
+    calls = []
+
+    def fake_yf_download_close(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame(
+            {"AAAU": [10.0, 11.0, 12.0]},
+            index=pd.to_datetime(["2018-08-31", "2026-02-28", "2026-03-31"]),
+        )
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_yf_download_close)
+
+    returns = da.fetch_prices(
+        ["AAAU"],
+        "2015-01-01",
+        "2026-03-31",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+        use_chart_fallback=False,
+    )
+
+    assert calls == [(("AAAU",), "2015-01-01", "2026-03-31")]
+    assert returns.attrs["price_diagnostics"]["tickers_from_trusted_partial_cache"] == 0
+    assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 1
 
 
 def test_fetch_prices_patches_partial_yfinance_history_with_chart(monkeypatch, tmp_path):

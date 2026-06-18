@@ -789,6 +789,70 @@ def _series_spans_requested_window(s: pd.Series, start: str, end: str) -> bool:
     return monthly.index.min() <= first_required[0] and monthly.index.max() >= first_required[-1]
 
 
+def _series_has_requested_window_data(s: pd.Series, start: str, end: str) -> bool:
+    x = s.dropna()
+    if x.empty:
+        return False
+    s_ts, e_ts = pd.Timestamp(start), pd.Timestamp(end)
+    return bool(((x.index >= s_ts) & (x.index <= e_ts)).any())
+
+
+def _trusted_partial_cache_cols(
+    coverage: pd.DataFrame,
+    cache_px: pd.DataFrame,
+    tickers,
+    start: str,
+    end: str,
+    *,
+    max_end_lag_days: int = 10,
+) -> set[str]:
+    """Previously fetched partial histories that should not be refetched forever.
+
+    This is intentionally conservative: it only trusts cache entries created by
+    the schema-v2 writer, whose actual close span/row count matches the parquet,
+    and whose latest close reaches the requested end. It is meant for natural
+    late-start histories such as IPOs, not stale or truncated data.
+    """
+    if coverage.empty or cache_px.empty:
+        return set()
+    clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    cov = coverage[
+        coverage["ticker"].isin(clean)
+        & coverage["status"].eq("fetched")
+        & (coverage["start"] <= s)
+        & (coverage["end"] >= e)
+        & coverage["actual_first_close"].notna()
+        & coverage["actual_last_close"].notna()
+        & (coverage["coverage_schema_version"].fillna(1).astype(int) >= PRICE_COVERAGE_SCHEMA_VERSION)
+    ]
+    out: set[str] = set()
+    for row in cov.sort_values(["ticker", "start", "end"]).itertuples(index=False):
+        ticker = str(row.ticker).strip().upper()
+        if ticker not in cache_px:
+            continue
+        series = cache_px[ticker].dropna()
+        if series.empty:
+            continue
+        if _series_spans_requested_window(series, start, end):
+            continue
+        actual_first = pd.Timestamp(row.actual_first_close)
+        actual_last = pd.Timestamp(row.actual_last_close)
+        expected_rows = int(row.rows) if pd.notna(row.rows) else -1
+        first_delta = abs((series.index.min() - actual_first).total_seconds())
+        last_delta = abs((series.index.max() - actual_last).total_seconds())
+        end_lag_days = (e - series.index.max()).days
+        if (
+            first_delta <= 86400
+            and last_delta <= 86400
+            and expected_rows == len(series)
+            and 0 <= end_lag_days <= max_end_lag_days
+            and _series_has_requested_window_data(series, start, end)
+        ):
+            out.add(ticker)
+    return out
+
+
 def _better_close_history(
     current: pd.Series | None,
     candidate: pd.Series,
@@ -1359,9 +1423,14 @@ def fetch_prices(
     # not strong enough evidence to skip future download attempts.
     coverage_no_close: set[str] = set()
     cache_symbol_cols = sorted(set(clean).intersection(cache_px.columns)) if not cache_px.empty else []
+    trusted_partial_cols = (
+        set()
+        if require_full_window
+        else _trusted_partial_cache_cols(coverage, cache_px, cache_symbol_cols, start, end)
+    )
     cached_cols = sorted(
         t for t in cache_symbol_cols
-        if _series_spans_requested_window(cache_px[t], start, end)
+        if _series_spans_requested_window(cache_px[t], start, end) or t in trusted_partial_cols
     )
     stale_cached_cols = sorted(set(cache_symbol_cols) - set(cached_cols))
     false_coverage_cols = sorted(set(stale_cached_cols).intersection(coverage_fetched))
@@ -1371,6 +1440,12 @@ def fetch_prices(
         if not cached_px.empty:
             frames.append(cached_px)
         print(f"  yfinance cache: {len(cached_cols)}/{len(clean)} coverage-valid tickers found at {cache_path}")
+    if trusted_partial_cols:
+        sample = ", ".join(sorted(trusted_partial_cols)[:20])
+        print(
+            "  price cache: "
+            f"reusing {len(trusted_partial_cols)} previously fetched partial-history tickers; sample: {sample}"
+        )
     if stale_cached_cols:
         sample = ", ".join(stale_cached_cols[:20])
         print(
@@ -1633,6 +1708,7 @@ def fetch_prices(
         "tickers_no_returns_dropped": int(len(all_nan_return_cols)),
         "invalid_tickers_skipped": int(dropped),
         "tickers_from_cache": int(len(cached_cols)),
+        "tickers_from_trusted_partial_cache": int(len(trusted_partial_cols)),
         "tickers_refetched_due_to_incomplete_cache": int(len(stale_cached_cols)),
         "tickers_refetched_due_to_false_coverage": int(len(false_coverage_cols)),
         "false_coverage_tickers": false_coverage_cols[:50],
