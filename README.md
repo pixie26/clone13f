@@ -84,8 +84,8 @@ month_end,ticker,weight
 ```
 
 Weights can be decimals or percentages. The loader normalizes tickers such as
-`BRK.B` to `BRK-B`. It uses only snapshots dated on or before each rebalance
-month and fails if coverage is missing or stale, so a current SPY snapshot is not
+`BRK.B` to `BRK-B`. The default requires one point-in-time snapshot for each
+rebalance month and fails if a month is missing, so a current SPY snapshot is not
 silently backfilled into historical tests.
 
 ETF-excluded equity-only live run:

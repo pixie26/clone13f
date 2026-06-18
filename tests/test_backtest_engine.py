@@ -1664,6 +1664,24 @@ def test_benchmark_weights_by_month_rejects_uncovered_history(tmp_path):
         da.benchmark_weights_by_month(table, pd.to_datetime(["2020-01-31", "2020-02-29"]))
 
 
+def test_benchmark_weights_by_month_requires_same_month_by_default(tmp_path):
+    path = tmp_path / "spy_weights.csv"
+    pd.DataFrame(
+        {
+            "month_end": ["2020-01-31", "2020-03-31"],
+            "ticker": ["AAPL", "AAPL"],
+            "weight": [1.0, 1.0],
+        }
+    ).to_csv(path, index=False)
+    table = da.load_benchmark_weight_table(path)
+
+    with pytest.raises(ValueError, match="2020-02-29"):
+        da.benchmark_weights_by_month(
+            table,
+            pd.to_datetime(["2020-01-31", "2020-02-29", "2020-03-31"]),
+        )
+
+
 def test_yfinance_ticker_filter_rejects_non_us_vendor_symbols():
     bad = ["0HQK", "2655787D", "ACLXGBX", "ALLKGUSD", "ANETEUR", "A2O1", "AM6", "TTEK 2.25 08/15/28"]
     good = ["AAPL", "GOOGL", "BRK-B", "BF.B", "AAXJ"]

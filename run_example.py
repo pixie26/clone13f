@@ -61,7 +61,7 @@ LIVE_CONFIG = {
     "refresh_openfigi_metadata": False,
     "active_benchmark_source": "spy_holdings",
     "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
-    "active_benchmark_max_stale_days": 45,
+    "active_benchmark_max_stale_days": 0,
 }
 
 
@@ -422,7 +422,7 @@ def _load_active_benchmark_weights_by_month(
     import data_adapters as da
 
     path = pathlib.Path(live_config.get("active_benchmark_weights_path", ""))
-    max_stale_days = int(live_config.get("active_benchmark_max_stale_days", 45))
+    max_stale_days = int(live_config.get("active_benchmark_max_stale_days", 0))
     table = da.load_benchmark_weight_table(path)
     weights = da.benchmark_weights_by_month(table, months, max_stale_days=max_stale_days)
     print(
