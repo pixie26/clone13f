@@ -53,6 +53,7 @@ LIVE_CONFIG = {
     "require_factors": False,
     "openfigi_cache_path": "openfigi_cache.parquet",
     "price_cache_path": "yfinance_close_cache.parquet",
+    "price_source": "chart",
     "security_overrides_path": "data/security_overrides.csv",
     "exclude_fund_like_holdings": False,
     "fund_ticker_exclusions_path": "data/fund_ticker_exclusions.csv",
@@ -306,6 +307,7 @@ def build_live_data(
         cfg["start"],
         cfg["end"],
         cache_path=cfg.get("price_cache_path"),
+        price_source=cfg.get("price_source", "auto"),
     )
     holdings = da.align_holdings_to_prices(price_holdings, prices)
     print("[1/6] Downloading Fama-French factors")
@@ -326,6 +328,7 @@ def build_live_data(
             cfg["start"],
             cfg["end"],
             cache_path=cfg.get("price_cache_path"),
+            price_source=cfg.get("price_source", "auto"),
             require_full_window=True,
         ).iloc[:, 0]
         bench_ret.name = cfg["benchmark_ticker"]
@@ -874,6 +877,7 @@ def _print_startup_parameters(
     skip_sweep: bool = False,
     equity_only: bool = False,
     refresh_openfigi_metadata: bool = False,
+    price_source: str | None = None,
 ) -> None:
     print("\nRun Parameters")
     print(f"  mode                  {mode}")
@@ -887,6 +891,7 @@ def _print_startup_parameters(
         print(f"  OpenFIGI key          {'env/config present' if LIVE_CONFIG.get('openfigi_key') or os.environ.get('OPENFIGI_API_KEY') else 'missing'}")
         print(f"  OpenFIGI cache        {LIVE_CONFIG.get('openfigi_cache_path')}")
         print(f"  price cache           {LIVE_CONFIG.get('price_cache_path')}")
+        print(f"  price source          {price_source or LIVE_CONFIG.get('price_source')}")
         print(f"  security overrides    {LIVE_CONFIG.get('security_overrides_path')}")
         if equity_only:
             print(f"  fund exclusions       {LIVE_CONFIG.get('fund_ticker_exclusions_path')}")
@@ -950,6 +955,7 @@ def run(
     sweep_checkpoint_every: int = 5,
     equity_only: bool = False,
     refresh_openfigi_metadata: bool = False,
+    price_source: str | None = None,
 ) -> pathlib.Path:
     cfg_a, cfg_b, axes, train_m, test_m = _default_run_configs()
     live_config = dict(LIVE_CONFIG)
@@ -957,6 +963,8 @@ def run(
         live_config["exclude_fund_like_holdings"] = True
     if refresh_openfigi_metadata:
         live_config["refresh_openfigi_metadata"] = True
+    if price_source is not None:
+        live_config["price_source"] = price_source
     _print_startup_parameters(
         mode=mode,
         output_root=output_root,
@@ -971,6 +979,7 @@ def run(
         skip_sweep=skip_sweep,
         equity_only=equity_only,
         refresh_openfigi_metadata=refresh_openfigi_metadata,
+        price_source=live_config.get("price_source"),
     )
     if mode == "synthetic":
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
@@ -1311,6 +1320,12 @@ def parse_args() -> argparse.Namespace:
         help="Re-query cached OpenFIGI CUSIPs that lack metadata fields needed for security classification.",
     )
     parser.add_argument(
+        "--price-source",
+        choices=["chart", "auto", "yfinance"],
+        default=None,
+        help="Price download source. Default live config uses chart to avoid yfinance hangs on restricted networks.",
+    )
+    parser.add_argument(
         "--sweep-checkpoint-every",
         type=int,
         default=5,
@@ -1332,6 +1347,7 @@ def main() -> None:
         sweep_checkpoint_every=args.sweep_checkpoint_every,
         equity_only=args.equity_only,
         refresh_openfigi_metadata=args.refresh_openfigi_metadata,
+        price_source=args.price_source,
     )
 
 

@@ -73,6 +73,13 @@ ETF-excluded equity-only live run:
 python -B run_example.py --mode live --equity-only
 ```
 
+The live default uses `--price-source chart` through `LIVE_CONFIG` to avoid
+`yfinance` hangs on restricted networks. To compare against yfinance manually:
+
+```powershell
+python -B run_example.py --mode live --price-source auto
+```
+
 For faster diagnostics before a full run:
 
 ```powershell

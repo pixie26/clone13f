@@ -1324,18 +1324,25 @@ def fetch_prices(
     *,
     batch_size: int = 50,
     max_retries: int = 2,
+    empty_close_retries: int = 0,
     rate_limit_sleep: int = 60,
     cache_path: str | Path | None = None,
     max_consecutive_empty_batches: int = 3,
     use_chart_fallback: bool = True,
     chart_fallback_workers: int = 8,
     chart_fallback_batch_timeout_seconds: int | None = 90,
-    yfinance_batch_timeout_seconds: int | None = 120,
+    yfinance_batch_timeout_seconds: int | None = 45,
+    price_source: str = "auto",
     require_full_window: bool = False,
 ) -> pd.DataFrame:
     ## FRICTION: yfinance has survivorship gaps (delisted names vanish). For a
     ##           publishable backtest use CRSP via WRDS; yfinance is fine first-pass.
-    import yfinance as yf
+    price_source = str(price_source).strip().lower()
+    if price_source not in {"auto", "yfinance", "chart"}:
+        raise ValueError("price_source must be one of: auto, yfinance, chart")
+    yf = None
+    if price_source != "chart":
+        import yfinance as yf
     raw_unique = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
     clean = sorted({t for t in raw_unique if _is_yfinance_ticker(t)})
     if not clean:
@@ -1392,6 +1399,19 @@ def fetch_prices(
     consecutive_empty = 0
     n_batches = int(np.ceil(len(todo) / batch_size)) if todo else 0
     print(f"  price download: {len(todo)} uncached / {len(clean)} requested tickers in {n_batches} batches")
+    if todo and price_source == "chart":
+        chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
+            todo,
+            start,
+            end,
+            batch_size=batch_size,
+            cache_path=cache_path,
+            max_workers=chart_fallback_workers,
+            batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
+        )
+        frames.extend(chart_frames)
+        used_chart_fallback = True
+        todo = []
     stop_yfinance_loop = False
     for i in range(0, len(todo), batch_size):
         batch = todo[i:i + batch_size]
@@ -1434,17 +1454,36 @@ def fetch_prices(
                         consecutive_empty = 0
                     break
                 last_attempt = attempt >= max_retries
-                if not last_attempt:
+                if attempt < empty_close_retries:
                     wait = min(15 * (attempt + 1), rate_limit_sleep)
                     print(
                         "    [warn] yfinance returned empty Close frame; "
-                        f"sleeping {wait}s before retry {attempt + 1}/{max_retries}"
+                        f"sleeping {wait}s before retry {attempt + 1}/{empty_close_retries}"
                     )
                     time.sleep(wait)
                     continue
                 empty_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
                 empty_batch_tickers.append(batch)
                 consecutive_empty += 1
+                if price_source == "auto" and use_chart_fallback:
+                    remaining = todo[i + batch_size:]
+                    fallback_tickers = sorted(set(batch).union(remaining))
+                    print(
+                        "    [warn] yfinance returned empty Close frame. "
+                        f"Switching immediately to Yahoo Chart API fallback for {len(fallback_tickers)} tickers"
+                    )
+                    chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
+                        fallback_tickers,
+                        start,
+                        end,
+                        batch_size=batch_size,
+                        cache_path=cache_path,
+                        max_workers=chart_fallback_workers,
+                        batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
+                    )
+                    frames.extend(chart_frames)
+                    used_chart_fallback = True
+                    stop_yfinance_loop = True
                 break
             except TimeoutError as exc:
                 failed_batches.append(f"{batch[0]}..{batch[-1]}: {exc}")
@@ -1599,6 +1638,8 @@ def fetch_prices(
         "false_coverage_tickers": false_coverage_cols[:50],
         "tickers_skipped_known_no_close": int(len(coverage_no_close)),
         "used_chart_fallback": bool(used_chart_fallback),
+        "price_source": price_source,
+        "empty_close_retries": int(empty_close_retries),
         "yfinance_batch_timeout_seconds": (
             int(yfinance_batch_timeout_seconds) if yfinance_batch_timeout_seconds else None
         ),
