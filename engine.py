@@ -459,6 +459,9 @@ def _manager_filter_diagnostics(selected_versions: pd.DataFrame, cfg: BacktestCo
         "manager_filter_after": int(selected_versions.attrs.get("manager_filter_after", len(selected_versions))),
         "manager_filter_dropped": int(selected_versions.attrs.get("manager_filter_dropped", 0)),
         "manager_filter_missing_classification": int(selected_versions.attrs.get("manager_filter_missing_classification", 0)),
+        "manager_filter_missing_classification_frac": float(
+            selected_versions.attrs.get("manager_filter_missing_classification_frac", 0.0)
+        ),
         "manager_filter_dirty_dropped": int(selected_versions.attrs.get("manager_filter_dirty_dropped", 0)),
         "manager_filter_non_dedicated_dropped": int(selected_versions.attrs.get("manager_filter_non_dedicated_dropped", 0)),
     }

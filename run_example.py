@@ -67,6 +67,7 @@ LIVE_CONFIG = {
     "exclude_fund_like_holdings": True,
     "fund_ticker_exclusions_path": "data/fund_ticker_exclusions.csv",
     "manager_overrides_path": "data/manager_overrides.csv",
+    "manager_classification_cache_dir": "data/processed",
     "refresh_openfigi_metadata": False,
     "active_benchmark_source": "visible_13f_aggregate",
     "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
@@ -675,6 +676,113 @@ def write_sweep_outputs(
     return outputs
 
 
+def _file_hash(path: str | pathlib.Path) -> str | None:
+    p = pathlib.Path(path)
+    if not p.exists():
+        return None
+    return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+
+
+def _hash_frame_for_cache(df: pd.DataFrame, *, columns: list[str] | None = None) -> str:
+    if df is None or df.empty:
+        return hashlib.sha256(b"empty").hexdigest()[:16]
+    work = df.copy()
+    if columns is not None:
+        keep = [c for c in columns if c in work.columns]
+        work = work[keep]
+    for col in work.columns:
+        if pd.api.types.is_datetime64_any_dtype(work[col]):
+            work[col] = pd.to_datetime(work[col]).dt.strftime("%Y-%m-%d")
+        elif work[col].dtype == "object" or str(work[col].dtype).startswith("string"):
+            work[col] = work[col].map(lambda x: "" if pd.isna(x) else str(x))
+    try:
+        work = work.sort_values(list(work.columns)).reset_index(drop=True)
+    except Exception:
+        work = work.reset_index(drop=True)
+    col_payload = "|".join(map(str, work.columns)).encode("utf-8")
+    row_hash = pd.util.hash_pandas_object(work, index=True).values.tobytes()
+    return hashlib.sha256(col_payload + row_hash).hexdigest()[:16]
+
+
+def _hash_matrix_for_cache(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return hashlib.sha256(b"empty").hexdigest()[:16]
+    work = df.copy()
+    work.index = pd.to_datetime(work.index)
+    work.columns = [str(c) for c in work.columns]
+    work = work.sort_index()
+    work = work.reindex(sorted(work.columns), axis=1)
+    labels = json.dumps(
+        {
+            "index": [pd.Timestamp(x).isoformat() for x in work.index],
+            "columns": list(map(str, work.columns)),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    row_hash = pd.util.hash_pandas_object(work, index=True).values.tobytes()
+    return hashlib.sha256(labels + row_hash).hexdigest()[:16]
+
+
+def _manager_classification_cache_key(
+    *,
+    raw_holdings: pd.DataFrame,
+    holdings: pd.DataFrame,
+    prices: pd.DataFrame,
+    factors: pd.DataFrame,
+    cfg: ManagerClassifierConfig,
+) -> tuple[str, dict[str, Any]]:
+    holding_cols = [
+        "manager",
+        "manager_name",
+        "period_date",
+        "filing_date",
+        "accession_number",
+        "ticker",
+        "issuer",
+        "value",
+        "sec_type",
+        "is_fund_like",
+    ]
+    payload = {
+        "schema_version": 1,
+        "classification_config_hash": manager_classifier_config_hash(cfg),
+        "override_file_hash": manager_override_file_hash(cfg.override_path),
+        "manager_classifier_py": _file_hash("manager_classifier.py"),
+        "engine_py": _file_hash("engine.py"),
+        "raw_holdings_hash": _hash_frame_for_cache(raw_holdings, columns=holding_cols),
+        "filtered_holdings_hash": _hash_frame_for_cache(holdings, columns=holding_cols),
+        "prices_hash": _hash_matrix_for_cache(prices),
+        "factors_hash": _hash_matrix_for_cache(factors),
+    }
+    key = hashlib.sha256(json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")).hexdigest()[:16]
+    return key, payload
+
+
+def _write_manager_classification_cache(
+    classification: pd.DataFrame,
+    *,
+    cache_path: pathlib.Path,
+    meta_path: pathlib.Path,
+    cache_key_payload: dict[str, Any],
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    classification.to_parquet(cache_path, index=False)
+    meta = {
+        "cache_key_payload": cache_key_payload,
+        "attrs": classification.attrs,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+
+
+def _read_manager_classification_cache(cache_path: pathlib.Path, meta_path: pathlib.Path) -> pd.DataFrame | None:
+    if not cache_path.exists() or not meta_path.exists():
+        return None
+    classification = pd.read_parquet(cache_path)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    classification.attrs.update(meta.get("attrs", {}))
+    return classification
+
+
 def _manager_filter_artifacts(
     *,
     out_dir: pathlib.Path,
@@ -691,16 +799,38 @@ def _manager_filter_artifacts(
     )
     overrides = load_manager_overrides(cfg.override_path)
     t0 = time.perf_counter()
-    classification = build_manager_classification(
-        raw_holdings,
-        holdings,
-        chars,
-        prices.index,
-        prices,
-        factors,
-        visible_versions_cache=visible_versions_cache,
-        config=cfg,
+    cache_key, cache_key_payload = _manager_classification_cache_key(
+        raw_holdings=raw_holdings,
+        holdings=holdings,
+        prices=prices,
+        factors=factors,
+        cfg=cfg,
     )
+    cache_dir = pathlib.Path(live_config.get("manager_classification_cache_dir", "data/processed"))
+    cache_path = cache_dir / f"manager_classification.{cache_key}.parquet"
+    meta_path = cache_dir / f"manager_classification.{cache_key}.meta.json"
+    classification = _read_manager_classification_cache(cache_path, meta_path)
+    cache_hit = classification is not None
+    if cache_hit:
+        print(f"  manager classification cache hit: {cache_path}")
+    else:
+        print(f"  manager classification cache miss: {cache_path}")
+        classification = build_manager_classification(
+            raw_holdings,
+            holdings,
+            chars,
+            prices.index,
+            prices,
+            factors,
+            visible_versions_cache=visible_versions_cache,
+            config=cfg,
+        )
+        _write_manager_classification_cache(
+            classification,
+            cache_path=cache_path,
+            meta_path=meta_path,
+            cache_key_payload=cache_key_payload,
+        )
     path = out_dir / "manager_classification.csv"
     classification.to_csv(path, index=False)
     summary = classification_summary(classification)
@@ -711,12 +841,18 @@ def _manager_filter_artifacts(
         "override_file_hash": manager_override_file_hash(cfg.override_path),
         "classification_config": cfg.__dict__,
         "classification_config_hash": manager_classifier_config_hash(cfg),
+        "cache_key": cache_key,
+        "cache_hit": bool(cache_hit),
+        "cache_path": str(cache_path),
+        "cache_meta_path": str(meta_path),
+        "cache_key_payload": cache_key_payload,
         "elapsed_sec": round(time.perf_counter() - t0, 3),
     })
     print(
         "  manager classification: "
         f"{summary.get('rows', 0)} rows, latest managers={summary.get('latest_managers', 0)}, "
-        f"hash={summary.get('classification_hash')} in {summary['elapsed_sec']:.1f}s"
+        f"hash={summary.get('classification_hash')} "
+        f"({'cache hit' if cache_hit else 'built'}) in {summary['elapsed_sec']:.1f}s"
     )
     print(f"    style counts latest: {summary.get('style_counts_latest', {})}")
     print(f"    dirty reasons latest: {summary.get('dirty_reason_counts_latest', {})}")

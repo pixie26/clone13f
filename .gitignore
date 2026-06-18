@@ -5,6 +5,8 @@ __pycache__/
 13f_cache/
 reports/
 artifacts/
+data/processed/manager_classification.*.parquet
+data/processed/manager_classification.*.meta.json
 openfigi_cache.parquet
 yfinance_close_cache.parquet
 yfinance_close_cache_coverage.parquet

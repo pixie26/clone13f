@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import re
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,9 @@ class ManagerClassifierConfig:
     factor_r2_min_months: int = 12
     factor_r2_min_names: int = 3
     factor_cols: tuple[str, ...] = ("MKT", "SMB", "HML", "RMW", "CMA", "MOM")
+    quasi_max_top10_weight: float = 0.35
+    quasi_min_breadth: int = 100
+    missing_classification_warn_frac: float = 0.10
     override_path: str = "data/manager_overrides.csv"
 
 
@@ -107,6 +111,11 @@ def override_file_hash(path: str | Path | None) -> str | None:
     return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
 
 
+def _norm_ts(x) -> str:
+    t = pd.to_datetime(x, errors="coerce")
+    return t.normalize().strftime("%Y-%m-%d") if pd.notna(t) else ""
+
+
 def _manager_name_map(raw_holdings: pd.DataFrame, filtered_holdings: pd.DataFrame) -> pd.Series:
     frames = [df for df in [raw_holdings, filtered_holdings] if df is not None and not df.empty]
     rows = []
@@ -135,30 +144,40 @@ def _static_dirty_reason(name: str) -> str:
     return ""
 
 
-def _raw_etf_share_by_accession(raw_holdings: pd.DataFrame) -> pd.Series:
+def _raw_etf_share_tables(raw_holdings: pd.DataFrame) -> tuple[dict, dict]:
+    """Return ETF-share lookup tables on raw, pre-security-filter books."""
     if raw_holdings is None or raw_holdings.empty or "manager" not in raw_holdings:
-        return pd.Series(dtype=float)
+        return {}, {}
     h = raw_holdings.copy()
-    if "accession_number" not in h:
-        h["accession_number"] = (
-            h["manager"].astype(str) + "|" + h["period_date"].astype(str) + "|" + h["filing_date"].astype(str)
-        )
     h["manager"] = h["manager"].astype(str).str.zfill(10)
+    h["_pd"] = h["period_date"].map(_norm_ts)
+    h["_fd"] = h["filing_date"].map(_norm_ts)
+    if "accession_number" not in h:
+        h["accession_number"] = h["manager"] + "|" + h["_pd"] + "|" + h["_fd"]
+    h["_acc"] = h["accession_number"].astype(str)
     sec = h.get("sec_type", pd.Series("SH", index=h.index)).fillna("SH").astype(str).str.upper()
     longs = h[sec.eq("SH")].copy()
     if longs.empty:
-        return pd.Series(dtype=float)
+        return {}, {}
     if _fund_like_mask is not None:
         fund_like = _fund_like_mask(longs)
     else:
         fund_like = longs.get("is_fund_like", pd.Series(False, index=longs.index)).fillna(False).astype(bool)
-    longs["_fund_like"] = fund_like.astype(bool)
-    totals = longs.groupby(["manager", "period_date", "filing_date", "accession_number"], dropna=False)["value"].sum()
+    longs["_fund_like"] = np.asarray(fund_like).astype(bool)
+    keys = ["manager", "_pd", "_fd", "_acc"]
+    totals = longs.groupby(keys, dropna=False)["value"].sum()
     fund_vals = longs[longs["_fund_like"]].groupby(
-        ["manager", "period_date", "filing_date", "accession_number"], dropna=False
+        keys, dropna=False
     )["value"].sum()
-    share = (fund_vals / totals.replace(0, np.nan)).fillna(0.0)
-    return share
+    share = (fund_vals.reindex(totals.index).fillna(0.0) / totals.replace(0, np.nan)).fillna(0.0)
+    full = {(m, pdt, fdt, acc): float(v) for (m, pdt, fdt, acc), v in share.items()}
+
+    fb = share.rename("etf_share").reset_index()
+    counts = fb.groupby(["manager", "_pd", "_fd"]).size()
+    unique = counts[counts == 1].index
+    fb = fb.set_index(["manager", "_pd", "_fd"])
+    fallback = {idx: float(fb.loc[idx, "etf_share"]) for idx in unique}
+    return full, fallback
 
 
 def _factor_r2(book: pd.Series, prices: pd.DataFrame, factors: pd.DataFrame, asof, cfg: ManagerClassifierConfig) -> tuple[float, str]:
@@ -178,7 +197,11 @@ def _factor_r2(book: pd.Series, prices: pd.DataFrame, factors: pd.DataFrame, aso
     window = prices.loc[prices.index <= end, tickers].tail(max(cfg.factor_r2_min_months, 12))
     if len(window.dropna(how="all")) < cfg.factor_r2_min_months:
         return np.nan, "insufficient_factor_r2"
-    port = (window * w).sum(axis=1, min_count=max(1, min(len(tickers), cfg.factor_r2_min_names)))
+    priced_weight = window.notna().mul(w, axis=1)
+    denom = priced_weight.sum(axis=1)
+    priced_count = window.notna().sum(axis=1)
+    weighted_sum = window.mul(w, axis=1).sum(axis=1, min_count=cfg.factor_r2_min_names)
+    port = (weighted_sum / denom.replace(0, np.nan)).where(priced_count >= cfg.factor_r2_min_names)
     df = pd.concat([port.rename("ret"), factors.reindex(port.index)], axis=1)
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["ret", "RF", *cfg.factor_cols])
     if len(df) < cfg.factor_r2_min_months:
@@ -197,18 +220,25 @@ def _reason_join(reasons: list[str]) -> str:
 
 
 def _apply_dedicated_persistence(df: pd.DataFrame, cfg: ManagerClassifierConfig) -> pd.Series:
+    """Calendar-quarter PIT persistence.
+
+    A month in quarter Q can only use status confirmed through Q-1, not the
+    quarter-end classification of Q. This prevents intra-quarter look-ahead when
+    a quarter has multiple filing-driven rebalance months.
+    """
     if df.empty:
         return pd.Series(False, index=df.index)
     out = pd.Series(False, index=df.index)
     work = df[["manager", "asof_month", "raw_dedicated"]].copy()
     work["asof_month"] = pd.to_datetime(work["asof_month"])
     work["quarter"] = work["asof_month"].dt.to_period("Q")
-    for manager, g in work.sort_values(["manager", "quarter", "asof_month"]).groupby("manager", sort=True):
+    k = max(1, int(cfg.persistence_quarters))
+    for _, g in work.sort_values(["manager", "quarter", "asof_month"]).groupby("manager", sort=True):
         q = g.groupby("quarter", sort=True)["raw_dedicated"].last()
         active = False
         good_run = 0
         bad_run = 0
-        q_active: dict[pd.Period, bool] = {}
+        status_after: dict[pd.Period, bool] = {}
         prev_q = None
         for quarter, is_good in q.items():
             if prev_q is not None and (quarter - prev_q).n != 1:
@@ -221,14 +251,14 @@ def _apply_dedicated_persistence(df: pd.DataFrame, cfg: ManagerClassifierConfig)
             else:
                 bad_run += 1
                 good_run = 0
-            if not active and good_run >= cfg.persistence_quarters:
+            if not active and good_run >= k:
                 active = True
-            elif active and bad_run >= cfg.persistence_quarters:
+            elif active and bad_run >= k:
                 active = False
-            q_active[quarter] = active
+            status_after[quarter] = active
             prev_q = quarter
-        idx = g.index
-        out.loc[idx] = g["quarter"].map(q_active).fillna(False).astype(bool).values
+        eligible_by_q = {quarter: bool(status_after.get(quarter - 1, False)) for quarter in q.index}
+        out.loc[g.index] = g["quarter"].map(eligible_by_q).fillna(False).astype(bool).values
     return out
 
 
@@ -247,13 +277,18 @@ def build_manager_classification(
     if chars is None or chars.empty:
         return pd.DataFrame()
     names = _manager_name_map(raw_holdings, filtered_holdings)
-    etf_share = _raw_etf_share_by_accession(raw_holdings)
+    etf_full, etf_fallback = _raw_etf_share_tables(raw_holdings)
     months = pd.Index(pd.to_datetime(months)).sort_values()
     ch = chars.copy()
     ch["manager"] = ch["manager"].astype(str).str.zfill(10)
     ch["period_date"] = pd.to_datetime(ch["period_date"])
     ch["filing_date"] = pd.to_datetime(ch["filing_date"])
     rows: list[dict[str, Any]] = []
+    r2_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
+    r2_versions_seen: set[tuple[str, str]] = set()
+    etf_hits = 0
+    etf_fallback_hits = 0
+    etf_lookups = 0
     for month in months:
         asof = pd.Timestamp(month)
         latest = None if visible_versions_cache is None else visible_versions_cache.get(asof)
@@ -266,7 +301,12 @@ def build_manager_classification(
         quarter_cutoff = asof.to_period("Q") - (cfg.window_quarters - 1)
         known = ch[ch["filing_date"] <= asof].copy()
         known = known[known["period_date"].dt.to_period("Q") >= quarter_cutoff]
-        turnover_by_manager = known.groupby("manager")["turnover"].mean()
+        known_latest = (
+            known.sort_values(["manager", "period_date", "filing_date", "accession_number"])
+            .groupby(["manager", "period_date"], as_index=False)
+            .tail(1)
+        )
+        turnover_by_manager = known_latest.groupby("manager")["turnover"].mean()
         latest = latest.copy().sort_values("manager")
         latest["manager"] = latest["manager"].astype(str).str.zfill(10)
         turnover_values = turnover_by_manager.replace([np.inf, -np.inf], np.nan).dropna()
@@ -275,14 +315,32 @@ def build_manager_classification(
         for r in latest.itertuples(index=False):
             manager = str(getattr(r, "manager")).zfill(10)
             manager_name = str(names.get(manager, manager))
-            key = (manager, getattr(r, "period_date"), getattr(r, "filing_date"), getattr(r, "accession_number"))
-            raw_etf = float(etf_share.get(key, 0.0))
+            period_key = _norm_ts(getattr(r, "period_date"))
+            filing_key = _norm_ts(getattr(r, "filing_date"))
+            accession_key = str(getattr(r, "accession_number"))
+            etf_lookups += 1
+            full_key = (manager, period_key, filing_key, accession_key)
+            fallback_key = (manager, period_key, filing_key)
+            if full_key in etf_full:
+                raw_etf = float(etf_full[full_key])
+                etf_hits += 1
+            elif fallback_key in etf_fallback:
+                raw_etf = float(etf_fallback[fallback_key])
+                etf_fallback_hits += 1
+            else:
+                raw_etf = 0.0
             turn = float(turnover_by_manager.get(manager, np.nan))
             n_holdings = int(getattr(r, "n_holdings", 0) or 0)
             top10 = float(getattr(r, "top10_weight", np.nan))
             put = float(getattr(r, "put_weight", 0.0) or 0.0)
             static_reason = _static_dirty_reason(manager_name)
-            r2, r2_status = _factor_r2(getattr(r, "bw"), prices, factors, asof, cfg)
+            r2_key = (manager, accession_key, asof.strftime("%Y-%m-%d"))
+            r2_versions_seen.add((manager, accession_key))
+            if r2_key in r2_cache:
+                r2, r2_status = r2_cache[r2_key]
+            else:
+                r2, r2_status = _factor_r2(getattr(r, "bw"), prices, factors, asof, cfg)
+                r2_cache[r2_key] = (r2, r2_status)
             reasons = []
             source = "unclassified"
             if static_reason:
@@ -305,7 +363,7 @@ def build_manager_classification(
                 pd.notna(turn)
                 and pd.notna(low_turnover)
                 and turn <= low_turnover
-                and (top10 < 0.35 or n_holdings > 100)
+                and (top10 < cfg.quasi_max_top10_weight or n_holdings > cfg.quasi_min_breadth)
             ):
                 manager_style = "quasi_indexer"
             elif (
@@ -352,10 +410,21 @@ def build_manager_classification(
     out.loc[out["dedicated_persistent"], "manager_style"] = "dedicated"
     out.loc[(out["manager_style_raw"].eq("dedicated")) & (~out["dedicated_persistent"]), "manager_style"] = "dedicated_pending"
     out = out.drop(columns=["raw_dedicated"])
+    etf_match_rate = (etf_hits + etf_fallback_hits) / etf_lookups if etf_lookups else 0.0
+    if (etf_full or etf_fallback) and etf_match_rate < 0.5:
+        warnings.warn(
+            f"manager_classifier: ETF-share key match rate is low ({etf_match_rate:.1%}); "
+            "raw_holdings keys likely disagree with chars.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     out.attrs["classification_config"] = asdict(cfg)
     out.attrs["classification_config_hash"] = config_hash(cfg)
     out.attrs["classification_hash"] = frame_hash(out)
     out.attrs["override_file_hash"] = override_file_hash(cfg.override_path)
+    out.attrs["etf_key_match_rate"] = float(etf_match_rate)
+    out.attrs["factor_r2_versions_computed"] = int(len(r2_versions_seen))
+    out.attrs["factor_r2_regressions_computed"] = int(len(r2_cache))
     return out
 
 
@@ -384,7 +453,8 @@ def apply_manager_overrides(classification: pd.DataFrame, overrides: pd.DataFram
         elif action == "allow":
             out.at[idx, "dirty_flag"] = False
             out.at[idx, "dirty_reason"] = "override_allow" + (f";{note}" if note else "")
-            out.at[idx, "classification_source"] = "override"
+            out.at[idx, "manager_style"] = "dedicated"
+            out.at[idx, "classification_source"] = "override_allow"
     out.attrs.update(classification.attrs)
     out.attrs["classification_hash"] = frame_hash(out)
     return out
@@ -396,6 +466,8 @@ def filter_selected_versions(
     mode: str,
     classification: pd.DataFrame | None,
     overrides: pd.DataFrame | None = None,
+    *,
+    config: ManagerClassifierConfig | None = None,
 ) -> pd.DataFrame:
     if mode == "all":
         return selected
@@ -403,6 +475,7 @@ def filter_selected_versions(
         raise ValueError(f"Unknown manager_filter_mode={mode!r}")
     if selected is None or selected.empty:
         return selected
+    warn_frac = (config or ManagerClassifierConfig()).missing_classification_warn_frac
     if classification is None or classification.empty:
         out = selected.iloc[0:0].copy()
         out.attrs.update(selected.attrs)
@@ -412,7 +485,14 @@ def filter_selected_versions(
             "manager_filter_after": 0,
             "manager_filter_dropped": int(len(selected)),
             "manager_filter_missing_classification": int(len(selected)),
+            "manager_filter_missing_classification_frac": 1.0 if len(selected) else 0.0,
         })
+        warnings.warn(
+            f"manager_filter mode={mode} has no classification rows for {pd.Timestamp(month).date()}; "
+            "all managers dropped.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return out
     asof = pd.Timestamp(month).normalize()
     c = classification[pd.to_datetime(classification["asof_month"]).eq(asof)].copy()
@@ -435,10 +515,19 @@ def filter_selected_versions(
     ]
     merged = selected2.merge(c[meta_cols], on="manager", how="left", suffixes=("", "_class"))
     missing = merged["manager_style"].isna()
+    missing_frac = float(missing.mean()) if len(merged) else 0.0
+    if missing_frac > warn_frac:
+        warnings.warn(
+            f"manager_filter mode={mode} @ {asof.date()}: {missing_frac:.1%} of selected managers "
+            "have no classification row and will be dropped. This usually means a join/dtype mismatch.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    dirty = merged["dirty_flag"].map(lambda x: bool(x) if pd.notna(x) else True)
     if mode == "exclude_dirty":
-        keep = merged["dirty_flag"].fillna(True).eq(False)
+        keep = ~dirty
     elif mode == "dedicated_like":
-        keep = merged["dirty_flag"].fillna(True).eq(False) & merged["manager_style"].eq("dedicated")
+        keep = (~dirty) & merged["manager_style"].eq("dedicated")
     else:
         keep = pd.Series(True, index=merged.index)
     out = merged.loc[keep].reset_index(drop=True)
@@ -449,8 +538,9 @@ def filter_selected_versions(
         "manager_filter_after": int(len(out)),
         "manager_filter_dropped": int(len(selected) - len(out)),
         "manager_filter_missing_classification": int(missing.sum()),
-        "manager_filter_dirty_dropped": int((~keep & merged["dirty_flag"].fillna(False).astype(bool)).sum()),
-        "manager_filter_non_dedicated_dropped": int((~keep & merged["dirty_flag"].fillna(False).eq(False)).sum())
+        "manager_filter_missing_classification_frac": missing_frac,
+        "manager_filter_dirty_dropped": int((~keep & dirty).sum()),
+        "manager_filter_non_dedicated_dropped": int((~keep & ~dirty).sum())
         if mode == "dedicated_like" else 0,
     })
     return out
@@ -479,4 +569,7 @@ def classification_summary(classification: pd.DataFrame) -> dict[str, Any]:
         "classification_hash": classification.attrs.get("classification_hash"),
         "classification_config_hash": classification.attrs.get("classification_config_hash"),
         "override_file_hash": classification.attrs.get("override_file_hash"),
+        "etf_key_match_rate": classification.attrs.get("etf_key_match_rate"),
+        "factor_r2_versions_computed": classification.attrs.get("factor_r2_versions_computed"),
+        "factor_r2_regressions_computed": classification.attrs.get("factor_r2_regressions_computed"),
     }
