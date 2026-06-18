@@ -277,11 +277,17 @@ def build_live_data(
     if cusip_limit:
         h_cusip = h_cusip[h_cusip["cusip"].isin(target_cusips)].copy()
         print(f"    smoke CUSIP subset: top {len(target_cusips)} CUSIPs by disclosed value")
+    require_openfigi_metadata = bool(
+        cfg.get("refresh_openfigi_metadata", False)
+        or cfg.get("exclude_fund_like_holdings", False)
+    )
+    if require_openfigi_metadata and cfg.get("exclude_fund_like_holdings", False):
+        print("    equity-only mode: requiring OpenFIGI metadata for ETF/fund classification")
     cmap = da.cusip_to_ticker(
         target_cusips,
         api_key=cfg["openfigi_key"],
         cache_path=cfg.get("openfigi_cache_path"),
-        require_metadata=bool(cfg.get("refresh_openfigi_metadata", False)),
+        require_metadata=require_openfigi_metadata,
     )
     openfigi_metadata = da.load_openfigi_metadata(cfg.get("openfigi_cache_path"))
     if not openfigi_metadata.empty:

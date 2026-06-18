@@ -1643,6 +1643,79 @@ def test_priceable_holdings_can_exclude_fund_like_rows(tmp_path):
     assert {"CUSTOM", "IVV", "SPY", "VEU"}.issubset(set(diag["tickers_fund_like_dropped_sample"]))
 
 
+def test_priceable_holdings_excludes_qqqm_without_manual_file():
+    holdings = pd.DataFrame(
+        {
+            "ticker": ["QQQM", "AAPL"],
+            "issuer": ["INVESCO EXCHANGE TRADED FD TR II", "APPLE INC"],
+            "sec_type": ["SH", "SH"],
+            "value": [25.0, 100.0],
+        }
+    )
+
+    filtered = priceable_holdings(holdings, exclude_fund_like=True)
+
+    assert filtered["ticker"].tolist() == ["AAPL"]
+    assert filtered.attrs["price_filter_diagnostics"]["rows_fund_like_dropped"] == 1
+    assert filtered.attrs["price_filter_diagnostics"]["tickers_fund_like_dropped_sample"] == ["QQQM"]
+
+
+def test_build_live_data_requires_openfigi_metadata_for_equity_only(monkeypatch):
+    calls = {}
+    h_cusip = pd.DataFrame(
+        {
+            "cik": ["1"],
+            "manager": ["m1"],
+            "period_date": [pd.Timestamp("2020-03-31")],
+            "filing_date": [pd.Timestamp("2020-05-15")],
+            "cusip": ["037833100"],
+            "issuer": ["APPLE INC"],
+            "sec_type": ["SH"],
+            "value": [100.0],
+        }
+    )
+    mapped = h_cusip.assign(ticker="AAPL")
+    prices = pd.DataFrame({"AAPL": [0.0]}, index=pd.to_datetime(["2020-05-31"]))
+
+    monkeypatch.setattr("build_universe.build_holdings_universe", lambda *args, **kwargs: h_cusip)
+
+    def fake_cusip_to_ticker(cusips, api_key=None, *, cache_path=None, require_metadata=False):
+        calls["require_metadata"] = require_metadata
+        return {"037833100": "AAPL"}
+
+    monkeypatch.setattr(da, "cusip_to_ticker", fake_cusip_to_ticker)
+    monkeypatch.setattr(da, "load_openfigi_metadata", lambda *_: pd.DataFrame())
+    monkeypatch.setattr(da, "map_holdings_to_tickers", lambda *args, **kwargs: mapped)
+    monkeypatch.setattr(da, "priceable_holdings", lambda h, **kwargs: h)
+    monkeypatch.setattr(da, "fetch_prices", lambda *args, **kwargs: prices)
+    monkeypatch.setattr(da, "align_holdings_to_prices", lambda h, p: h)
+    monkeypatch.setattr(da, "fetch_factors", lambda *args, **kwargs: pd.DataFrame(index=prices.index))
+
+    from run_example import build_live_data
+
+    build_live_data(
+        {
+            "start": "2020-05-31",
+            "end": "2020-05-31",
+            "identity": "test@example.com",
+            "openfigi_key": None,
+            "min_aum": 0.0,
+            "max_aum": 1e12,
+            "max_holdings": 100,
+            "max_put_weight": 1.0,
+            "openfigi_cache_path": "unused.parquet",
+            "price_cache_path": "unused_prices.parquet",
+            "price_source": "chart",
+            "benchmark_ticker": "AAPL",
+            "exclude_fund_like_holdings": True,
+            "fund_ticker_exclusions_path": None,
+            "require_factors": False,
+        }
+    )
+
+    assert calls["require_metadata"] is True
+
+
 def test_load_benchmark_weight_table_normalizes_tickers_and_percent_weights(tmp_path):
     path = tmp_path / "spy_weights.csv"
     pd.DataFrame(
