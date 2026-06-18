@@ -35,7 +35,7 @@ from engine import (
     run_backtest,
     target_weights_from_versions,
 )
-from run_example import _rebalance_summary_stats, load_security_groups, value_unit_continuity_diagnostics
+from run_example import _rebalance_summary_stats, load_security_groups, run as run_example_run, value_unit_continuity_diagnostics
 from sweep import deflated_sharpe
 
 
@@ -535,6 +535,22 @@ def test_walk_forward_can_reuse_precomputed_config_returns(monkeypatch):
     assert n_trials == 1
     assert log["idea_signal"].tolist() == ["level"]
     assert oos.index.tolist() == [months[-1]]
+
+
+def test_live_run_preflights_missing_spy_weight_file_before_data_build(tmp_path, monkeypatch):
+    def fail_build_live_data(*args, **kwargs):
+        raise AssertionError("live data build should not start when SPY weights are missing")
+
+    monkeypatch.setattr("run_example.build_live_data", fail_build_live_data)
+
+    missing = tmp_path / "missing_spy_weights.parquet"
+    with pytest.raises(FileNotFoundError, match="active benchmark weight file is required"):
+        run_example_run(
+            "live",
+            tmp_path,
+            active_benchmark_source="spy_holdings",
+            active_benchmark_weights_path=str(missing),
+        )
 
 
 def test_grid_eval_active_sharpe_skips_factor_attribution(monkeypatch):

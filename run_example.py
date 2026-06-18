@@ -433,6 +433,26 @@ def _load_active_benchmark_weights_by_month(
     return weights
 
 
+def _preflight_active_benchmark_inputs(*, mode: str, live_config: dict, cfg: BacktestConfig | None) -> None:
+    if mode != "live" or cfg is None:
+        return
+    if not _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
+        return
+    if cfg.active_benchmark_source in {"visible_13f_aggregate", "13f_aggregate"}:
+        return
+    path = pathlib.Path(live_config.get("active_benchmark_weights_path", ""))
+    if path.exists():
+        return
+    raise FileNotFoundError(
+        "active benchmark weight file is required before live data processing starts: "
+        f"{path}\n"
+        "The repository cannot safely auto-generate historical SPY constituent weights; "
+        "using a current snapshot for historical months would introduce look-ahead bias.\n"
+        "Provide a PIT monthly file with columns month_end,ticker,weight, or run explicitly with "
+        "--active-benchmark-source visible_13f_aggregate for the old 13F-aggregate proxy."
+    )
+
+
 def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weights, security_groups=None) -> dict:
     return {
         "rebalance_rule": (
@@ -1034,6 +1054,7 @@ def run(
             else "visible_13f_aggregate"
         ),
     )
+    _preflight_active_benchmark_inputs(mode=mode, live_config=live_config, cfg=cfg_a)
     _print_startup_parameters(
         mode=mode,
         output_root=output_root,

@@ -89,6 +89,15 @@ missing months (`active_benchmark_max_stale_days=45`) and fails if coverage is
 older than that, so a current SPY snapshot is not silently backfilled into
 historical tests.
 
+The repository does not auto-generate historical SPY constituent weights. A
+current holdings download cannot be used for past months without look-ahead
+bias. If you need to run before preparing the PIT SPY weight file, explicitly use
+the older 13F aggregate proxy:
+
+```powershell
+python -B run_example.py --mode live --active-benchmark-source visible_13f_aggregate
+```
+
 ETF-excluded equity-only live run:
 
 ```powershell
