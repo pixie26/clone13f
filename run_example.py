@@ -35,6 +35,14 @@ from engine import (
     rebalance_trace,
     run_backtest,
 )
+from manager_classifier import (
+    ManagerClassifierConfig,
+    build_manager_classification,
+    classification_summary,
+    config_hash as manager_classifier_config_hash,
+    load_manager_overrides,
+    override_file_hash as manager_override_file_hash,
+)
 from report import dashboard, interactive_results
 from sweep import active_return_stream, deflated_sharpe, grid_eval, walk_forward
 
@@ -58,6 +66,7 @@ LIVE_CONFIG = {
     "security_overrides_path": "data/security_overrides.csv",
     "exclude_fund_like_holdings": True,
     "fund_ticker_exclusions_path": "data/fund_ticker_exclusions.csv",
+    "manager_overrides_path": "data/manager_overrides.csv",
     "refresh_openfigi_metadata": False,
     "active_benchmark_source": "visible_13f_aggregate",
     "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
@@ -213,6 +222,7 @@ def build_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd
         sum([make_manager(f"GOOD{i:02d}", True) for i in range(8)], [])
         + sum([make_manager(f"BAD{i:02d}", False) for i in range(8)], [])
     )
+    holdings.attrs["raw_mapped_holdings"] = holdings.copy()
 
     good_top = (
         holdings[holdings.manager.str.startswith("GOOD")]
@@ -301,11 +311,13 @@ def build_live_data(
         cmap,
         openfigi_metadata=openfigi_metadata,
     )
+    raw_mapped_holdings = holdings.copy()
     holdings = da.priceable_holdings(
         holdings,
         exclude_fund_like=bool(cfg.get("exclude_fund_like_holdings", False)),
         fund_ticker_exclusions_path=cfg.get("fund_ticker_exclusions_path"),
     )
+    holdings.attrs["raw_mapped_holdings"] = raw_mapped_holdings
     print("[1/6] Downloading monthly prices from yfinance")
     price_holdings = holdings
     if price_ticker_limit:
@@ -320,6 +332,7 @@ def build_live_data(
         price_source=cfg.get("price_source", "auto"),
     )
     holdings = da.align_holdings_to_prices(price_holdings, prices)
+    holdings.attrs["raw_mapped_holdings"] = raw_mapped_holdings
     print("[1/6] Downloading Fama-French factors")
     try:
         factors = da.fetch_factors(cfg["start"], cfg["end"])
@@ -478,6 +491,7 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
             "bps_per_side": cfg.cost.bps_per_side,
         },
         "universe": asdict(cfg.universe),
+        "manager_filter_mode": cfg.manager_filter_mode,
         "portfolio": asdict(cfg.portfolio),
         "security_grouping": {
             "enabled": security_groups is not None,
@@ -528,6 +542,7 @@ def _dashboard_parameter_summary(
         ),
         "Universe": (
             f"min_aum={u.min_aum:.0f}, max_aum={u.max_aum:.0f}, "
+            f"manager_filter={cfg.manager_filter_mode}, "
             f"max_holdings={u.max_holdings}, min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
             f"turnover_q={u.turnover_quantile}, min_history_q={u.min_history_quarters}, "
             f"hedge_put_max={u.hedge_put_max_weight:.0%}, value_tilt_min={u.value_tilt_min_pctl:.0%}"
@@ -569,6 +584,8 @@ def write_rebalance_outputs(
     visible_versions_cache=None,
     security_groups=None,
     active_benchmark_weights_by_month=None,
+    manager_classification=None,
+    manager_overrides=None,
 ) -> dict[str, Any]:
     trace = rebalance_trace(
         holdings,
@@ -580,6 +597,8 @@ def write_rebalance_outputs(
         visible_versions_cache=visible_versions_cache,
         security_groups=security_groups,
         active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+        manager_classification=manager_classification,
+        manager_overrides=manager_overrides,
     )
     outputs: dict[str, str] = {}
     for name, df in trace.items():
@@ -654,6 +673,198 @@ def write_sweep_outputs(
         path=str(html_path),
     )
     return outputs
+
+
+def _manager_filter_artifacts(
+    *,
+    out_dir: pathlib.Path,
+    raw_holdings: pd.DataFrame,
+    holdings: pd.DataFrame,
+    chars: pd.DataFrame,
+    prices: pd.DataFrame,
+    factors: pd.DataFrame,
+    visible_versions_cache: dict[pd.Timestamp, pd.DataFrame],
+    live_config: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    cfg = ManagerClassifierConfig(
+        override_path=str(live_config.get("manager_overrides_path", "data/manager_overrides.csv"))
+    )
+    overrides = load_manager_overrides(cfg.override_path)
+    t0 = time.perf_counter()
+    classification = build_manager_classification(
+        raw_holdings,
+        holdings,
+        chars,
+        prices.index,
+        prices,
+        factors,
+        visible_versions_cache=visible_versions_cache,
+        config=cfg,
+    )
+    path = out_dir / "manager_classification.csv"
+    classification.to_csv(path, index=False)
+    summary = classification_summary(classification)
+    summary.update({
+        "path": str(path),
+        "override_path": cfg.override_path,
+        "override_rows": int(len(overrides)),
+        "override_file_hash": manager_override_file_hash(cfg.override_path),
+        "classification_config": cfg.__dict__,
+        "classification_config_hash": manager_classifier_config_hash(cfg),
+        "elapsed_sec": round(time.perf_counter() - t0, 3),
+    })
+    print(
+        "  manager classification: "
+        f"{summary.get('rows', 0)} rows, latest managers={summary.get('latest_managers', 0)}, "
+        f"hash={summary.get('classification_hash')} in {summary['elapsed_sec']:.1f}s"
+    )
+    print(f"    style counts latest: {summary.get('style_counts_latest', {})}")
+    print(f"    dirty reasons latest: {summary.get('dirty_reason_counts_latest', {})}")
+    print(f"    classification coverage latest: {summary.get('source_counts_latest', {})}")
+    if overrides.empty:
+        print(f"    manager overrides: none ({cfg.override_path})")
+    else:
+        print(f"    manager overrides: {len(overrides)} rows ({cfg.override_path})")
+    return classification, overrides, summary
+
+
+def _trace_core_diagnostics(trace: dict[str, pd.DataFrame]) -> dict[str, Any]:
+    summary = trace.get("summary", pd.DataFrame())
+    holdings = trace.get("holdings", pd.DataFrame())
+    if summary.empty:
+        return {
+            "avg_top_issuer_exposure": np.nan,
+            "max_top_issuer_exposure": np.nan,
+            "avg_effective_number": np.nan,
+            "core_90_overlap_frac": np.nan,
+            "permanent_core_name_count": 0,
+            "permanent_core_names": "",
+            "latest_top_holdings": "",
+        }
+    avg_top_issuer = float(pd.to_numeric(summary.get("max_issuer_weight", pd.Series(dtype=float)), errors="coerce").mean())
+    max_top_issuer = float(pd.to_numeric(summary.get("max_issuer_weight", pd.Series(dtype=float)), errors="coerce").max())
+    avg_eff = float(pd.to_numeric(summary.get("effective_number", pd.Series(dtype=float)), errors="coerce").mean())
+    latest_top = str(summary.iloc[-1].get("top_holdings", ""))
+    if holdings.empty:
+        return {
+            "avg_top_issuer_exposure": avg_top_issuer,
+            "max_top_issuer_exposure": max_top_issuer,
+            "avg_effective_number": avg_eff,
+            "core_90_overlap_frac": np.nan,
+            "permanent_core_name_count": 0,
+            "permanent_core_names": "",
+            "latest_top_holdings": latest_top,
+        }
+    sets = []
+    for _, g in holdings.groupby("rebalance_month", sort=True):
+        sets.append(set(g["ticker"].astype(str)))
+    overlaps = []
+    for prev, cur in zip(sets, sets[1:]):
+        denom = min(len(prev), len(cur))
+        if denom:
+            overlaps.append(len(prev.intersection(cur)) / denom)
+    core_90_frac = float(np.mean([x >= 0.90 for x in overlaps])) if overlaps else np.nan
+    months = holdings["rebalance_month"].nunique()
+    freq = holdings.groupby("ticker")["rebalance_month"].nunique().sort_values(ascending=False)
+    permanent = freq[freq >= max(1, int(np.ceil(months * 0.90)))].index.tolist()
+    return {
+        "avg_top_issuer_exposure": avg_top_issuer,
+        "max_top_issuer_exposure": max_top_issuer,
+        "avg_effective_number": avg_eff,
+        "core_90_overlap_frac": core_90_frac,
+        "permanent_core_name_count": int(len(permanent)),
+        "permanent_core_names": ";".join(permanent[:25]),
+        "latest_top_holdings": latest_top,
+    }
+
+
+def write_manager_filter_acceptance(
+    out_dir: pathlib.Path,
+    *,
+    holdings: pd.DataFrame,
+    prices: pd.DataFrame,
+    base_cfg: BacktestConfig,
+    factors: pd.DataFrame,
+    benchmark: pd.Series | None,
+    value_scores=None,
+    benchmark_weights=None,
+    chars=None,
+    visible_versions_cache=None,
+    security_groups=None,
+    active_benchmark_weights_by_month=None,
+    manager_classification=None,
+    manager_overrides=None,
+) -> dict[str, Any]:
+    rows = []
+    for mode in ["all", "dedicated_like"]:
+        cfg = replace(base_cfg, manager_filter_mode=mode)
+        ret = run_backtest(
+            holdings,
+            prices,
+            cfg,
+            value_scores,
+            benchmark_weights,
+            chars,
+            visible_versions_cache,
+            security_groups,
+            active_benchmark_weights_by_month,
+            manager_classification,
+            manager_overrides,
+        )
+        trace = rebalance_trace(
+            holdings,
+            prices,
+            cfg,
+            value_scores=value_scores,
+            benchmark_weights=benchmark_weights,
+            chars=chars,
+            visible_versions_cache=visible_versions_cache,
+            security_groups=security_groups,
+            active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+            manager_classification=manager_classification,
+            manager_overrides=manager_overrides,
+        )
+        att = attribution(ret, factors, benchmark)
+        diag = _trace_core_diagnostics(trace)
+        rows.append({
+            "manager_filter_mode": mode,
+            "ann_return": att.get("ann_return"),
+            "ann_alpha": att.get("ann_alpha"),
+            "alpha_t": att.get("alpha_t"),
+            "smb_beta": (att.get("betas") or {}).get("SMB"),
+            **diag,
+        })
+    df = pd.DataFrame(rows)
+    if len(df) == 2:
+        all_row = df[df["manager_filter_mode"].eq("all")].iloc[0]
+        ded_row = df[df["manager_filter_mode"].eq("dedicated_like")].iloc[0]
+        unchanged = (
+            pd.notna(all_row.get("smb_beta"))
+            and pd.notna(ded_row.get("smb_beta"))
+            and abs(float(all_row["smb_beta"]) - float(ded_row["smb_beta"])) < 0.05
+            and float(ded_row.get("core_90_overlap_frac", 0) or 0) >= 0.80
+        )
+        finding = (
+            "manager_cleaning_did_not_materially_move_core_book"
+            if unchanged
+            else "manager_cleaning_changed_book_diagnostics"
+        )
+    else:
+        finding = "insufficient_acceptance_rows"
+    df["finding"] = finding
+    path = out_dir / "manager_filter_acceptance.csv"
+    df.to_csv(path, index=False)
+    print(f"  Saved manager-filter acceptance diagnostics: {path}")
+    print(df[[
+        "manager_filter_mode",
+        "smb_beta",
+        "avg_top_issuer_exposure",
+        "avg_effective_number",
+        "core_90_overlap_frac",
+        "permanent_core_name_count",
+        "finding",
+    ]].to_string(index=False))
+    return {"path": str(path), "finding": finding}
 
 
 def value_unit_continuity_diagnostics(
@@ -895,6 +1106,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             max_issuer_weight=0.15,
             min_active_weight_holdings=10,
         ),
+        manager_filter_mode="dedicated_like",
     )
     cfg_b = BacktestConfig(
         universe=UniverseConfig(
@@ -905,8 +1117,10 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             use_value_tilt=False,
         ),
         portfolio=PortfolioConfig(idea_signal="level", min_consensus_funds=1, holding_horizon_q=0),
+        manager_filter_mode="all",
     )
     axes = {
+        ("backtest", "manager_filter_mode"): ["all", "exclude_dirty", "dedicated_like"],
         ("universe", "aum_band"): [
             ("0.5-5B", 0.5e9, 5e9),
             ("15-30B", 15e9, 30e9),
@@ -988,6 +1202,7 @@ def _print_startup_parameters(
         c = cfg_a.cost
         print(
             "  thesis universe       "
+            f"manager_filter={cfg_a.manager_filter_mode}, "
             f"min_aum={u.min_aum:.0f}, max_aum={u.max_aum:.0f}, "
             f"max_holdings={u.max_holdings}, min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
             f"turnover_q={u.turnover_quantile}, min_history_q={u.min_history_quarters}, "
@@ -1007,6 +1222,7 @@ def _print_startup_parameters(
     if cfg_b is not None:
         print(
             "  placebo portfolio     "
+            f"manager_filter={cfg_b.manager_filter_mode}, "
             f"idea_signal={cfg_b.portfolio.idea_signal}, "
             f"min_consensus={cfg_b.portfolio.min_consensus_funds}, "
             f"holding_horizon_q={cfg_b.portfolio.holding_horizon_q}"
@@ -1037,6 +1253,7 @@ def run(
     active_benchmark_source: str | None = None,
     active_benchmark_weights_path: str | None = None,
     active_benchmark_max_stale_days: int | None = None,
+    manager_filter_mode: str | None = None,
 ) -> pathlib.Path:
     cfg_a, cfg_b, axes, train_m, test_m = _default_run_configs()
     live_config = dict(LIVE_CONFIG)
@@ -1052,6 +1269,8 @@ def run(
         live_config["active_benchmark_weights_path"] = active_benchmark_weights_path
     if active_benchmark_max_stale_days is not None:
         live_config["active_benchmark_max_stale_days"] = active_benchmark_max_stale_days
+    if manager_filter_mode is not None:
+        cfg_a = replace(cfg_a, manager_filter_mode=manager_filter_mode)
     cfg_a = replace(
         cfg_a,
         active_benchmark_source=(
@@ -1102,6 +1321,17 @@ def run(
     t_step = time.perf_counter()
     visible_cache = build_visible_versions_cache(chars, prices.index)
     print(f"    {len(visible_cache)} month-end visible-version snapshots in {time.perf_counter() - t_step:.1f}s")
+    raw_holdings_for_classification = holdings.attrs.get("raw_mapped_holdings", holdings)
+    manager_classification, manager_overrides, manager_classification_summary = _manager_filter_artifacts(
+        out_dir=out_dir,
+        raw_holdings=raw_holdings_for_classification,
+        holdings=holdings,
+        chars=chars,
+        prices=prices,
+        factors=factors,
+        visible_versions_cache=visible_cache,
+        live_config=live_config,
+    )
     security_groups = load_security_groups(
         prices.columns,
         live_config.get("security_overrides_path", "data/security_overrides.csv"),
@@ -1125,12 +1355,26 @@ def run(
         visible_cache,
         security_groups,
         active_benchmark_weights_by_month,
+        manager_classification,
+        manager_overrides,
         capture_rebalance=True,
     )
     print(f"    thesis backtest done in {time.perf_counter() - t_step:.1f}s")
     t_placebo = time.perf_counter()
     print("    placebo backtest running")
-    ret_b = run_backtest(holdings, prices, cfg_b, value_scores, bench_w, chars, visible_cache, security_groups)
+    ret_b = run_backtest(
+        holdings,
+        prices,
+        cfg_b,
+        value_scores,
+        bench_w,
+        chars,
+        visible_cache,
+        security_groups,
+        active_benchmark_weights_by_month,
+        manager_classification,
+        manager_overrides,
+    )
     print(f"    placebo backtest done in {time.perf_counter() - t_placebo:.1f}s")
     print("    attribution running")
     att_a = attribution(ret_a, factors, bench_ret)
@@ -1191,6 +1435,23 @@ def run(
         path=str(out_dir / "strategy_dashboard_stage3.png"),
     )
     print(f"  Saved quick dashboard: {quick_dashboard_path}")
+    print("  Manager-filter acceptance diagnostics running")
+    manager_filter_acceptance = write_manager_filter_acceptance(
+        out_dir,
+        holdings=holdings,
+        prices=prices,
+        base_cfg=cfg_a,
+        factors=factors,
+        benchmark=bench_ret,
+        value_scores=value_scores,
+        benchmark_weights=bench_w,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+        security_groups=security_groups,
+        active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+        manager_classification=manager_classification,
+        manager_overrides=manager_overrides,
+    )
 
     if skip_marginal:
         print("\n[4/6] Marginal-IR ablation skipped")
@@ -1210,6 +1471,8 @@ def run(
             visible_versions_cache=visible_cache,
             security_groups=security_groups,
             active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+            manager_classification=manager_classification,
+            manager_overrides=manager_overrides,
             verbose=True,
         )
         print(f"  marginal-ir total time {time.perf_counter() - t_step:.1f}s")
@@ -1251,6 +1514,8 @@ def run(
             include_returns=True,
             security_groups=security_groups,
             active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+            manager_classification=manager_classification,
+            manager_overrides=manager_overrides,
             checkpoint_dir=out_dir,
             checkpoint_every=sweep_checkpoint_every,
         )
@@ -1275,6 +1540,8 @@ def run(
             precomputed_returns=grid_returns,
             security_groups=security_groups,
             active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+            manager_classification=manager_classification,
+            manager_overrides=manager_overrides,
         )
         oos_dsr_stream = active_return_stream(oos_ret, bench_ret)
         dsr = deflated_sharpe(
@@ -1352,6 +1619,8 @@ def run(
         visible_versions_cache=visible_cache,
         security_groups=security_groups,
         active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+        manager_classification=manager_classification,
+        manager_overrides=manager_overrides,
     )
     print(f"  Saved rebalance summary:  {rebalance_outputs['summary']}")
     print(f"  Saved rebalance holdings: {rebalance_outputs['holdings']}")
@@ -1395,6 +1664,8 @@ def run(
                 "rows": int(len(value_diag)),
                 "suspicious_unit_jumps": suspicious_value_unit_jumps,
             },
+            "manager_classification": manager_classification_summary,
+            "manager_filter_acceptance": manager_filter_acceptance,
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
         "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),
@@ -1458,6 +1729,12 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Write sweep_grid_partial.csv every N grid configs; 0 disables checkpointing.",
     )
+    parser.add_argument(
+        "--manager-filter-mode",
+        choices=["all", "exclude_dirty", "dedicated_like"],
+        default=None,
+        help="Manager-type filter for the thesis run. all is the untouched baseline.",
+    )
     return parser.parse_args()
 
 
@@ -1478,6 +1755,7 @@ def main() -> None:
         active_benchmark_source=args.active_benchmark_source,
         active_benchmark_weights_path=args.active_benchmark_weights,
         active_benchmark_max_stale_days=args.active_benchmark_max_stale_days,
+        manager_filter_mode=args.manager_filter_mode,
     )
 
 

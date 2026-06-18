@@ -44,11 +44,11 @@ except ImportError:
 
 
 def iter_configs(base: BacktestConfig, axes: dict) -> list[tuple[dict, BacktestConfig]]:
-    """axes: {('universe'|'portfolio', field): [values]} -> list of (label, cfg)."""
+    """axes: {('universe'|'portfolio'|'backtest', field): [values]} -> configs."""
     keys = list(axes.keys())
     out = []
     for combo in itertools.product(*[axes[k] for k in keys]):
-        u, p = dict(), dict()
+        u, p, b = dict(), dict(), dict()
         label = {}
         for (scope, field), val in zip(keys, combo):
             if scope == "universe" and field == "aum_band":
@@ -57,9 +57,16 @@ def iter_configs(base: BacktestConfig, axes: dict) -> list[tuple[dict, BacktestC
                 u["max_aum"] = max_aum
                 label["aum_band"] = band_label
             else:
-                (u if scope == "universe" else p)[field] = val
+                if scope == "universe":
+                    u[field] = val
+                elif scope == "portfolio":
+                    p[field] = val
+                elif scope == "backtest":
+                    b[field] = val
+                else:
+                    raise ValueError(f"Unknown sweep scope={scope!r}")
                 label[field] = val
-        cfg = replace(base, universe=replace(base.universe, **u), portfolio=replace(base.portfolio, **p))
+        cfg = replace(base, universe=replace(base.universe, **u), portfolio=replace(base.portfolio, **p), **b)
         out.append((label, cfg))
     return out
 
@@ -74,6 +81,24 @@ def _config_id(label: dict) -> str:
 
 def _universe_key(cfg) -> tuple:
     return tuple((f.name, getattr(cfg, f.name)) for f in fields(cfg))
+
+
+def _selection_key(cfg: BacktestConfig) -> tuple:
+    return (
+        ("manager_filter_mode", cfg.manager_filter_mode),
+        ("active_benchmark_source", cfg.active_benchmark_source),
+        ("missing_price_policy", cfg.missing_price_policy),
+        *_universe_key(cfg.universe),
+    )
+
+
+def _manager_filter_kwargs(manager_classification=None, manager_overrides=None) -> dict:
+    out = {}
+    if manager_classification is not None:
+        out["manager_classification"] = manager_classification
+    if manager_overrides is not None:
+        out["manager_overrides"] = manager_overrides
+    return out
 
 
 def _periodic_sharpe(r: pd.Series) -> float:
@@ -228,6 +253,8 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
               chars=None, visible_versions_cache=None, verbose: bool = False,
               include_returns: bool = False, security_groups=None,
               active_benchmark_weights_by_month=None,
+              manager_classification=None,
+              manager_overrides=None,
               include_factor_metrics: bool | None = None,
               use_selection_cache: bool = True,
               checkpoint_dir=None,
@@ -247,16 +274,17 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
             print(f"  grid {i}/{total} running {label}")
             t0 = time.perf_counter()
         if use_selection_cache:
-            ukey = _universe_key(cfg.universe)
+            ukey = _selection_key(cfg)
             if ukey not in selection_caches:
                 selection_caches[ukey] = build_rebalance_selection_cache(
                     holdings,
                     prices,
                     cfg,
-                    value_scores,
-                    benchmark_weights,
-                    ch,
-                    visible_cache,
+                    value_scores=value_scores,
+                    benchmark_weights=benchmark_weights,
+                    chars=ch,
+                    visible_versions_cache=visible_cache,
+                    **_manager_filter_kwargs(manager_classification, manager_overrides),
                 )
             active_benchmark_cache = None
             if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
@@ -292,12 +320,13 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
                 holdings,
                 prices,
                 cfg,
-                value_scores,
-                benchmark_weights,
-                ch,
-                visible_cache,
-                security_groups,
-                active_benchmark_weights_by_month,
+                value_scores=value_scores,
+                benchmark_weights=benchmark_weights,
+                chars=ch,
+                visible_versions_cache=visible_cache,
+                security_groups=security_groups,
+                active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+                **_manager_filter_kwargs(manager_classification, manager_overrides),
                 capture_rebalance=True,
             )
         if include_returns:
@@ -325,6 +354,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
             print(f"    done grid {i}/{total} in {time.perf_counter() - t0:.1f}s {metric}={_fmt_metric(chosen)}")
         rows.append({
             "config_id": _config_id(label),
+            "manager_filter_mode": cfg.manager_filter_mode,
             **label,
             **return_metrics,
             **row_metrics,
@@ -350,7 +380,9 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                  chars=None, visible_versions_cache=None, verbose: bool = False,
                  precomputed_returns: dict[tuple, pd.Series] | None = None,
                  security_groups=None,
-                 active_benchmark_weights_by_month=None):
+                 active_benchmark_weights_by_month=None,
+                 manager_classification=None,
+                 manager_overrides=None):
     """Rolling OOS. Returns (oos_returns, fold_log, n_trials)."""
     configs = iter_configs(base, axes)
     n_trials = len(configs)
@@ -383,12 +415,13 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                     holdings,
                     prices.loc[tr],
                     cfg,
-                    value_scores,
-                    benchmark_weights,
-                    ch,
-                    visible_cache,
-                    security_groups,
-                    active_benchmark_weights_by_month,
+                    value_scores=value_scores,
+                    benchmark_weights=benchmark_weights,
+                    chars=ch,
+                    visible_versions_cache=visible_cache,
+                    security_groups=security_groups,
+                    active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+                    **_manager_filter_kwargs(manager_classification, manager_overrides),
                 )
             sc = _periodic_sharpe(_score_series(ret, benchmark.reindex(tr) if benchmark is not None else None, select_on))
             if verbose:
@@ -401,9 +434,18 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
         if precomputed_returns is not None and _label_key(best_lbl) in precomputed_returns:
             te_ret = _without_attrs(precomputed_returns[_label_key(best_lbl)].reindex(te))
         else:
-            te_ret = run_backtest(holdings, prices.loc[months[:start + train_m + test_m]],
-                                  best, value_scores, benchmark_weights, ch, visible_cache, security_groups,
-                                  active_benchmark_weights_by_month).reindex(te)
+            te_ret = run_backtest(
+                holdings,
+                prices.loc[months[:start + train_m + test_m]],
+                best,
+                value_scores=value_scores,
+                benchmark_weights=benchmark_weights,
+                chars=ch,
+                visible_versions_cache=visible_cache,
+                security_groups=security_groups,
+                active_benchmark_weights_by_month=active_benchmark_weights_by_month,
+                **_manager_filter_kwargs(manager_classification, manager_overrides),
+            ).reindex(te)
             te_ret = _without_attrs(te_ret)
         if verbose:
             print(f"    done test fold {fold_no}/{n_folds} in {time.perf_counter() - t0:.1f}s")

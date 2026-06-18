@@ -11,6 +11,7 @@ This repository is intended as a reproducible systematic research sandbox, not a
 - Maps CUSIPs through OpenFIGI, with cache support and coverage diagnostics.
 - Downloads monthly returns from yfinance, with cache support and Yahoo Chart API fallback.
 - Supports idea signals such as `level`, `change`, `initiation`, `active_weight`, `active_weight_change`, and `active_weight_initiation`.
+- Supports PIT manager-type filtering with `all`, `exclude_dirty`, and `dedicated_like` modes.
 - Runs thesis vs placebo backtests, marginal-IR ablations, grid sweeps, walk-forward selection, and deflated Sharpe checks.
 - Writes dashboard PNGs, interactive sweep HTML, sweep CSVs, rebalance audit CSVs, rule summaries, and run manifests under `reports/`.
 
@@ -20,10 +21,12 @@ This repository is intended as a reproducible systematic research sandbox, not a
 - `data_adapters.py` - network-facing adapters for OpenFIGI, yfinance/Yahoo Chart, Fama-French factors, and mapping/price diagnostics.
 - `engine.py` - pure-pandas portfolio construction, point-in-time backtest, attribution, rebalance trace, and risk/cost logic.
 - `sweep.py` - parameter grid evaluation, walk-forward selection, active-return scoring, and deflated Sharpe.
+- `manager_classifier.py` - PIT manager behavior/type classifier for cleaning the idea-generation universe.
 - `report.py` - dashboard chart rendering.
 - `run_example.py` - runnable synthetic/live research pipeline.
 - `data/security_overrides.csv` - issuer-group overrides for multi-class securities such as `GOOG`/`GOOGL`.
 - `data/fund_ticker_exclusions.csv` - supplemental ETF/ETN/fund ticker exclusions for equity-only research runs.
+- `data/manager_overrides.csv` - optional manager allow/deny overrides for filter-active manager modes.
 
 ## Setup
 
@@ -70,6 +73,16 @@ python -B run_example.py --mode live
 The live thesis default uses `active_benchmark_source="visible_13f_aggregate"`
 for `active_weight` signals. This avoids requiring a separate historical SPY
 constituent-weight dataset.
+
+The live thesis default uses `manager_filter_mode="dedicated_like"`, while
+`all` remains the untouched baseline. Manager filtering modes:
+
+- `all` - no manager classifier or override is applied; this is the parity anchor.
+- `exclude_dirty` - drops obvious out-of-scope filers and extreme behavior fingerprints.
+- `dedicated_like` - keeps low-turnover, concentrated, bounded-breadth managers after calendar-quarter persistence.
+
+The classifier is local/PIT in v1. It does not use Form ADV or external Bushee
+labels. `factor_r2` is reported as a diagnostic and is not a default hard filter.
 
 Optionally, you can run active weights against point-in-time SPY/S&P 500 weights
 by preparing `data/processed/benchmark_weights_spy.parquet` or passing a path
@@ -123,6 +136,14 @@ For faster diagnostics before a full run:
 python -B run_example.py --mode live --equity-only --skip-marginal --skip-sweep
 ```
 
+To compare manager universe definitions:
+
+```powershell
+python -B run_example.py --mode live --manager-filter-mode all --skip-marginal --skip-sweep
+python -B run_example.py --mode live --manager-filter-mode exclude_dirty --skip-marginal --skip-sweep
+python -B run_example.py --mode live --manager-filter-mode dedicated_like --skip-marginal --skip-sweep
+```
+
 To populate OpenFIGI security metadata for an older ticker-only cache, run once with:
 
 ```powershell
@@ -140,6 +161,8 @@ Outputs are written to timestamped folders under `reports/`, including:
 - `rebalance_holdings_thesis.csv`
 - `rebalance_managers_thesis.csv`
 - `rebalance_rules_thesis.json`
+- `manager_classification.csv`
+- `manager_filter_acceptance.csv`
 
 ## Testing
 

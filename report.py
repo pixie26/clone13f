@@ -250,6 +250,7 @@ def interactive_results(
     """Write a self-contained HTML viewer for parameter-sweep results."""
     table_cols = [
         "config_id",
+        "manager_filter_mode",
         "aum_band",
         "use_concentration",
         "use_low_turnover",
@@ -402,8 +403,8 @@ def interactive_results(
   </main>
   <script>
     const DATA = {payload_json};
-    const filterFields = ["valid_config", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "use_concentration", "use_low_turnover", "use_value_tilt"];
-    const tableFields = ["valid_config", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "ann_return", "active_sharpe", "invested_month_frac", "avg_effective_names", "avg_max_weight", "name_cap_feasible_ratio", "max_drawdown"];
+    const filterFields = ["valid_config", "manager_filter_mode", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "use_concentration", "use_low_turnover", "use_value_tilt"];
+    const tableFields = ["valid_config", "manager_filter_mode", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "ann_return", "active_sharpe", "invested_month_frac", "avg_effective_names", "avg_max_weight", "name_cap_feasible_ratio", "max_drawdown"];
     let sortField = "active_sharpe";
     let sortDir = -1;
     let selectedId = null;

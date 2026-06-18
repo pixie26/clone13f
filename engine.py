@@ -21,6 +21,8 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
+from manager_classifier import filter_selected_versions
+
 
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -70,6 +72,7 @@ class BacktestConfig:
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     cost: CostConfig = field(default_factory=CostConfig)
+    manager_filter_mode: str = "all"        # "all" | "exclude_dirty" | "dedicated_like"
     active_benchmark_source: str = "visible_13f_aggregate"
     # "exit" liquidates a held name when its monthly return is missing, then
     # redeploys into priced survivors. This reduces complete-window survivorship
@@ -429,6 +432,38 @@ def select_universe(chars, asof, cfg: UniverseConfig, value_scores=None) -> list
     return selected["manager"].tolist()
 
 
+def _apply_manager_type_filter(
+    selected_versions: pd.DataFrame,
+    month,
+    cfg: BacktestConfig,
+    manager_classification: pd.DataFrame | None = None,
+    manager_overrides: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    mode = getattr(cfg, "manager_filter_mode", "all")
+    if mode == "all":
+        return selected_versions
+    return filter_selected_versions(
+        selected_versions,
+        month,
+        mode,
+        manager_classification,
+        manager_overrides,
+    )
+
+
+def _manager_filter_diagnostics(selected_versions: pd.DataFrame, cfg: BacktestConfig) -> dict:
+    mode = getattr(cfg, "manager_filter_mode", "all")
+    return {
+        "manager_filter_mode": mode,
+        "manager_filter_before": int(selected_versions.attrs.get("manager_filter_before", len(selected_versions))),
+        "manager_filter_after": int(selected_versions.attrs.get("manager_filter_after", len(selected_versions))),
+        "manager_filter_dropped": int(selected_versions.attrs.get("manager_filter_dropped", 0)),
+        "manager_filter_missing_classification": int(selected_versions.attrs.get("manager_filter_missing_classification", 0)),
+        "manager_filter_dirty_dropped": int(selected_versions.attrs.get("manager_filter_dirty_dropped", 0)),
+        "manager_filter_non_dedicated_dropped": int(selected_versions.attrs.get("manager_filter_non_dedicated_dropped", 0)),
+    }
+
+
 # --------------------------------------------------------------------------- #
 def _idea_scores(
     cur: pd.Series,
@@ -716,7 +751,9 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                     value_scores=None, benchmark_weights=None, chars=None,
                     visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
                     security_groups=None,
-                    active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None) -> dict[str, pd.DataFrame]:
+                    active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None,
+                    manager_classification: pd.DataFrame | None = None,
+                    manager_overrides: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
     """Return auditable rebalance summary, holdings, and manager-selection tables."""
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
@@ -745,9 +782,29 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             active_benchmark_weights_by_month,
         )
         selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+        selected_versions = _apply_manager_type_filter(
+            selected_versions,
+            m,
+            cfg,
+            manager_classification,
+            manager_overrides,
+        )
+        manager_filter_diag = _manager_filter_diagnostics(selected_versions, cfg)
         selected_managers = selected_versions["manager"].tolist() if not selected_versions.empty else []
-        for manager in selected_managers:
-            manager_rows.append({"rebalance_month": m.date().isoformat(), "manager": manager})
+        for row in selected_versions.itertuples(index=False):
+            manager_rows.append({
+                "rebalance_month": m.date().isoformat(),
+                "manager": getattr(row, "manager"),
+                "manager_name": getattr(row, "manager_name", ""),
+                "manager_style": getattr(row, "manager_style", ""),
+                "dirty_flag": bool(getattr(row, "dirty_flag", False)),
+                "dirty_reason": getattr(row, "dirty_reason", ""),
+                "classification_source": getattr(row, "classification_source", ""),
+                "factor_r2": getattr(row, "factor_r2", np.nan),
+                "factor_r2_status": getattr(row, "factor_r2_status", ""),
+                "etf_share_raw": getattr(row, "etf_share_raw", np.nan),
+                "turnover_mean_trailing": getattr(row, "turnover_mean_trailing", np.nan),
+            })
 
         priced_now = prices.columns[prices.loc[m].notna()]
         tgt, idea_diag = target_weights_from_versions(
@@ -771,6 +828,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                 "rebalance_month": m.date().isoformat(),
                 "selected_managers": int(len(selected_versions)),
                 **stale_diag,
+                **manager_filter_diag,
                 "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
                 "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
                 "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -806,6 +864,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             "rebalance_month": m.date().isoformat(),
             "selected_managers": int(len(selected_versions)),
             **stale_diag,
+            **manager_filter_diag,
             "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
             "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
             "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -852,6 +911,8 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                  visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
                  security_groups=None,
                  active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None,
+                 manager_classification: pd.DataFrame | None = None,
+                 manager_overrides: pd.DataFrame | None = None,
                  progress_label: str | None = None,
                  progress_every: int = 10,
                  capture_rebalance: bool = False) -> pd.Series:
@@ -884,6 +945,14 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 active_benchmark_weights_by_month,
             )
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+            selected_versions = _apply_manager_type_filter(
+                selected_versions,
+                m,
+                cfg,
+                manager_classification,
+                manager_overrides,
+            )
+            manager_filter_diag = _manager_filter_diagnostics(selected_versions, cfg)
             priced_now = prices.columns[prices.loc[m].notna()]
             tgt, idea_diag = target_weights_from_versions(
                 selected_versions,
@@ -918,6 +987,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                     "rebalance_month": m.date().isoformat(),
                     "selected_managers": int(len(selected_versions)),
                     **stale_diag,
+                    **manager_filter_diag,
                     "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
                     "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
                     "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -960,6 +1030,8 @@ def build_rebalance_selection_cache(
     benchmark_weights=None,
     chars=None,
     visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
+    manager_classification: pd.DataFrame | None = None,
+    manager_overrides: pd.DataFrame | None = None,
 ) -> dict[pd.Timestamp, pd.DataFrame]:
     """Precompute PIT universe selections for each rebalance month.
 
@@ -978,6 +1050,13 @@ def build_rebalance_selection_cache(
             latest_versions = _visible_manager_versions(chars, month)
         fresh_versions, stale_diag = _filter_fresh_versions(latest_versions, month, cfg.universe)
         selected = filter_universe_versions(fresh_versions, cfg.universe, value_scores)
+        selected = _apply_manager_type_filter(
+            selected,
+            month,
+            cfg,
+            manager_classification,
+            manager_overrides,
+        )
         selected.attrs.update(stale_diag)
         selected_by_month[month] = selected
     return selected_by_month
@@ -1042,6 +1121,7 @@ def run_backtest_from_selection_cache(
             rebal_no += 1
             selected_versions = selected_versions_by_month.get(month, pd.DataFrame())
             stale_diag = _selection_cache_diagnostics(selected_versions)
+            manager_filter_diag = _manager_filter_diagnostics(selected_versions, cfg)
             active_benchmark_weights = None
             if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
                 if active_benchmark_weights_by_month is not None:
@@ -1080,6 +1160,7 @@ def run_backtest_from_selection_cache(
                     "rebalance_month": m.date().isoformat(),
                     "selected_managers": int(len(selected_versions)),
                     **stale_diag,
+                    **manager_filter_diag,
                     "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
                     "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
                     "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -1187,7 +1268,10 @@ def _active_ir_metric(port_ret: pd.Series, benchmark: pd.Series | None = None) -
 
 def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=None, benchmark_weights=None,
                 chars=None, visible_versions_cache=None, security_groups=None,
-                active_benchmark_weights_by_month=None, verbose: bool = False):
+                active_benchmark_weights_by_month=None,
+                manager_classification: pd.DataFrame | None = None,
+                manager_overrides: pd.DataFrame | None = None,
+                verbose: bool = False):
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
     visible_cache = visible_versions_cache if visible_versions_cache is not None else build_visible_versions_cache(ch, prices.index)
     if verbose:
@@ -1203,6 +1287,8 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
         visible_cache,
         security_groups,
         active_benchmark_weights_by_month,
+        manager_classification,
+        manager_overrides,
         progress_label="marginal-ir full stack" if verbose else None,
     )
     bm = _active_ir_metric(base_ret, benchmark)
@@ -1235,6 +1321,8 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
             visible_cache,
             security_groups,
             active_benchmark_weights_by_month,
+            manager_classification,
+            manager_overrides,
             progress_label=f"marginal-ir -{t}" if verbose else None,
         )
         m = _active_ir_metric(ret, benchmark)
