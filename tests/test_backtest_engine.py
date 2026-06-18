@@ -18,6 +18,7 @@ from data_adapters import (
     cusip_to_ticker,
     _write_price_cache,
     align_holdings_to_prices,
+    load_openfigi_metadata,
     map_holdings_to_tickers,
     mapping_diagnostics,
     priceable_holdings,
@@ -1279,6 +1280,47 @@ def test_openfigi_cache_invalidates_legacy_negative_rows(tmp_path):
     assert loaded == {"084670702": None}
 
 
+def test_openfigi_metadata_cache_drives_equity_only_filter(tmp_path):
+    cache_path = tmp_path / "openfigi.parquet"
+    _write_openfigi_cache(
+        cache_path,
+        {
+            "037833100": {
+                "ticker": "AAPL",
+                "name": "APPLE INC",
+                "marketSector": "Equity",
+                "exchCode": "US",
+                "securityType2": "Common Stock",
+            },
+            "464287200": {
+                "ticker": "IVV",
+                "name": "ISHARES CORE S&P 500 ETF",
+                "marketSector": "Equity",
+                "exchCode": "US",
+                "securityType2": "ETF",
+            },
+        },
+    )
+    cmap = _load_openfigi_cache(cache_path)
+    metadata = load_openfigi_metadata(cache_path)
+    holdings = pd.DataFrame(
+        {
+            "cusip": ["037833100", "464287200"],
+            "issuer": ["APPLE INC", "BLACKROCK"],
+            "sec_type": ["SH", "SH"],
+            "value": [100.0, 50.0],
+        }
+    )
+
+    mapped = map_holdings_to_tickers(holdings, cmap, openfigi_metadata=metadata)
+    filtered = priceable_holdings(mapped, exclude_fund_like=True)
+
+    assert cmap == {"037833100": "AAPL", "464287200": "IVV"}
+    assert bool(metadata.set_index("cusip").loc["464287200", "is_fund_like"]) is True
+    assert filtered["ticker"].tolist() == ["AAPL"]
+    assert filtered.attrs["price_filter_diagnostics"]["rows_fund_like_dropped"] == 1
+
+
 def test_cusip_to_ticker_uses_cins_id_type_and_normalizes_ticker(monkeypatch, tmp_path):
     requests_seen = []
 
@@ -1319,11 +1361,16 @@ def test_cusip_to_ticker_uses_cins_id_type_and_normalizes_ticker(monkeypatch, tm
     monkeypatch.setattr(da.requests, "post", fake_post)
     monkeypatch.setattr(da.time, "sleep", lambda *_: None)
 
-    out = cusip_to_ticker(["G5960L103", "084670702"], cache_path=tmp_path / "openfigi.parquet")
+    cache_path = tmp_path / "openfigi.parquet"
+    out = cusip_to_ticker(["G5960L103", "084670702"], cache_path=cache_path)
 
     jobs = requests_seen[0]
+    metadata = load_openfigi_metadata(cache_path).set_index("cusip")
     assert [job["idType"] for job in jobs] == ["ID_CUSIP", "ID_CINS"]
     assert out == {"084670702": "BRK-B", "G5960L103": "MDT"}
+    assert metadata.loc["084670702", "ticker"] == "BRK-B"
+    assert metadata.loc["084670702", "securityType2"] == "Common Stock"
+    assert pd.notna(metadata.loc["084670702", "metadata_version"])
 
 
 def test_priceable_holdings_drops_prn_and_bond_descriptions():
@@ -1339,6 +1386,32 @@ def test_priceable_holdings_drops_prn_and_bond_descriptions():
 
     assert filtered["ticker"].tolist() == ["AAPL"]
     assert filtered.attrs["price_filter_diagnostics"]["rows_dropped"] == 2
+
+
+def test_priceable_holdings_can_exclude_fund_like_rows(tmp_path):
+    exclusion_path = tmp_path / "funds.csv"
+    pd.DataFrame({"ticker": ["CUSTOM"], "reason": ["test_fund"]}).to_csv(exclusion_path, index=False)
+    holdings = pd.DataFrame(
+        {
+            "ticker": ["AAPL", "SPY", "IVV", "CUSTOM", "MSFT"],
+            "issuer": ["APPLE INC", "SPDR S&P 500 ETF TR", "ISHARES TR", "CUSTOM TRUST", "MICROSOFT CORP"],
+            "sec_type": ["SH", "SH", "SH", "SH", "SH"],
+            "value": [100.0, 20.0, 30.0, 40.0, 50.0],
+        }
+    )
+
+    filtered = priceable_holdings(
+        holdings,
+        exclude_fund_like=True,
+        fund_ticker_exclusions_path=exclusion_path,
+    )
+
+    assert filtered["ticker"].tolist() == ["AAPL", "MSFT"]
+    diag = filtered.attrs["price_filter_diagnostics"]
+    assert diag["exclude_fund_like"] is True
+    assert diag["rows_fund_like_dropped"] == 3
+    assert diag["value_fund_like_dropped"] == 90.0
+    assert {"CUSTOM", "IVV", "SPY"}.issubset(set(diag["tickers_fund_like_dropped_sample"]))
 
 
 def test_yfinance_ticker_filter_rejects_non_us_vendor_symbols():

@@ -23,6 +23,7 @@ This repository is intended as a reproducible systematic research sandbox, not a
 - `report.py` - dashboard chart rendering.
 - `run_example.py` - runnable synthetic/live research pipeline.
 - `data/security_overrides.csv` - issuer-group overrides for multi-class securities such as `GOOG`/`GOOGL`.
+- `data/fund_ticker_exclusions.csv` - supplemental ETF/ETN/fund ticker exclusions for equity-only research runs.
 
 ## Setup
 
@@ -64,6 +65,24 @@ Full live run:
 
 ```powershell
 python -B run_example.py --mode live
+```
+
+ETF-excluded equity-only live run:
+
+```powershell
+python -B run_example.py --mode live --equity-only
+```
+
+For faster diagnostics before a full run:
+
+```powershell
+python -B run_example.py --mode live --equity-only --skip-marginal --skip-sweep
+```
+
+To populate OpenFIGI security metadata for an older ticker-only cache, run once with:
+
+```powershell
+python -B run_example.py --mode live-smoke --equity-only --refresh-openfigi-metadata
 ```
 
 Outputs are written to timestamped folders under `reports/`, including:

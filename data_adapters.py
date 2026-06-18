@@ -27,12 +27,45 @@ import requests
 PRICE_ELIGIBLE_SEC_TYPES = {"SH"}
 YFINANCE_TICKER_RE = r"^[A-Z]{1,6}([.\-][A-Z]{1,2})?$"
 OPENFIGI_SELECTOR_VERSION = 2
+OPENFIGI_METADATA_VERSION = 1
 PRICE_COVERAGE_SCHEMA_VERSION = 2
 OPENFIGI_US_EQUITY_FILTERS = {
     "currency": "USD",
     "marketSecDes": "Equity",
     "exchCode": "US",
 }
+OPENFIGI_METADATA_FIELDS = [
+    "name",
+    "marketSector",
+    "marketSecDes",
+    "securityType",
+    "securityType2",
+    "securityDescription",
+    "exchCode",
+    "currency",
+    "figi",
+    "compositeFIGI",
+    "shareClassFIGI",
+]
+DEFAULT_FUND_LIKE_TICKERS = {
+    "AGG", "ARKK", "BIL", "DIA", "EEM", "EFA", "EMB", "HYG", "IAU", "IEFA",
+    "IEMG", "IJH", "IJR", "IVV", "IWB", "IWD", "IWF", "IWM", "IWN", "IWO",
+    "LQD", "MDY", "QQQ", "RSP", "SCHA", "SCHF", "SCHX", "SHV", "SLV", "SPY",
+    "TIP", "TLT", "USO", "VB", "VBK", "VBR", "VCIT", "VEA", "VGT", "VNQ",
+    "VO", "VOE", "VONG", "VOO", "VOT", "VTI", "VTV", "VUG", "VV", "VWO",
+    "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY",
+}
+FUND_LIKE_ISSUER_RE = re.compile(
+    r"\b(?:"
+    r"ETF|ETN|EXCHANGE TRADED|ISHARES|SPDR|SELECT SECTOR SPDR|VANGUARD INDEX|"
+    r"VANGUARD WORLD|VANGUARD WHITEHALL|VANGUARD SCOTTSDALE|INVESCO QQQ|"
+    r"PROSHARES|DIREXION|GLOBAL X|WISDOMTREE|VANECK|VAN ECK|ARK ETF|"
+    r"FIRST TR EXCHANGE|FIRST TRUST EXCHANGE|JPMORGAN EXCHANGE TRADED|"
+    r"PIMCO ETF|SCHWAB STRATEGIC TR|BLACKROCK ETF|ISHARES TR|ISHARES INC|"
+    r"ISHARES U S ETF|SPDR INDEX SHS FDS|SPDR SERIES TRUST"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _normalise_yfinance_ticker(value) -> str | None:
@@ -44,6 +77,26 @@ def _normalise_yfinance_ticker(value) -> str | None:
 
 def _is_yfinance_ticker(value) -> bool:
     return _normalise_yfinance_ticker(value) is not None
+
+
+def _load_ticker_exclusion_file(path: str | Path | None) -> set[str]:
+    if path is None:
+        return set()
+    p = Path(path)
+    if not p.exists():
+        return set()
+    if p.suffix.lower() == ".csv":
+        df = pd.read_csv(p)
+        if "ticker" not in df.columns:
+            raise ValueError(f"ticker exclusion file missing ticker column: {p}")
+        raw = df["ticker"]
+    else:
+        raw = pd.Series(p.read_text(encoding="utf-8").splitlines())
+    return {
+        t
+        for t in raw.map(_normalise_yfinance_ticker).dropna().astype(str)
+        if t and not t.startswith("#")
+    }
 
 
 def _openfigi_id_type(identifier: str) -> str:
@@ -59,7 +112,30 @@ def _is_us_openfigi_exchange(value) -> bool:
     return exch == "US" or (len(exch) == 2 and exch.startswith("U"))
 
 
-def _select_openfigi_ticker(data: list[dict] | None) -> str | None:
+def _is_openfigi_fund_like(ticker: str | None, rec: dict | None) -> bool:
+    ticker_norm = _normalise_yfinance_ticker(ticker) if ticker else None
+    if ticker_norm in DEFAULT_FUND_LIKE_TICKERS:
+        return True
+    if not isinstance(rec, dict):
+        return False
+    text = " ".join(str(rec.get(k, "")) for k in OPENFIGI_METADATA_FIELDS).upper()
+    return bool(
+        re.search(
+            r"\b(?:ETF|ETN|EXCHANGE TRADED|OPEN-END FUND|CLOSED-END FUND|MUTUAL FUND|"
+            r"UNIT INVESTMENT TRUST|INDEX FUND)\b",
+            text,
+        )
+    )
+
+
+def _is_openfigi_common_stock_like(rec: dict | None, *, fund_like: bool) -> bool:
+    if fund_like or not isinstance(rec, dict):
+        return False
+    text = " ".join(str(rec.get(k, "")) for k in ("securityType", "securityType2", "securityDescription")).upper()
+    return any(term in text for term in ("COMMON STOCK", "ADR", "REIT", "ORDINARY SHARE", "SHS"))
+
+
+def _select_openfigi_record(data: list[dict] | None) -> dict | None:
     if not data:
         return None
     candidates = []
@@ -86,14 +162,38 @@ def _select_openfigi_ticker(data: list[dict] | None) -> str | None:
             score += 2
         if market_sector == "EQUITY":
             score += 1
-        candidates.append((score, ticker))
+        selected = dict(rec)
+        selected["ticker"] = ticker
+        candidates.append((score, ticker, selected))
     if not candidates:
         return None
     candidates.sort(key=lambda x: (-x[0], x[1]))
-    return candidates[0][1]
+    return candidates[0][2]
 
 
-def _load_openfigi_cache(cache_path: str | Path | None) -> dict[str, str | None]:
+def _select_openfigi_ticker(data: list[dict] | None) -> str | None:
+    rec = _select_openfigi_record(data)
+    return None if rec is None else _normalise_yfinance_ticker(rec.get("ticker"))
+
+
+def _openfigi_cache_row(cusip: str, ticker: str | None, rec: dict | None = None) -> dict:
+    ticker_norm = _normalise_yfinance_ticker(ticker)
+    fund_like = _is_openfigi_fund_like(ticker_norm, rec)
+    row = {
+        "cusip": str(cusip).strip().upper(),
+        "ticker": ticker_norm,
+        "id_type": _openfigi_id_type(cusip),
+        "selector_version": OPENFIGI_SELECTOR_VERSION,
+        "metadata_version": OPENFIGI_METADATA_VERSION if rec else pd.NA,
+        "is_fund_like": bool(fund_like),
+        "is_common_stock_like": bool(_is_openfigi_common_stock_like(rec, fund_like=fund_like)),
+    }
+    for field in OPENFIGI_METADATA_FIELDS:
+        row[field] = None if rec is None else rec.get(field)
+    return row
+
+
+def _load_openfigi_cache_entries(cache_path: str | Path | None) -> dict[str, dict]:
     if cache_path is None:
         return {}
     path = Path(cache_path)
@@ -102,33 +202,75 @@ def _load_openfigi_cache(cache_path: str | Path | None) -> dict[str, str | None]
     df = pd.read_parquet(path)
     if "cusip" not in df or "ticker" not in df:
         return {}
-    out: dict[str, str | None] = {}
+    entries: dict[str, dict] = {}
     has_selector_version = "selector_version" in df.columns
-    version = df["selector_version"] if has_selector_version else pd.Series([pd.NA] * len(df))
-    for row, selector_version in zip(df[["cusip", "ticker"]].itertuples(index=False), version):
-        cusip = str(row.cusip).strip().upper()
-        ticker = _normalise_yfinance_ticker(row.ticker)
-        if ticker is not None:
-            out[cusip] = ticker
-        elif has_selector_version and pd.notna(selector_version) and int(selector_version) >= OPENFIGI_SELECTOR_VERSION:
-            out[cusip] = None
-    return out
+    for raw in df.to_dict(orient="records"):
+        cusip = str(raw.get("cusip", "")).strip().upper()
+        if not cusip:
+            continue
+        ticker = _normalise_yfinance_ticker(raw.get("ticker"))
+        selector_version = raw.get("selector_version") if has_selector_version else pd.NA
+        is_current_negative = (
+            ticker is None
+            and has_selector_version
+            and pd.notna(selector_version)
+            and int(selector_version) >= OPENFIGI_SELECTOR_VERSION
+        )
+        if ticker is None and not is_current_negative:
+            continue
+        row = _openfigi_cache_row(cusip, ticker, None)
+        for key, value in raw.items():
+            row[key] = value
+        row["cusip"] = cusip
+        row["ticker"] = ticker
+        row["id_type"] = row.get("id_type") or _openfigi_id_type(cusip)
+        row["selector_version"] = (
+            int(row["selector_version"]) if pd.notna(row.get("selector_version")) else OPENFIGI_SELECTOR_VERSION
+        )
+        entries[cusip] = row
+    return entries
 
 
-def _write_openfigi_cache(cache_path: str | Path | None, cache: dict[str, str | None]) -> None:
+def _load_openfigi_cache(cache_path: str | Path | None) -> dict[str, str | None]:
+    return {c: row.get("ticker") for c, row in _load_openfigi_cache_entries(cache_path).items()}
+
+
+def load_openfigi_metadata(cache_path: str | Path | None) -> pd.DataFrame:
+    entries = _load_openfigi_cache_entries(cache_path)
+    if not entries:
+        return pd.DataFrame()
+    df = pd.DataFrame(entries.values())
+    keep = [
+        "cusip",
+        "ticker",
+        "metadata_version",
+        "is_fund_like",
+        "is_common_stock_like",
+        *OPENFIGI_METADATA_FIELDS,
+    ]
+    for col in keep:
+        if col not in df:
+            df[col] = pd.NA
+    return df[keep].drop_duplicates("cusip", keep="last")
+
+
+def _write_openfigi_cache(cache_path: str | Path | None, cache: dict[str, str | None | dict]) -> None:
     if cache_path is None:
         return
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {
-            "cusip": c,
-            "ticker": t,
-            "id_type": _openfigi_id_type(c),
-            "selector_version": OPENFIGI_SELECTOR_VERSION,
-        }
-        for c, t in sorted(cache.items())
-    ]
+    rows = []
+    for c, value in sorted(cache.items()):
+        if isinstance(value, dict):
+            row = _openfigi_cache_row(c, value.get("ticker"), value)
+            row.update(value)
+            row["cusip"] = str(c).strip().upper()
+            row["ticker"] = _normalise_yfinance_ticker(row.get("ticker"))
+            row["id_type"] = row.get("id_type") or _openfigi_id_type(c)
+            row["selector_version"] = OPENFIGI_SELECTOR_VERSION
+        else:
+            row = _openfigi_cache_row(c, value, None)
+        rows.append(row)
     pd.DataFrame(rows).to_parquet(path, index=False)
 
 
@@ -837,6 +979,7 @@ def cusip_to_ticker(
     api_key: str | None = None,
     *,
     cache_path: str | Path | None = None,
+    require_metadata: bool = False,
 ) -> dict[str, str]:
     ## FRICTION: this is THE assembly bottleneck. Cache the map to disk and only
     ##           query new CUSIPs. ~25 req/min without a (free) OpenFIGI key.
@@ -845,14 +988,26 @@ def cusip_to_ticker(
     if api_key:
         hdr["X-OPENFIGI-APIKEY"] = api_key
     uniq = sorted({str(c).strip().upper() for c in cusips if pd.notna(c)})
-    cache = _load_openfigi_cache(cache_path)
-    cached = {c: cache[c] for c in uniq if c in cache}
+    cache = _load_openfigi_cache_entries(cache_path)
+    cached = {c: cache[c].get("ticker") for c in uniq if c in cache}
     mp: dict[str, str] = {c: t for c, t in cached.items() if t is not None}
-    todo = [c for c in uniq if c not in cache]
+    todo = []
+    for c in uniq:
+        if c not in cache:
+            todo.append(c)
+            continue
+        if require_metadata:
+            metadata_version = cache[c].get("metadata_version")
+            if pd.isna(metadata_version) or int(metadata_version) < OPENFIGI_METADATA_VERSION:
+                todo.append(c)
     if cache_path is not None:
         print(f"  OpenFIGI cache: {len(cached)}/{len(uniq)} CUSIPs found at {cache_path}")
+        if require_metadata:
+            missing_meta = len([c for c in uniq if c in cache and c in todo])
+            print(f"  OpenFIGI metadata refresh: {missing_meta} cached CUSIPs missing current metadata")
     n_batches = int(np.ceil(len(todo) / 100)) if todo else 0
-    print(f"  OpenFIGI mapping: {len(todo)} uncached CUSIPs in {n_batches} batches")
+    todo_label = "CUSIPs needing mapping/metadata" if require_metadata else "uncached CUSIPs"
+    print(f"  OpenFIGI mapping: {len(todo)} {todo_label} in {n_batches} batches")
     for i in range(0, len(todo), 100):
         batch_cusips = todo[i:i + 100]
         batch_no = i // 100 + 1
@@ -870,16 +1025,19 @@ def cusip_to_ticker(
         batch_rejected = 0
         for c, res in zip(batch_cusips, r.json()):
             data = res.get("data") if isinstance(res, dict) else None
-            ticker = _select_openfigi_ticker(data)
-            if ticker is not None:
+            rec = _select_openfigi_record(data)
+            ticker = None if rec is None else _normalise_yfinance_ticker(rec.get("ticker"))
+            if ticker is not None and rec is not None:
                 mp[c] = ticker
-                cache[c] = ticker
+                cache[c] = _openfigi_cache_row(c, ticker, rec)
                 batch_mapped += 1
             elif data:
-                cache[c] = None
+                if c not in cache or cache[c].get("ticker") is None:
+                    cache[c] = _openfigi_cache_row(c, None, None)
                 batch_rejected += 1
             else:
-                cache[c] = None
+                if c not in cache or cache[c].get("ticker") is None:
+                    cache[c] = _openfigi_cache_row(c, None, None)
         print(
             f"    OpenFIGI batch {batch_no}/{n_batches}: "
             f"mapped {batch_mapped}/{len(batch_cusips)}, rejected_non_yahoo_us {batch_rejected}"
@@ -972,12 +1130,20 @@ def map_holdings_to_tickers(
     holdings: pd.DataFrame,
     cmap: dict[str, str],
     *,
+    openfigi_metadata: pd.DataFrame | None = None,
     min_value_coverage: float = 0.90,
     strict: bool = False,
 ) -> pd.DataFrame:
     h = holdings.copy()
+    h["cusip"] = h["cusip"].astype(str).str.strip().str.upper()
     h["ticker"] = h["cusip"].map(cmap).astype("string").str.strip()
     h["ticker"] = h["ticker"].mask(h["ticker"].eq(""))
+    if openfigi_metadata is not None and not openfigi_metadata.empty:
+        meta = openfigi_metadata.copy()
+        meta["cusip"] = meta["cusip"].astype(str).str.strip().str.upper()
+        meta = meta.drop(columns=["ticker"], errors="ignore")
+        add_cols = [c for c in meta.columns if c == "cusip" or c not in h.columns]
+        h = h.merge(meta[add_cols].drop_duplicates("cusip", keep="last"), on="cusip", how="left")
     diag = mapping_diagnostics(h, cmap)
     msg = (
         "CUSIP mapping coverage: "
@@ -1011,31 +1177,96 @@ def map_holdings_to_tickers(
     return out
 
 
-def priceable_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
+def _fund_like_mask(holdings: pd.DataFrame, extra_fund_tickers: set[str] | None = None) -> pd.Series:
+    h = holdings.copy()
+    ticker = h.get("ticker", pd.Series("", index=h.index)).astype("string").str.strip().str.upper()
+    issuer = h.get("issuer", pd.Series("", index=h.index)).fillna("").astype(str)
+    security_text = pd.Series("", index=h.index, dtype="string")
+    for col in ("security_type", "securityType", "securityType2", "securityDescription", "marketSecDes"):
+        if col in h:
+            security_text = security_text.str.cat(h[col].fillna("").astype(str), sep=" ")
+    fund_tickers = set(DEFAULT_FUND_LIKE_TICKERS)
+    if extra_fund_tickers:
+        fund_tickers |= {str(t).strip().upper() for t in extra_fund_tickers if str(t).strip()}
+    by_ticker = ticker.isin(fund_tickers)
+    by_metadata = (
+        h["is_fund_like"].fillna(False).astype(bool)
+        if "is_fund_like" in h
+        else pd.Series(False, index=h.index)
+    )
+    by_issuer = issuer.str.contains(FUND_LIKE_ISSUER_RE, na=False)
+    by_security_text = security_text.str.contains(
+        r"\b(?:ETF|ETN|EXCHANGE TRADED FUND|EXCHANGE TRADED PRODUCT|OPEN-END FUND|CLOSED-END FUND|MUTUAL FUND)\b",
+        case=False,
+        regex=True,
+        na=False,
+    )
+    return (by_metadata | by_ticker | by_issuer | by_security_text).astype(bool)
+
+
+def priceable_holdings(
+    holdings: pd.DataFrame,
+    *,
+    exclude_fund_like: bool = False,
+    fund_ticker_exclusions_path: str | Path | None = None,
+    extra_fund_tickers: set[str] | None = None,
+) -> pd.DataFrame:
     """
     Keep holdings that can plausibly be priced as exchange-traded equities by
     yfinance. 13F PRN rows are usually bonds/convertibles and OpenFIGI may map
     them to descriptions like 'ABC 2.25 08/15/28', not stock symbols.
+
+    If exclude_fund_like=True, also drop ETF/ETN/fund-like rows before idea
+    generation. This is a research-design filter for equity-only clone tests;
+    diagnostics report the dropped exposure so the choice is auditable.
     """
     h = holdings.copy()
     sec_type = h.get("sec_type", pd.Series("SH", index=h.index)).fillna("SH").astype(str).str.upper()
     ticker = h["ticker"].astype("string").str.strip().str.upper()
     keep_sec = sec_type.isin(PRICE_ELIGIBLE_SEC_TYPES)
     keep_ticker = ticker.map(_is_yfinance_ticker).astype(bool)
-    out = h.loc[keep_sec & keep_ticker].copy()
+    extra_from_file = _load_ticker_exclusion_file(fund_ticker_exclusions_path)
+    if extra_fund_tickers:
+        extra_from_file |= {str(t).strip().upper() for t in extra_fund_tickers if str(t).strip()}
+    fund_like = _fund_like_mask(h, extra_from_file) if exclude_fund_like else pd.Series(False, index=h.index)
+    out = h.loc[keep_sec & keep_ticker & ~fund_like].copy()
     out["ticker"] = ticker.loc[out.index]
     dropped = int(len(h) - len(out))
+    dropped_fund_like = int((keep_sec & keep_ticker & fund_like).sum())
+    fund_like_value = float(h.loc[keep_sec & keep_ticker & fund_like, "value"].sum()) if "value" in h else float("nan")
+    fund_like_tickers = sorted(ticker.loc[keep_sec & keep_ticker & fund_like].dropna().unique().tolist())[:25]
     if dropped:
+        reason = (
+            "non-equity sec_type, invalid yfinance ticker, or ETF/ETN/fund-like row"
+            if exclude_fund_like
+            else "non-equity sec_type or non-yfinance ticker"
+        )
         print(
             "  [warn] price input filter: "
-            f"dropped {dropped}/{len(h)} mapped rows with non-equity sec_type or non-yfinance ticker"
+            f"dropped {dropped}/{len(h)} mapped rows with {reason}"
+            + (f"; fund_like rows dropped {dropped_fund_like}" if exclude_fund_like else "")
+        )
+    if exclude_fund_like:
+        print(
+            "  equity-only filter: "
+            f"dropped {dropped_fund_like} ETF/ETN/fund-like rows before pricing"
+            + (f"; sample: {', '.join(fund_like_tickers[:15])}" if fund_like_tickers else "")
         )
     out.attrs.update(h.attrs)
     out.attrs["price_filter_diagnostics"] = {
         "rows_total": int(len(h)),
         "rows_priceable": int(len(out)),
         "rows_dropped": dropped,
-        "drop_reason": "non_equity_or_invalid_yfinance_ticker",
+        "rows_fund_like_dropped": dropped_fund_like,
+        "value_fund_like_dropped": fund_like_value,
+        "tickers_fund_like_dropped_sample": fund_like_tickers,
+        "exclude_fund_like": bool(exclude_fund_like),
+        "fund_ticker_exclusions_path": str(fund_ticker_exclusions_path) if fund_ticker_exclusions_path else None,
+        "drop_reason": (
+            "non_equity_or_invalid_yfinance_ticker_or_fund_like"
+            if exclude_fund_like
+            else "non_equity_or_invalid_yfinance_ticker"
+        ),
     }
     return out
 

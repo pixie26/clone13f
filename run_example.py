@@ -54,6 +54,9 @@ LIVE_CONFIG = {
     "openfigi_cache_path": "openfigi_cache.parquet",
     "price_cache_path": "yfinance_close_cache.parquet",
     "security_overrides_path": "data/security_overrides.csv",
+    "exclude_fund_like_holdings": False,
+    "fund_ticker_exclusions_path": "data/fund_ticker_exclusions.csv",
+    "refresh_openfigi_metadata": False,
 }
 
 
@@ -273,9 +276,25 @@ def build_live_data(
         target_cusips,
         api_key=cfg["openfigi_key"],
         cache_path=cfg.get("openfigi_cache_path"),
+        require_metadata=bool(cfg.get("refresh_openfigi_metadata", False)),
     )
-    holdings = da.map_holdings_to_tickers(h_cusip, cmap)
-    holdings = da.priceable_holdings(holdings)
+    openfigi_metadata = da.load_openfigi_metadata(cfg.get("openfigi_cache_path"))
+    if not openfigi_metadata.empty:
+        metadata_rows = int(openfigi_metadata["metadata_version"].notna().sum())
+        print(
+            "  OpenFIGI metadata cache: "
+            f"{metadata_rows}/{len(openfigi_metadata)} cached rows have metadata"
+        )
+    holdings = da.map_holdings_to_tickers(
+        h_cusip,
+        cmap,
+        openfigi_metadata=openfigi_metadata,
+    )
+    holdings = da.priceable_holdings(
+        holdings,
+        exclude_fund_like=bool(cfg.get("exclude_fund_like_holdings", False)),
+        fund_ticker_exclusions_path=cfg.get("fund_ticker_exclusions_path"),
+    )
     print("[1/6] Downloading monthly prices from yfinance")
     price_holdings = holdings
     if price_ticker_limit:
@@ -317,8 +336,14 @@ def build_live_data(
     return holdings, prices, factors, None, None, bench_ret
 
 
-def run_live_smoke(output_root: pathlib.Path, *, cusip_limit: int, ticker_limit: int) -> pathlib.Path:
-    cfg = dict(LIVE_CONFIG)
+def run_live_smoke(
+    output_root: pathlib.Path,
+    *,
+    cusip_limit: int,
+    ticker_limit: int,
+    cfg: dict | None = None,
+) -> pathlib.Path:
+    cfg = dict(LIVE_CONFIG if cfg is None else cfg)
     holdings, prices, factors, _, _, bench_ret = build_live_data(
         cfg,
         cusip_limit=cusip_limit,
@@ -334,6 +359,9 @@ def run_live_smoke(output_root: pathlib.Path, *, cusip_limit: int, ticker_limit:
             "cusip_limit": cusip_limit,
             "ticker_limit": ticker_limit,
             "benchmark_ticker": cfg["benchmark_ticker"],
+            "exclude_fund_like_holdings": bool(cfg.get("exclude_fund_like_holdings", False)),
+            "fund_ticker_exclusions_path": cfg.get("fund_ticker_exclusions_path"),
+            "refresh_openfigi_metadata": bool(cfg.get("refresh_openfigi_metadata", False)),
         },
         "input_summary": {
             "holdings_rows": int(len(holdings)),
@@ -844,10 +872,13 @@ def _print_startup_parameters(
     smoke_tickers: int | None = None,
     skip_marginal: bool = False,
     skip_sweep: bool = False,
+    equity_only: bool = False,
+    refresh_openfigi_metadata: bool = False,
 ) -> None:
     print("\nRun Parameters")
     print(f"  mode                  {mode}")
     print(f"  output_root           {output_root}")
+    print(f"  equity-only filter    {equity_only}")
     if mode in {"live", "live-smoke"}:
         print(f"  SEC history start     {LIVE_CONFIG.get('sec_history_start')}")
         print(f"  price window          {LIVE_CONFIG.get('start')} -> {LIVE_CONFIG.get('end')}")
@@ -857,6 +888,9 @@ def _print_startup_parameters(
         print(f"  OpenFIGI cache        {LIVE_CONFIG.get('openfigi_cache_path')}")
         print(f"  price cache           {LIVE_CONFIG.get('price_cache_path')}")
         print(f"  security overrides    {LIVE_CONFIG.get('security_overrides_path')}")
+        if equity_only:
+            print(f"  fund exclusions       {LIVE_CONFIG.get('fund_ticker_exclusions_path')}")
+        print(f"  refresh FIGI metadata {refresh_openfigi_metadata}")
         print(
             "  live universe         "
             f"min_aum={LIVE_CONFIG.get('min_aum'):.0f}, "
@@ -914,8 +948,15 @@ def run(
     skip_marginal: bool = False,
     skip_sweep: bool = False,
     sweep_checkpoint_every: int = 5,
+    equity_only: bool = False,
+    refresh_openfigi_metadata: bool = False,
 ) -> pathlib.Path:
     cfg_a, cfg_b, axes, train_m, test_m = _default_run_configs()
+    live_config = dict(LIVE_CONFIG)
+    if equity_only:
+        live_config["exclude_fund_like_holdings"] = True
+    if refresh_openfigi_metadata:
+        live_config["refresh_openfigi_metadata"] = True
     _print_startup_parameters(
         mode=mode,
         output_root=output_root,
@@ -928,13 +969,20 @@ def run(
         smoke_tickers=smoke_tickers,
         skip_marginal=skip_marginal,
         skip_sweep=skip_sweep,
+        equity_only=equity_only,
+        refresh_openfigi_metadata=refresh_openfigi_metadata,
     )
     if mode == "synthetic":
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
     elif mode == "live-smoke":
-        return run_live_smoke(output_root, cusip_limit=smoke_cusips, ticker_limit=smoke_tickers)
+        return run_live_smoke(
+            output_root,
+            cusip_limit=smoke_cusips,
+            ticker_limit=smoke_tickers,
+            cfg=live_config,
+        )
     else:
-        holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(LIVE_CONFIG)
+        holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(live_config)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = output_root / run_id
@@ -950,7 +998,7 @@ def run(
     print(f"    {len(visible_cache)} month-end visible-version snapshots in {time.perf_counter() - t_step:.1f}s")
     security_groups = load_security_groups(
         prices.columns,
-        LIVE_CONFIG.get("security_overrides_path", "data/security_overrides.csv"),
+        live_config.get("security_overrides_path", "data/security_overrides.csv"),
     )
 
     print("[3/6] Running thesis and placebo backtests")
@@ -1205,7 +1253,7 @@ def run(
     )
     manifest_payload = {
         "mode": mode,
-        "live_config": LIVE_CONFIG if mode == "live" else None,
+        "live_config": live_config if mode == "live" else None,
         "cfg_thesis": asdict(cfg_a),
         "cfg_placebo": asdict(cfg_b),
         "sweep_axes": {f"{scope}.{field}": values for (scope, field), values in axes.items()},
@@ -1221,7 +1269,7 @@ def run(
             "price_filter_diagnostics": holdings.attrs.get("price_filter_diagnostics"),
             "price_alignment_diagnostics": holdings.attrs.get("price_alignment_diagnostics"),
             "price_diagnostics": prices.attrs.get("price_diagnostics"),
-            "security_overrides_path": LIVE_CONFIG.get("security_overrides_path", "data/security_overrides.csv"),
+            "security_overrides_path": live_config.get("security_overrides_path", "data/security_overrides.csv"),
             "issuer_group_count": int(security_groups.nunique()),
             "value_unit_diagnostics": {
                 "path": str(value_diag_path),
@@ -1253,6 +1301,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-marginal", action="store_true", help="Skip marginal-IR ablation after thesis/placebo.")
     parser.add_argument("--skip-sweep", action="store_true", help="Skip parameter grid and walk-forward sweep.")
     parser.add_argument(
+        "--equity-only",
+        action="store_true",
+        help="Exclude ETF/ETN/fund-like 13F rows before pricing and idea generation.",
+    )
+    parser.add_argument(
+        "--refresh-openfigi-metadata",
+        action="store_true",
+        help="Re-query cached OpenFIGI CUSIPs that lack metadata fields needed for security classification.",
+    )
+    parser.add_argument(
         "--sweep-checkpoint-every",
         type=int,
         default=5,
@@ -1272,6 +1330,8 @@ def main() -> None:
         skip_marginal=args.skip_marginal,
         skip_sweep=args.skip_sweep,
         sweep_checkpoint_every=args.sweep_checkpoint_every,
+        equity_only=args.equity_only,
+        refresh_openfigi_metadata=args.refresh_openfigi_metadata,
     )
 
 
