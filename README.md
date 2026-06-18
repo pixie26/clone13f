@@ -67,6 +67,27 @@ Full live run:
 python -B run_example.py --mode live
 ```
 
+The live thesis default uses `active_benchmark_source="spy_holdings"` for
+`active_weight` signals. Prepare a point-in-time monthly SPY/S&P 500 weight file
+at `data/processed/benchmark_weights_spy.parquet` or pass a path explicitly:
+
+```powershell
+python -B run_example.py --mode live --active-benchmark-weights data/processed/benchmark_weights_spy.parquet
+```
+
+The file may be CSV, Parquet, or XLSX, and must contain long-form columns:
+
+```text
+month_end,ticker,weight
+2020-01-31,AAPL,0.045
+2020-01-31,MSFT,0.038
+```
+
+Weights can be decimals or percentages. The loader normalizes tickers such as
+`BRK.B` to `BRK-B`. It uses only snapshots dated on or before each rebalance
+month and fails if coverage is missing or stale, so a current SPY snapshot is not
+silently backfilled into historical tests.
+
 ETF-excluded equity-only live run:
 
 ```powershell

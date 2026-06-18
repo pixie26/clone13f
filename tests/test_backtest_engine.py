@@ -466,6 +466,7 @@ def test_walk_forward_selects_on_active_sharpe_not_raw_market_return(monkeypatch
         chars=None,
         visible_versions_cache=None,
         security_groups=None,
+        active_benchmark_weights_by_month=None,
     ):
         if cfg.portfolio.idea_signal == "active_weight":
             active = pd.Series([0.01, 0.02, 0.01], index=months).reindex(px.index)
@@ -894,6 +895,104 @@ def test_active_selection_cache_backtest_matches_direct_run_with_same_benchmark(
     pd.testing.assert_series_equal(cached, direct)
 
 
+def test_external_active_benchmark_direct_and_cached_paths_match():
+    months = pd.date_range("2020-01-31", periods=4, freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": manager,
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": manager,
+                "submission_type": "13F-HR",
+                "ticker": ticker,
+                "value": value,
+                "sec_type": "SH",
+            }
+            for manager, ticker, value in [
+                ("m1", "A", 70.0),
+                ("m1", "B", 30.0),
+                ("m2", "A", 20.0),
+                ("m2", "B", 80.0),
+            ]
+        ]
+    )
+    prices = pd.DataFrame({"A": [0.01, 0.02, 0.03, 0.04], "B": [0.0, 0.0, 0.0, 0.0]}, index=months)
+    cfg = BacktestConfig(
+        active_benchmark_source="spy_holdings",
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(
+            idea_signal="active_weight",
+            min_consensus_funds=1,
+            max_name_weight=1.0,
+            min_active_weight_holdings=1,
+        ),
+    )
+    external = {month: pd.Series({"A": 0.60, "B": 0.40}) for month in months}
+    chars = en.manager_characteristics(holdings)
+    visible_cache = en.build_visible_versions_cache(chars, prices.index)
+    selected = en.build_rebalance_selection_cache(
+        holdings,
+        prices,
+        cfg,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+    )
+
+    direct = run_backtest(
+        holdings,
+        prices,
+        cfg,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+        active_benchmark_weights_by_month=external,
+    )
+    cached = en.run_backtest_from_selection_cache(prices, cfg, selected, external)
+
+    pd.testing.assert_series_equal(cached, direct)
+
+
+def test_external_active_benchmark_missing_weights_fails_loudly():
+    months = pd.date_range("2020-01-31", periods=2, freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "m1",
+                "submission_type": "13F-HR",
+                "ticker": "A",
+                "value": 100.0,
+                "sec_type": "SH",
+            }
+        ]
+    )
+    prices = pd.DataFrame({"A": [0.01, 0.02]}, index=months)
+    cfg = BacktestConfig(
+        active_benchmark_source="spy_holdings",
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="active_weight", max_name_weight=1.0, min_active_weight_holdings=1),
+    )
+
+    with pytest.raises(ValueError, match="requires active_benchmark_weights_by_month"):
+        run_backtest(holdings, prices, cfg)
+
+
 def test_holding_horizon_is_measured_in_quarters_not_rebalance_events():
     rows = [
         ("m1", "2019-12-31", "2020-01-15", "a1", "A"),
@@ -983,6 +1082,113 @@ def test_min_portfolio_names_marks_rebalance_invalid_and_moves_to_cash():
     assert "target_names_below_min_portfolio_names" in ret.attrs["rebalance_summary"].loc[0, "note"]
     assert trace["summary"].loc[0, "effective_names"] == 0
     assert trace["holdings"].empty
+
+
+def test_stale_manager_versions_are_excluded_at_later_rebalances():
+    months = pd.date_range("2020-01-31", "2021-02-28", freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "stopped",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "old",
+                "submission_type": "13F-HR",
+                "ticker": "OLD",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "fresh",
+                "period_date": pd.Timestamp("2020-12-31"),
+                "filing_date": pd.Timestamp("2021-02-15"),
+                "accession_number": "new",
+                "submission_type": "13F-HR",
+                "ticker": "NEW",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+        ]
+    )
+    prices = pd.DataFrame(0.0, index=months, columns=["OLD", "NEW"])
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            max_stale_filing_months=6,
+            max_stale_period_months=6,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(top_n_ideas=1, min_consensus_funds=1, max_name_weight=1.0),
+    )
+
+    trace = rebalance_trace(holdings, prices, cfg)
+    last_summary = trace["summary"].iloc[-1]
+    last_holdings = trace["holdings"][trace["holdings"]["rebalance_month"].eq("2021-02-28")]
+
+    assert last_summary["visible_managers"] == 2
+    assert last_summary["stale_managers_dropped"] == 1
+    assert last_summary["stale_filing_managers"] == 1
+    assert last_summary["stale_period_managers"] == 1
+    assert last_summary["selected_managers"] == 1
+    assert last_holdings["ticker"].tolist() == ["NEW"]
+
+
+def test_active_benchmark_cache_excludes_stale_manager_versions():
+    months = pd.date_range("2020-01-31", "2021-02-28", freq="ME")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "stopped",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2020-01-15"),
+                "accession_number": "old",
+                "submission_type": "13F-HR",
+                "ticker": "OLD",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "fresh",
+                "period_date": pd.Timestamp("2020-12-31"),
+                "filing_date": pd.Timestamp("2021-02-15"),
+                "accession_number": "new",
+                "submission_type": "13F-HR",
+                "ticker": "NEW",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+        ]
+    )
+    prices = pd.DataFrame(0.0, index=months, columns=["OLD", "NEW"])
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            max_stale_filing_months=6,
+            max_stale_period_months=6,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(idea_signal="active_weight", max_name_weight=1.0),
+    )
+    chars = en.manager_characteristics(holdings)
+    visible_cache = en.build_visible_versions_cache(chars, prices.index)
+
+    active_cache = en.build_active_benchmark_weights_cache(
+        holdings,
+        prices,
+        chars=chars,
+        visible_versions_cache=visible_cache,
+        cfg=cfg,
+    )
+
+    assert active_cache[pd.Timestamp("2021-02-28")].index.tolist() == ["NEW"]
 
 
 def test_rebalance_trace_reports_auditable_rebalance_fields():
@@ -1393,10 +1599,17 @@ def test_priceable_holdings_can_exclude_fund_like_rows(tmp_path):
     pd.DataFrame({"ticker": ["CUSTOM"], "reason": ["test_fund"]}).to_csv(exclusion_path, index=False)
     holdings = pd.DataFrame(
         {
-            "ticker": ["AAPL", "SPY", "IVV", "CUSTOM", "MSFT"],
-            "issuer": ["APPLE INC", "SPDR S&P 500 ETF TR", "ISHARES TR", "CUSTOM TRUST", "MICROSOFT CORP"],
-            "sec_type": ["SH", "SH", "SH", "SH", "SH"],
-            "value": [100.0, 20.0, 30.0, 40.0, 50.0],
+            "ticker": ["AAPL", "SPY", "IVV", "VEU", "CUSTOM", "MSFT"],
+            "issuer": [
+                "APPLE INC",
+                "SPDR S&P 500 ETF TR",
+                "ISHARES TR",
+                "VANGUARD INTL EQUITY INDEX FDS",
+                "CUSTOM TRUST",
+                "MICROSOFT CORP",
+            ],
+            "sec_type": ["SH", "SH", "SH", "SH", "SH", "SH"],
+            "value": [100.0, 20.0, 30.0, 35.0, 40.0, 50.0],
         }
     )
 
@@ -1409,9 +1622,46 @@ def test_priceable_holdings_can_exclude_fund_like_rows(tmp_path):
     assert filtered["ticker"].tolist() == ["AAPL", "MSFT"]
     diag = filtered.attrs["price_filter_diagnostics"]
     assert diag["exclude_fund_like"] is True
-    assert diag["rows_fund_like_dropped"] == 3
-    assert diag["value_fund_like_dropped"] == 90.0
-    assert {"CUSTOM", "IVV", "SPY"}.issubset(set(diag["tickers_fund_like_dropped_sample"]))
+    assert diag["rows_fund_like_dropped"] == 4
+    assert diag["value_fund_like_dropped"] == 125.0
+    assert {"CUSTOM", "IVV", "SPY", "VEU"}.issubset(set(diag["tickers_fund_like_dropped_sample"]))
+
+
+def test_load_benchmark_weight_table_normalizes_tickers_and_percent_weights(tmp_path):
+    path = tmp_path / "spy_weights.csv"
+    pd.DataFrame(
+        {
+            "month_end": ["2020-01-31", "2020-01-31", "2020-02-29", "2020-02-29"],
+            "ticker": ["BRK.B", "AAPL", "BRK/B", "AAPL"],
+            "weight": ["2.5%", "7.5%", "3.0%", "7.0%"],
+        }
+    ).to_csv(path, index=False)
+
+    table = da.load_benchmark_weight_table(path)
+    weights = da.benchmark_weights_by_month(
+        table,
+        pd.to_datetime(["2020-01-31", "2020-02-29"]),
+        max_stale_days=45,
+    )
+
+    assert set(table["ticker"]) == {"AAPL", "BRK-B"}
+    assert weights[pd.Timestamp("2020-01-31")].sum() == pytest.approx(1.0)
+    assert weights[pd.Timestamp("2020-01-31")].loc["BRK-B"] == pytest.approx(0.25)
+
+
+def test_benchmark_weights_by_month_rejects_uncovered_history(tmp_path):
+    path = tmp_path / "spy_weights.csv"
+    pd.DataFrame(
+        {
+            "month_end": ["2020-02-29"],
+            "ticker": ["AAPL"],
+            "weight": [1.0],
+        }
+    ).to_csv(path, index=False)
+    table = da.load_benchmark_weight_table(path)
+
+    with pytest.raises(ValueError, match="does not cover requested months"):
+        da.benchmark_weights_by_month(table, pd.to_datetime(["2020-01-31", "2020-02-29"]))
 
 
 def test_yfinance_ticker_filter_rejects_non_us_vendor_symbols():

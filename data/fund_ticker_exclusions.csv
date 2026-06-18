@@ -37,6 +37,7 @@ VBK,equity_index_etf
 VBR,equity_index_etf
 VCIT,bond_etf
 VEA,equity_index_etf
+VEU,equity_index_etf
 VGT,sector_etf
 VNQ,sector_etf
 VO,equity_index_etf
@@ -48,6 +49,7 @@ VTI,equity_index_etf
 VTV,equity_index_etf
 VUG,equity_index_etf
 VV,equity_index_etf
+VXUS,equity_index_etf
 VWO,equity_index_etf
 XLB,sector_etf
 XLC,sector_etf

@@ -58,7 +58,8 @@ DEFAULT_FUND_LIKE_TICKERS = {
 FUND_LIKE_ISSUER_RE = re.compile(
     r"\b(?:"
     r"ETF|ETN|EXCHANGE TRADED|ISHARES|SPDR|SELECT SECTOR SPDR|VANGUARD INDEX|"
-    r"VANGUARD WORLD|VANGUARD WHITEHALL|VANGUARD SCOTTSDALE|INVESCO QQQ|"
+    r"VANGUARD WORLD|VANGUARD WHITEHALL|VANGUARD SCOTTSDALE|VANGUARD INTL|"
+    r"VANGUARD FTSE|VANGUARD ADMIRAL|VANGUARD TAX MANAGED|INVESCO QQQ|"
     r"PROSHARES|DIREXION|GLOBAL X|WISDOMTREE|VANECK|VAN ECK|ARK ETF|"
     r"FIRST TR EXCHANGE|FIRST TRUST EXCHANGE|JPMORGAN EXCHANGE TRADED|"
     r"PIMCO ETF|SCHWAB STRATEGIC TR|BLACKROCK ETF|ISHARES TR|ISHARES INC|"
@@ -77,6 +78,104 @@ def _normalise_yfinance_ticker(value) -> str | None:
 
 def _is_yfinance_ticker(value) -> bool:
     return _normalise_yfinance_ticker(value) is not None
+
+
+def _normalise_benchmark_ticker(value) -> str | None:
+    if pd.isna(value):
+        return None
+    ticker = str(value).strip().upper().replace("/", "-").replace(".", "-")
+    return ticker if re.fullmatch(YFINANCE_TICKER_RE, ticker) else None
+
+
+def _parse_weight_value(value):
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, str):
+        value = value.strip().replace("%", "").replace(",", "")
+    return pd.to_numeric(value, errors="coerce")
+
+
+def load_benchmark_weight_table(path: str | Path) -> pd.DataFrame:
+    """Load a long PIT benchmark weight table.
+
+    Expected columns are date/month_end/as_of_date, ticker/symbol, and weight.
+    Weights may be decimals or percentages. Tickers are normalized to yfinance
+    style, e.g. BRK.B -> BRK-B.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"benchmark weight file not found: {p}")
+    if p.suffix.lower() == ".parquet":
+        raw = pd.read_parquet(p)
+    elif p.suffix.lower() in {".xlsx", ".xls"}:
+        raw = pd.read_excel(p)
+    else:
+        raw = pd.read_csv(p)
+
+    cols = {str(c).strip().lower().replace(" ", "_"): c for c in raw.columns}
+
+    def pick(candidates: list[str]) -> str:
+        for name in candidates:
+            if name in cols:
+                return cols[name]
+        raise ValueError(f"benchmark weight file {p} missing one of columns: {candidates}")
+
+    date_col = pick(["month_end", "date", "as_of_date", "asof_date", "asof"])
+    ticker_col = pick(["ticker", "symbol"])
+    weight_col = pick(["weight", "weight_pct", "index_weight", "fund_weight", "percent"])
+
+    out = pd.DataFrame({
+        "month_end": pd.to_datetime(raw[date_col]).dt.to_period("M").dt.to_timestamp("M"),
+        "ticker": raw[ticker_col].map(_normalise_benchmark_ticker),
+        "weight": raw[weight_col].map(_parse_weight_value),
+    })
+    out = out.dropna(subset=["month_end", "ticker", "weight"])
+    out = out[out["weight"] > 0]
+    if out.empty:
+        raise ValueError(f"benchmark weight file has no usable positive weights: {p}")
+    # If the file is in percent units, normalize before the per-date sum step.
+    if out["weight"].max() > 1.0:
+        out["weight"] = out["weight"] / 100.0
+    out = out.groupby(["month_end", "ticker"], as_index=False)["weight"].sum()
+    totals = out.groupby("month_end")["weight"].transform("sum")
+    out["weight"] = out["weight"] / totals
+    return out.sort_values(["month_end", "ticker"]).reset_index(drop=True)
+
+
+def benchmark_weights_by_month(
+    weight_table: pd.DataFrame,
+    months,
+    *,
+    max_stale_days: int = 45,
+) -> dict[pd.Timestamp, pd.Series]:
+    """Build month->weights using the latest benchmark file date known by month."""
+    if weight_table.empty:
+        raise ValueError("benchmark weight table is empty")
+    tbl = weight_table.copy()
+    tbl["month_end"] = pd.to_datetime(tbl["month_end"]).dt.to_period("M").dt.to_timestamp("M")
+    months_idx = pd.Index(pd.to_datetime(months)).sort_values()
+    available_dates = pd.Index(tbl["month_end"].drop_duplicates().sort_values())
+    out: dict[pd.Timestamp, pd.Series] = {}
+    missing: list[str] = []
+    for month in months_idx:
+        candidates = available_dates[available_dates <= month]
+        if len(candidates) == 0:
+            missing.append(pd.Timestamp(month).date().isoformat())
+            continue
+        asof = pd.Timestamp(candidates[-1])
+        if max_stale_days is not None and (pd.Timestamp(month) - asof).days > int(max_stale_days):
+            missing.append(pd.Timestamp(month).date().isoformat())
+            continue
+        w = tbl[tbl["month_end"].eq(asof)].set_index("ticker")["weight"].astype(float)
+        w = w[w > 0]
+        out[pd.Timestamp(month)] = w / w.sum()
+    if missing:
+        sample = ", ".join(missing[:8])
+        raise ValueError(
+            "benchmark weight table does not cover requested months with PIT weights "
+            f"(max_stale_days={max_stale_days}); missing sample: {sample}"
+        )
+    return out
 
 
 def _load_ticker_exclusion_file(path: str | Path | None) -> set[str]:

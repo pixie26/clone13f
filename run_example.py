@@ -16,6 +16,7 @@ import platform
 import subprocess
 import time
 from dataclasses import asdict
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -58,6 +59,9 @@ LIVE_CONFIG = {
     "exclude_fund_like_holdings": False,
     "fund_ticker_exclusions_path": "data/fund_ticker_exclusions.csv",
     "refresh_openfigi_metadata": False,
+    "active_benchmark_source": "spy_holdings",
+    "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
+    "active_benchmark_max_stale_days": 45,
 }
 
 
@@ -405,13 +409,40 @@ def write_manifest(path: pathlib.Path, payload: dict) -> None:
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
 
 
+def _load_active_benchmark_weights_by_month(
+    *,
+    live_config: dict,
+    months,
+    cfg: BacktestConfig,
+) -> dict[pd.Timestamp, pd.Series] | None:
+    if not _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
+        return None
+    if cfg.active_benchmark_source in {"visible_13f_aggregate", "13f_aggregate"}:
+        return None
+    import data_adapters as da
+
+    path = pathlib.Path(live_config.get("active_benchmark_weights_path", ""))
+    max_stale_days = int(live_config.get("active_benchmark_max_stale_days", 45))
+    table = da.load_benchmark_weight_table(path)
+    weights = da.benchmark_weights_by_month(table, months, max_stale_days=max_stale_days)
+    print(
+        f"    active benchmark: {cfg.active_benchmark_source} "
+        f"{len(table['month_end'].drop_duplicates())} snapshots, "
+        f"{len(weights)} monthly weights loaded from {path}"
+    )
+    return weights
+
+
 def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weights, security_groups=None) -> dict:
     return {
         "rebalance_rule": (
             "At each month-end on or after a visible SEC filing date, select each "
-            "manager's latest filing version available by filing_date and rebalance."
+            "manager's latest non-stale filing version available by filing_date and rebalance."
         ),
-        "point_in_time_rule": "Only filings with filing_date <= rebalance_month are visible.",
+        "point_in_time_rule": (
+            "Only filings with filing_date <= rebalance_month are visible; latest visible "
+            "manager books older than max_stale_filing_months or max_stale_period_months are excluded."
+        ),
         "execution_timing": (
             "Existing holdings earn the current month's return first; new target "
             "weights are set at month-end for subsequent months."
@@ -435,7 +466,7 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
             "active_share_active": bool(cfg.universe.use_active_share and benchmark_weights is not None),
             "active_weight_signal": _needs_active_benchmark_weights(cfg.portfolio.idea_signal),
             "active_weight_benchmark": (
-                "visible_13f_aggregate: PIT equal-manager aggregate of all visible latest 13F books at each rebalance"
+                cfg.active_benchmark_source
                 if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
                 else None
             ),
@@ -481,7 +512,8 @@ def _dashboard_parameter_summary(
             f"max_portfolio_names={p.max_portfolio_names}, "
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
             f"min_portfolio_names={p.min_portfolio_names}, "
-            f"min_active_weight_holdings={p.min_active_weight_holdings}"
+            f"min_active_weight_holdings={p.min_active_weight_holdings}, "
+            f"active_benchmark={cfg.active_benchmark_source}"
         ),
         "Execution/cost": (
             f"rebalance=month-end after filing_date visibility, missing_price_policy={cfg.missing_price_policy}, "
@@ -510,6 +542,7 @@ def write_rebalance_outputs(
     chars=None,
     visible_versions_cache=None,
     security_groups=None,
+    active_benchmark_weights_by_month=None,
 ) -> dict[str, Any]:
     trace = rebalance_trace(
         holdings,
@@ -520,6 +553,7 @@ def write_rebalance_outputs(
         chars=chars,
         visible_versions_cache=visible_versions_cache,
         security_groups=security_groups,
+        active_benchmark_weights_by_month=active_benchmark_weights_by_month,
     )
     outputs: dict[str, str] = {}
     for name, df in trace.items():
@@ -662,6 +696,10 @@ def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
     out: dict[str, Any] = {"rebalance_months": int(len(summary))}
     numeric_cols = [
         "selected_managers",
+        "visible_managers",
+        "stale_managers_dropped",
+        "stale_filing_managers",
+        "stale_period_managers",
         "active_eligible_managers",
         "zero_contributor_managers",
         "raw_idea_rows",
@@ -741,6 +779,12 @@ def _print_rebalance_summary(stats: dict[str, Any]) -> None:
         print(
             "  zero contributor mgrs  "
             f"{_pct(stats.get('zero_contributor_manager_frac', float('nan')))}"
+        )
+    if "avg_stale_managers_dropped" in stats:
+        print(
+            "  stale mgrs dropped avg/max "
+            f"{stats.get('avg_stale_managers_dropped', float('nan')):.1f}/"
+            f"{stats.get('max_stale_managers_dropped', float('nan')):.0f}"
         )
     print(
         "  traded names avg/max   "
@@ -878,30 +922,36 @@ def _print_startup_parameters(
     equity_only: bool = False,
     refresh_openfigi_metadata: bool = False,
     price_source: str | None = None,
+    live_config: dict | None = None,
 ) -> None:
+    live_cfg = live_config or LIVE_CONFIG
     print("\nRun Parameters")
     print(f"  mode                  {mode}")
     print(f"  output_root           {output_root}")
     print(f"  equity-only filter    {equity_only}")
     if mode in {"live", "live-smoke"}:
-        print(f"  SEC history start     {LIVE_CONFIG.get('sec_history_start')}")
-        print(f"  price window          {LIVE_CONFIG.get('start')} -> {LIVE_CONFIG.get('end')}")
-        print(f"  benchmark             {LIVE_CONFIG.get('benchmark_ticker')}")
-        print(f"  SEC identity          {LIVE_CONFIG.get('identity')}")
-        print(f"  OpenFIGI key          {'env/config present' if LIVE_CONFIG.get('openfigi_key') or os.environ.get('OPENFIGI_API_KEY') else 'missing'}")
-        print(f"  OpenFIGI cache        {LIVE_CONFIG.get('openfigi_cache_path')}")
-        print(f"  price cache           {LIVE_CONFIG.get('price_cache_path')}")
-        print(f"  price source          {price_source or LIVE_CONFIG.get('price_source')}")
-        print(f"  security overrides    {LIVE_CONFIG.get('security_overrides_path')}")
+        print(f"  SEC history start     {live_cfg.get('sec_history_start')}")
+        print(f"  price window          {live_cfg.get('start')} -> {live_cfg.get('end')}")
+        print(f"  benchmark             {live_cfg.get('benchmark_ticker')}")
+        print(f"  SEC identity          {live_cfg.get('identity')}")
+        print(f"  OpenFIGI key          {'env/config present' if live_cfg.get('openfigi_key') or os.environ.get('OPENFIGI_API_KEY') else 'missing'}")
+        print(f"  OpenFIGI cache        {live_cfg.get('openfigi_cache_path')}")
+        print(f"  price cache           {live_cfg.get('price_cache_path')}")
+        print(f"  price source          {price_source or live_cfg.get('price_source')}")
+        print(f"  security overrides    {live_cfg.get('security_overrides_path')}")
+        print(f"  active benchmark      {live_cfg.get('active_benchmark_source')}")
+        if live_cfg.get("active_benchmark_source") not in {"visible_13f_aggregate", "13f_aggregate"}:
+            print(f"  active bench weights  {live_cfg.get('active_benchmark_weights_path')}")
+            print(f"  active bench stale d  {live_cfg.get('active_benchmark_max_stale_days')}")
         if equity_only:
-            print(f"  fund exclusions       {LIVE_CONFIG.get('fund_ticker_exclusions_path')}")
+            print(f"  fund exclusions       {live_cfg.get('fund_ticker_exclusions_path')}")
         print(f"  refresh FIGI metadata {refresh_openfigi_metadata}")
         print(
             "  live universe         "
-            f"min_aum={LIVE_CONFIG.get('min_aum'):.0f}, "
-            f"max_aum={LIVE_CONFIG.get('max_aum'):.0f}, "
-            f"max_holdings={LIVE_CONFIG.get('max_holdings')}, "
-            f"max_put_weight={LIVE_CONFIG.get('max_put_weight'):.0%}"
+            f"min_aum={live_cfg.get('min_aum'):.0f}, "
+            f"max_aum={live_cfg.get('max_aum'):.0f}, "
+            f"max_holdings={live_cfg.get('max_holdings')}, "
+            f"max_put_weight={live_cfg.get('max_put_weight'):.0%}"
         )
     if mode == "live-smoke":
         print(f"  smoke CUSIPs          {smoke_cusips}")
@@ -915,6 +965,7 @@ def _print_startup_parameters(
             f"min_aum={u.min_aum:.0f}, max_aum={u.max_aum:.0f}, "
             f"max_holdings={u.max_holdings}, min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
             f"turnover_q={u.turnover_quantile}, min_history_q={u.min_history_quarters}, "
+            f"max_stale_filing_m={u.max_stale_filing_months}, max_stale_period_m={u.max_stale_period_months}, "
             f"hedge_put_max={u.hedge_put_max_weight:.0%}, value_tilt_min={u.value_tilt_min_pctl:.0%}"
         )
         print(
@@ -926,6 +977,7 @@ def _print_startup_parameters(
             f"min_active_weight_holdings={p.min_active_weight_holdings}, "
             f"missing_price_policy={cfg_a.missing_price_policy}, cost={c.bps_per_side:.1f}bps"
         )
+        print(f"  thesis active bench   {cfg_a.active_benchmark_source}")
     if cfg_b is not None:
         print(
             "  placebo portfolio     "
@@ -956,6 +1008,9 @@ def run(
     equity_only: bool = False,
     refresh_openfigi_metadata: bool = False,
     price_source: str | None = None,
+    active_benchmark_source: str | None = None,
+    active_benchmark_weights_path: str | None = None,
+    active_benchmark_max_stale_days: int | None = None,
 ) -> pathlib.Path:
     cfg_a, cfg_b, axes, train_m, test_m = _default_run_configs()
     live_config = dict(LIVE_CONFIG)
@@ -965,6 +1020,20 @@ def run(
         live_config["refresh_openfigi_metadata"] = True
     if price_source is not None:
         live_config["price_source"] = price_source
+    if active_benchmark_source is not None:
+        live_config["active_benchmark_source"] = active_benchmark_source
+    if active_benchmark_weights_path is not None:
+        live_config["active_benchmark_weights_path"] = active_benchmark_weights_path
+    if active_benchmark_max_stale_days is not None:
+        live_config["active_benchmark_max_stale_days"] = active_benchmark_max_stale_days
+    cfg_a = replace(
+        cfg_a,
+        active_benchmark_source=(
+            live_config.get("active_benchmark_source", "visible_13f_aggregate")
+            if mode == "live"
+            else "visible_13f_aggregate"
+        ),
+    )
     _print_startup_parameters(
         mode=mode,
         output_root=output_root,
@@ -980,6 +1049,7 @@ def run(
         equity_only=equity_only,
         refresh_openfigi_metadata=refresh_openfigi_metadata,
         price_source=live_config.get("price_source"),
+        live_config=live_config,
     )
     if mode == "synthetic":
         holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
@@ -1009,6 +1079,11 @@ def run(
         prices.columns,
         live_config.get("security_overrides_path", "data/security_overrides.csv"),
     )
+    active_benchmark_weights_by_month = _load_active_benchmark_weights_by_month(
+        live_config=live_config,
+        months=prices.index,
+        cfg=cfg_a,
+    )
 
     print("[3/6] Running thesis and placebo backtests")
     t_step = time.perf_counter()
@@ -1022,6 +1097,7 @@ def run(
         chars,
         visible_cache,
         security_groups,
+        active_benchmark_weights_by_month,
         capture_rebalance=True,
     )
     print(f"    thesis backtest done in {time.perf_counter() - t_step:.1f}s")
@@ -1106,6 +1182,7 @@ def run(
             chars=chars,
             visible_versions_cache=visible_cache,
             security_groups=security_groups,
+            active_benchmark_weights_by_month=active_benchmark_weights_by_month,
             verbose=True,
         )
         print(f"  marginal-ir total time {time.perf_counter() - t_step:.1f}s")
@@ -1146,6 +1223,7 @@ def run(
             verbose=True,
             include_returns=True,
             security_groups=security_groups,
+            active_benchmark_weights_by_month=active_benchmark_weights_by_month,
             checkpoint_dir=out_dir,
             checkpoint_every=sweep_checkpoint_every,
         )
@@ -1169,6 +1247,7 @@ def run(
             verbose=True,
             precomputed_returns=grid_returns,
             security_groups=security_groups,
+            active_benchmark_weights_by_month=active_benchmark_weights_by_month,
         )
         oos_dsr_stream = active_return_stream(oos_ret, bench_ret)
         dsr = deflated_sharpe(
@@ -1245,6 +1324,7 @@ def run(
         chars=chars,
         visible_versions_cache=visible_cache,
         security_groups=security_groups,
+        active_benchmark_weights_by_month=active_benchmark_weights_by_month,
     )
     print(f"  Saved rebalance summary:  {rebalance_outputs['summary']}")
     print(f"  Saved rebalance holdings: {rebalance_outputs['holdings']}")
@@ -1279,6 +1359,9 @@ def run(
             "price_alignment_diagnostics": holdings.attrs.get("price_alignment_diagnostics"),
             "price_diagnostics": prices.attrs.get("price_diagnostics"),
             "security_overrides_path": live_config.get("security_overrides_path", "data/security_overrides.csv"),
+            "active_benchmark_source": cfg_a.active_benchmark_source,
+            "active_benchmark_weights_path": live_config.get("active_benchmark_weights_path"),
+            "active_benchmark_max_stale_days": live_config.get("active_benchmark_max_stale_days"),
             "issuer_group_count": int(security_groups.nunique()),
             "value_unit_diagnostics": {
                 "path": str(value_diag_path),
@@ -1326,6 +1409,23 @@ def parse_args() -> argparse.Namespace:
         help="Price download source. Default live config uses chart to avoid yfinance hangs on restricted networks.",
     )
     parser.add_argument(
+        "--active-benchmark-source",
+        choices=["visible_13f_aggregate", "spy_holdings"],
+        default=None,
+        help="Benchmark used for active_weight signals. Live default is spy_holdings.",
+    )
+    parser.add_argument(
+        "--active-benchmark-weights",
+        default=None,
+        help="CSV/Parquet/XLSX long table with month_end,ticker,weight for non-13F active benchmark sources.",
+    )
+    parser.add_argument(
+        "--active-benchmark-max-stale-days",
+        type=int,
+        default=None,
+        help="Maximum age of benchmark-weight snapshot allowed for a rebalance month.",
+    )
+    parser.add_argument(
         "--sweep-checkpoint-every",
         type=int,
         default=5,
@@ -1348,6 +1448,9 @@ def main() -> None:
         equity_only=args.equity_only,
         refresh_openfigi_metadata=args.refresh_openfigi_metadata,
         price_source=args.price_source,
+        active_benchmark_source=args.active_benchmark_source,
+        active_benchmark_weights_path=args.active_benchmark_weights,
+        active_benchmark_max_stale_days=args.active_benchmark_max_stale_days,
     )
 
 

@@ -183,6 +183,10 @@ def _rebalance_validity_metrics(summary: pd.DataFrame, cfg: BacktestConfig) -> d
         "valid_rebalance_frac": valid_frac,
         "invalid_rebalance_frac": 1.0 - valid_frac,
         "avg_selected_managers": mean_col("selected_managers", 0.0),
+        "avg_visible_managers": mean_col("visible_managers", 0.0),
+        "avg_stale_managers_dropped": mean_col("stale_managers_dropped", 0.0),
+        "avg_stale_filing_managers": mean_col("stale_filing_managers", 0.0),
+        "avg_stale_period_managers": mean_col("stale_period_managers", 0.0),
         "avg_active_eligible_managers": mean_col("active_eligible_managers", 0.0),
         "avg_zero_contributor_managers": mean_col("zero_contributor_managers", 0.0),
         "zero_contributor_manager_frac": zero_frac,
@@ -223,6 +227,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
               value_scores=None, benchmark_weights=None, metric="sharpe",
               chars=None, visible_versions_cache=None, verbose: bool = False,
               include_returns: bool = False, security_groups=None,
+              active_benchmark_weights_by_month=None,
               include_factor_metrics: bool | None = None,
               use_selection_cache: bool = True,
               checkpoint_dir=None,
@@ -231,7 +236,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
     visible_cache = visible_versions_cache if visible_versions_cache is not None else build_visible_versions_cache(ch, prices.index)
     run_attribution = _needs_factor_attribution(metric) if include_factor_metrics is None else bool(include_factor_metrics)
     selection_caches: dict[tuple, dict[pd.Timestamp, pd.DataFrame]] = {}
-    active_benchmark_cache: dict[pd.Timestamp, pd.Series] | None = None
+    active_benchmark_caches: dict[tuple, dict[pd.Timestamp, pd.Series]] = {}
     rows = []
     returns_by_config: dict[tuple, pd.Series] = {}
     returns_by_config_id: dict[str, pd.Series] = {}
@@ -253,14 +258,27 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
                     ch,
                     visible_cache,
                 )
-            if _needs_active_benchmark_weights(cfg.portfolio.idea_signal) and active_benchmark_cache is None:
-                active_benchmark_cache = build_active_benchmark_weights_cache(
-                    holdings,
-                    prices,
-                    benchmark_weights,
-                    ch,
-                    visible_cache,
+            active_benchmark_cache = None
+            if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
+                active_key = (
+                    cfg.active_benchmark_source,
+                    cfg.universe.max_stale_filing_months,
+                    cfg.universe.max_stale_period_months,
                 )
+                if cfg.active_benchmark_source not in {"visible_13f_aggregate", "13f_aggregate"}:
+                    active_benchmark_cache = active_benchmark_weights_by_month
+                else:
+                    if active_key not in active_benchmark_caches:
+                        active_benchmark_caches[active_key] = build_active_benchmark_weights_cache(
+                            holdings,
+                            prices,
+                            benchmark_weights,
+                            ch,
+                            visible_cache,
+                            cfg,
+                            active_benchmark_weights_by_month,
+                        )
+                    active_benchmark_cache = active_benchmark_caches[active_key]
             ret = run_backtest_from_selection_cache(
                 prices,
                 cfg,
@@ -279,6 +297,7 @@ def grid_eval(holdings, prices, factors, base, axes, benchmark=None,
                 ch,
                 visible_cache,
                 security_groups,
+                active_benchmark_weights_by_month,
                 capture_rebalance=True,
             )
         if include_returns:
@@ -330,7 +349,8 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
                  train_m=36, test_m=12, select_on="sharpe",
                  chars=None, visible_versions_cache=None, verbose: bool = False,
                  precomputed_returns: dict[tuple, pd.Series] | None = None,
-                 security_groups=None):
+                 security_groups=None,
+                 active_benchmark_weights_by_month=None):
     """Rolling OOS. Returns (oos_returns, fold_log, n_trials)."""
     configs = iter_configs(base, axes)
     n_trials = len(configs)
@@ -359,7 +379,17 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
             if precomputed_returns is not None and _label_key(label) in precomputed_returns:
                 ret = _without_attrs(precomputed_returns[_label_key(label)].reindex(tr))
             else:
-                ret = run_backtest(holdings, prices.loc[tr], cfg, value_scores, benchmark_weights, ch, visible_cache, security_groups)
+                ret = run_backtest(
+                    holdings,
+                    prices.loc[tr],
+                    cfg,
+                    value_scores,
+                    benchmark_weights,
+                    ch,
+                    visible_cache,
+                    security_groups,
+                    active_benchmark_weights_by_month,
+                )
             sc = _periodic_sharpe(_score_series(ret, benchmark.reindex(tr) if benchmark is not None else None, select_on))
             if verbose:
                 print(f"      done in {time.perf_counter() - t0:.1f}s train_{select_on}={_fmt_metric(sc)}")
@@ -372,7 +402,8 @@ def walk_forward(holdings, prices, factors, base, axes, benchmark=None,
             te_ret = _without_attrs(precomputed_returns[_label_key(best_lbl)].reindex(te))
         else:
             te_ret = run_backtest(holdings, prices.loc[months[:start + train_m + test_m]],
-                                  best, value_scores, benchmark_weights, ch, visible_cache, security_groups).reindex(te)
+                                  best, value_scores, benchmark_weights, ch, visible_cache, security_groups,
+                                  active_benchmark_weights_by_month).reindex(te)
             te_ret = _without_attrs(te_ret)
         if verbose:
             print(f"    done test fold {fold_no}/{n_folds} in {time.perf_counter() - t0:.1f}s")

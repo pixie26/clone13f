@@ -32,6 +32,8 @@ class UniverseConfig:
     max_holdings: int = 40
     turnover_quantile: float = 0.34
     min_history_quarters: int = 4
+    max_stale_filing_months: int | None = 6
+    max_stale_period_months: int | None = 6
     hedge_put_max_weight: float = 0.05
     value_tilt_min_pctl: float = 0.50
     min_active_share: float = 0.60          # used only if use_active_share & benchmark given
@@ -68,6 +70,7 @@ class BacktestConfig:
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     cost: CostConfig = field(default_factory=CostConfig)
+    active_benchmark_source: str = "visible_13f_aggregate"
     # "exit" liquidates a held name when its monthly return is missing, then
     # redeploys into priced survivors. This reduces complete-window survivorship
     # bias from partial yfinance histories, but is still a CRSP/WRDS placeholder.
@@ -115,6 +118,42 @@ def _needs_active_benchmark_weights(idea_signal: str) -> bool:
     return idea_signal in {"active_weight", "active_weight_change", "active_weight_initiation"}
 
 
+def _active_benchmark_source(cfg: BacktestConfig | str | None) -> str:
+    if isinstance(cfg, BacktestConfig):
+        return str(cfg.active_benchmark_source or "visible_13f_aggregate")
+    if cfg is None:
+        return "visible_13f_aggregate"
+    return str(cfg)
+
+
+def _uses_visible_13f_active_benchmark(cfg: BacktestConfig | str | None) -> bool:
+    return _active_benchmark_source(cfg) in {"visible_13f_aggregate", "13f_aggregate"}
+
+
+def _active_benchmark_for_month(
+    cfg: BacktestConfig,
+    month,
+    latest_versions: pd.DataFrame | None = None,
+    active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None,
+) -> pd.Series | None:
+    if not _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
+        return None
+    source = _active_benchmark_source(cfg)
+    if _uses_visible_13f_active_benchmark(source):
+        if latest_versions is None:
+            raise ValueError("visible_13f_aggregate active benchmark requires latest_versions")
+        return _aggregate_book_weights(latest_versions["bw"]) if not latest_versions.empty else pd.Series(dtype=float)
+    if active_benchmark_weights_by_month is None:
+        raise ValueError(
+            f"{source} active benchmark requires active_benchmark_weights_by_month; "
+            "provide a point-in-time monthly benchmark weight table."
+        )
+    weights = active_benchmark_weights_by_month.get(pd.Timestamp(month))
+    if weights is None or len(weights) == 0:
+        raise ValueError(f"{source} active benchmark has no weights for {pd.Timestamp(month).date()}")
+    return weights
+
+
 def _require_active_benchmark_weights(
     cfg: PortfolioConfig,
     active_benchmark_weights: pd.Series | None,
@@ -155,6 +194,48 @@ def _visible_manager_versions(chars: pd.DataFrame, asof, managers=None) -> pd.Da
     return (known.sort_values(["manager", "period_date", "filing_date", "accession_number"])
                  .groupby("manager", as_index=False)
                  .tail(1))
+
+
+def _filter_fresh_versions(latest_versions: pd.DataFrame, asof, cfg: UniverseConfig) -> tuple[pd.DataFrame, dict]:
+    """Drop latest-visible manager books that are too stale for a live decision."""
+    diag = {
+        "visible_managers": int(len(latest_versions)),
+        "stale_managers_dropped": 0,
+        "stale_filing_managers": 0,
+        "stale_period_managers": 0,
+    }
+    if latest_versions.empty:
+        return latest_versions, diag
+
+    latest = latest_versions.copy()
+    keep = pd.Series(True, index=latest.index)
+    asof_ts = pd.Timestamp(asof)
+
+    if cfg.max_stale_filing_months is not None:
+        filing_cutoff = asof_ts - pd.DateOffset(months=int(cfg.max_stale_filing_months))
+        stale_filing = pd.to_datetime(latest["filing_date"]) < filing_cutoff
+        diag["stale_filing_managers"] = int(stale_filing.sum())
+        keep &= ~stale_filing
+
+    if cfg.max_stale_period_months is not None:
+        period_cutoff = asof_ts - pd.DateOffset(months=int(cfg.max_stale_period_months))
+        stale_period = pd.to_datetime(latest["period_date"]) < period_cutoff
+        diag["stale_period_managers"] = int(stale_period.sum())
+        keep &= ~stale_period
+
+    fresh = latest.loc[keep].reset_index(drop=True)
+    diag["stale_managers_dropped"] = int(len(latest) - len(fresh))
+    return fresh, diag
+
+
+def _selection_cache_diagnostics(selected_versions: pd.DataFrame) -> dict:
+    visible = selected_versions.attrs.get("visible_managers")
+    return {
+        "visible_managers": int(visible) if visible is not None else int(len(selected_versions)),
+        "stale_managers_dropped": int(selected_versions.attrs.get("stale_managers_dropped", 0)),
+        "stale_filing_managers": int(selected_versions.attrs.get("stale_filing_managers", 0)),
+        "stale_period_managers": int(selected_versions.attrs.get("stale_period_managers", 0)),
+    }
 
 
 def build_visible_versions_cache(chars: pd.DataFrame, months) -> dict[pd.Timestamp, pd.DataFrame]:
@@ -337,7 +418,8 @@ def filter_universe_versions(latest_versions: pd.DataFrame, cfg: UniverseConfig,
 
 
 def select_universe_versions(chars, asof, cfg: UniverseConfig, value_scores=None) -> pd.DataFrame:
-    return filter_universe_versions(_visible_manager_versions(chars, asof), cfg, value_scores)
+    latest, _ = _filter_fresh_versions(_visible_manager_versions(chars, asof), asof, cfg)
+    return filter_universe_versions(latest, cfg, value_scores)
 
 
 def select_universe(chars, asof, cfg: UniverseConfig, value_scores=None) -> list[str]:
@@ -633,7 +715,8 @@ def _apply_monthly_returns(cur: pd.Series,
 def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                     value_scores=None, benchmark_weights=None, chars=None,
                     visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
-                    security_groups=None) -> dict[str, pd.DataFrame]:
+                    security_groups=None,
+                    active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None) -> dict[str, pd.DataFrame]:
     """Return auditable rebalance summary, holdings, and manager-selection tables."""
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
@@ -654,10 +737,12 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
         if latest_versions is None:
             latest_versions = _visible_manager_versions(chars, m)
-        active_benchmark_weights = (
-            _aggregate_book_weights(latest_versions["bw"])
-            if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
-            else None
+        latest_versions, stale_diag = _filter_fresh_versions(latest_versions, m, cfg.universe)
+        active_benchmark_weights = _active_benchmark_for_month(
+            cfg,
+            m,
+            latest_versions,
+            active_benchmark_weights_by_month,
         )
         selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
         selected_managers = selected_versions["manager"].tolist() if not selected_versions.empty else []
@@ -685,6 +770,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             summary_rows.append({
                 "rebalance_month": m.date().isoformat(),
                 "selected_managers": int(len(selected_versions)),
+                **stale_diag,
                 "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
                 "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
                 "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -719,6 +805,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         summary_rows.append({
             "rebalance_month": m.date().isoformat(),
             "selected_managers": int(len(selected_versions)),
+            **stale_diag,
             "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
             "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
             "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -764,6 +851,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                  value_scores=None, benchmark_weights=None, chars=None,
                  visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
                  security_groups=None,
+                 active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None,
                  progress_label: str | None = None,
                  progress_every: int = 10,
                  capture_rebalance: bool = False) -> pd.Series:
@@ -788,10 +876,12 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
             latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
             if latest_versions is None:
                 latest_versions = _visible_manager_versions(chars, m)
-            active_benchmark_weights = (
-                _aggregate_book_weights(latest_versions["bw"])
-                if _needs_active_benchmark_weights(cfg.portfolio.idea_signal)
-                else None
+            latest_versions, stale_diag = _filter_fresh_versions(latest_versions, m, cfg.universe)
+            active_benchmark_weights = _active_benchmark_for_month(
+                cfg,
+                m,
+                latest_versions,
+                active_benchmark_weights_by_month,
             )
             selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
             priced_now = prices.columns[prices.loc[m].notna()]
@@ -827,6 +917,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 summary_rows.append({
                     "rebalance_month": m.date().isoformat(),
                     "selected_managers": int(len(selected_versions)),
+                    **stale_diag,
                     "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
                     "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
                     "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -885,7 +976,10 @@ def build_rebalance_selection_cache(
         latest_versions = visible_versions_cache.get(month) if visible_versions_cache is not None else None
         if latest_versions is None:
             latest_versions = _visible_manager_versions(chars, month)
-        selected_by_month[month] = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+        fresh_versions, stale_diag = _filter_fresh_versions(latest_versions, month, cfg.universe)
+        selected = filter_universe_versions(fresh_versions, cfg.universe, value_scores)
+        selected.attrs.update(stale_diag)
+        selected_by_month[month] = selected
     return selected_by_month
 
 
@@ -895,16 +989,26 @@ def build_active_benchmark_weights_cache(
     benchmark_weights=None,
     chars=None,
     visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
+    cfg: BacktestConfig | UniverseConfig | None = None,
+    active_benchmark_weights_by_month: dict[pd.Timestamp, pd.Series] | None = None,
 ) -> dict[pd.Timestamp, pd.Series]:
     """Precompute PIT aggregate 13F book weights used by active_weight ideas."""
+    if isinstance(cfg, BacktestConfig) and not _uses_visible_13f_active_benchmark(cfg):
+        if active_benchmark_weights_by_month is None:
+            raise ValueError(
+                f"{cfg.active_benchmark_source} active benchmark requires active_benchmark_weights_by_month"
+            )
+        return {pd.Timestamp(k): v for k, v in active_benchmark_weights_by_month.items()}
     if chars is None:
         chars = manager_characteristics(holdings, benchmark_weights)
+    universe_cfg = cfg.universe if isinstance(cfg, BacktestConfig) else (cfg if isinstance(cfg, UniverseConfig) else UniverseConfig())
     active_by_month: dict[pd.Timestamp, pd.Series] = {}
     for m in _rebalance_months(holdings, prices):
         month = pd.Timestamp(m)
         latest_versions = visible_versions_cache.get(month) if visible_versions_cache is not None else None
         if latest_versions is None:
             latest_versions = _visible_manager_versions(chars, month)
+        latest_versions, _ = _filter_fresh_versions(latest_versions, month, universe_cfg)
         active_by_month[month] = _aggregate_book_weights(latest_versions["bw"]) if not latest_versions.empty else pd.Series(dtype=float)
     return active_by_month
 
@@ -937,6 +1041,7 @@ def run_backtest_from_selection_cache(
         if month in rebal_months:
             rebal_no += 1
             selected_versions = selected_versions_by_month.get(month, pd.DataFrame())
+            stale_diag = _selection_cache_diagnostics(selected_versions)
             active_benchmark_weights = None
             if _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
                 if active_benchmark_weights_by_month is not None:
@@ -974,6 +1079,7 @@ def run_backtest_from_selection_cache(
                 summary_rows.append({
                     "rebalance_month": m.date().isoformat(),
                     "selected_managers": int(len(selected_versions)),
+                    **stale_diag,
                     "active_eligible_managers": int(idea_diag["active_eligible_managers"]),
                     "zero_contributor_managers": int(idea_diag["zero_contributor_managers"]),
                     "raw_idea_rows": int(idea_diag["raw_idea_rows"]),
@@ -1080,7 +1186,8 @@ def _active_ir_metric(port_ret: pd.Series, benchmark: pd.Series | None = None) -
 
 
 def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=None, benchmark_weights=None,
-                chars=None, visible_versions_cache=None, security_groups=None, verbose: bool = False):
+                chars=None, visible_versions_cache=None, security_groups=None,
+                active_benchmark_weights_by_month=None, verbose: bool = False):
     ch = chars if chars is not None else manager_characteristics(holdings, benchmark_weights)
     visible_cache = visible_versions_cache if visible_versions_cache is not None else build_visible_versions_cache(ch, prices.index)
     if verbose:
@@ -1095,6 +1202,7 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
         ch,
         visible_cache,
         security_groups,
+        active_benchmark_weights_by_month,
         progress_label="marginal-ir full stack" if verbose else None,
     )
     bm = _active_ir_metric(base_ret, benchmark)
@@ -1126,6 +1234,7 @@ def marginal_ir(holdings, prices, factors, cfg, benchmark=None, value_scores=Non
             ch,
             visible_cache,
             security_groups,
+            active_benchmark_weights_by_month,
             progress_label=f"marginal-ir -{t}" if verbose else None,
         )
         m = _active_ir_metric(ret, benchmark)
