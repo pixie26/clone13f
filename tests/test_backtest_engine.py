@@ -37,6 +37,7 @@ from engine import (
 )
 from run_example import (
     _default_run_configs,
+    _complete_idio_vol_cache_months,
     _rebalance_summary_stats,
     load_security_groups,
     run as run_example_run,
@@ -51,9 +52,20 @@ def test_default_thesis_uses_manager_held_mcap_cps_best_idea_and_48_trial_sweep(
     assert thesis.portfolio.idea_signal == "cps_ir"
     assert thesis.active_benchmark_source == "manager_held_mcap"
     assert thesis.portfolio.top_n_ideas == 1
-    assert thesis.portfolio.idea_aggregation == "equal_name"
+    assert thesis.portfolio.idea_aggregation == "score"
     assert thesis.portfolio.min_consensus_funds == 1
     assert int(np.prod([len(values) for values in axes.values()])) == 48
+
+
+def test_idio_cache_restores_requested_empty_months_after_parquet_roundtrip():
+    months = pd.to_datetime(["2015-01-31", "2015-02-28"])
+    loaded = {pd.Timestamp("2015-02-28"): pd.Series({"AAPL": 0.25})}
+
+    completed = _complete_idio_vol_cache_months(loaded, months)
+
+    assert list(completed) == months.tolist()
+    assert completed[pd.Timestamp("2015-01-31")].empty
+    assert completed[pd.Timestamp("2015-02-28")].to_dict() == {"AAPL": 0.25}
 
 
 def test_run_backtest_raises_on_missing_held_return():
@@ -121,7 +133,7 @@ def test_run_backtest_exits_missing_held_return_by_default():
     assert ret.loc[pd.Timestamp("2020-02-29")] == 0.0
 
 
-def test_rebalance_skips_target_without_current_month_price():
+def test_rebalance_skips_target_without_current_month_price(tmp_path):
     holdings = pd.DataFrame(
         [
             {
@@ -155,7 +167,8 @@ def test_rebalance_skips_target_without_current_month_price():
             use_low_turnover=False,
             use_hedge_filter=False,
             use_value_tilt=False,
-        )
+        ),
+        portfolio=PortfolioConfig(min_portfolio_names=2),
     )
 
     trace = rebalance_trace(holdings, prices, cfg)
@@ -163,6 +176,18 @@ def test_rebalance_skips_target_without_current_month_price():
 
     assert feb["target_names"] == 0
     assert feb["effective_names"] == 0
+    path = tmp_path / "empty_holdings.csv"
+    trace["holdings"].to_csv(path, index=False)
+    loaded = pd.read_csv(path)
+    assert loaded.empty
+    assert loaded.columns.tolist() == [
+        "rebalance_month",
+        "rank",
+        "ticker",
+        "issuer_group",
+        "weight",
+        "is_carried",
+    ]
 
 
 def test_manager_characteristics_turnover_uses_latest_prior_period_amendment():
@@ -2998,6 +3023,28 @@ def test_interactive_results_writes_self_contained_html(tmp_path):
     assert "__DATA_PAYLOAD__" not in text
     assert "__PORTFOLIO_PAYLOAD__" not in text
     assert "__META_PAYLOAD__" not in text
+
+
+def test_single_config_result_grid_supports_skip_sweep_report():
+    idx = pd.date_range("2020-01-31", periods=3, freq="ME")
+    returns = pd.Series([0.10, -0.05, 0.02], index=idx)
+
+    grid = rp.single_config_result_grid(
+        "thesis",
+        returns,
+        config={"idea_signal": "cps_ir"},
+        metrics={"ann_return": 0.12, "ir_vs_benchmark": 0.4},
+        rebalance_stats={"avg_effective_names": 20.0},
+    )
+
+    row = grid.iloc[0]
+    assert row["config_id"] == "thesis"
+    assert row["idea_signal"] == "cps_ir"
+    assert row["valid_config"]
+    assert row["total_return"] == pytest.approx((1.10 * 0.95 * 1.02) - 1.0)
+    assert row["max_drawdown"] == pytest.approx(-0.05)
+    assert row["active_sharpe"] == pytest.approx(0.4)
+    assert row["avg_effective_names"] == pytest.approx(20.0)
 
 
 def test_interactive_results_template_embeds_thesis_holdings_and_exits(tmp_path):

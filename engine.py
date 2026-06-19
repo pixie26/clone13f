@@ -1265,8 +1265,26 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
 
     return {
         "summary": pd.DataFrame(summary_rows),
-        "holdings": pd.DataFrame(holding_rows),
-        "managers": pd.DataFrame(manager_rows),
+        "holdings": pd.DataFrame(
+            holding_rows,
+            columns=["rebalance_month", "rank", "ticker", "issuer_group", "weight", "is_carried"],
+        ),
+        "managers": pd.DataFrame(
+            manager_rows,
+            columns=[
+                "rebalance_month",
+                "manager",
+                "manager_name",
+                "manager_style",
+                "dirty_flag",
+                "dirty_reason",
+                "classification_source",
+                "factor_r2",
+                "factor_r2_status",
+                "etf_share_raw",
+                "turnover_mean_trailing",
+            ],
+        ),
     }
 
 

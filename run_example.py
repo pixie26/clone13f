@@ -12,8 +12,6 @@ import hashlib
 import json
 import os
 import pathlib
-import platform
-import subprocess
 import time
 from dataclasses import asdict
 from dataclasses import replace
@@ -46,7 +44,24 @@ from manager_classifier import (
     override_file_hash as manager_override_file_hash,
 )
 from market_cap import fetch_market_cap_history, load_market_cap_table, market_caps_by_month
-from report import dashboard, interactive_results
+from report import dashboard, interactive_results, single_config_result_grid
+from run_diagnostics import (
+    print_rebalance_summary as _print_rebalance_summary,
+    rebalance_summary_stats as _rebalance_summary_stats,
+    trace_core_diagnostics as _trace_core_diagnostics,
+    value_unit_continuity_diagnostics,
+    write_manager_filter_acceptance,
+)
+from runtime_support import (
+    config_hash as _config_hash,
+    frame_shallow_mb as _frame_shallow_mb,
+    git_sha as _git_sha,
+    json_default as _json_default,
+    load_local_env as _load_local_env,
+    process_rss_mb as _process_rss_mb,
+    progress_printer as _progress_printer,
+    write_manifest,
+)
 from sweep import active_return_stream, deflated_sharpe, grid_eval, walk_forward
 
 
@@ -92,69 +107,6 @@ LIVE_CONFIG = {
     "idio_vol_winsor_lower": 0.05,
     "idio_vol_winsor_upper": 0.95,
 }
-
-
-def _load_local_env(path: pathlib.Path = pathlib.Path(".env")) -> None:
-    if not path.exists():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-def _git_sha() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except Exception:
-        return "unknown"
-
-
-def _json_default(x: Any) -> Any:
-    if isinstance(x, (pd.Timestamp, datetime)):
-        return x.isoformat()
-    if isinstance(x, np.generic):
-        return x.item()
-    return str(x)
-
-
-def _process_rss_mb() -> float | None:
-    try:
-        import psutil
-
-        return float(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2))
-    except Exception:
-        return None
-
-
-def _frame_shallow_mb(frame: pd.DataFrame | None) -> float:
-    if frame is None:
-        return 0.0
-    return float(frame.memory_usage(index=True, deep=False).sum() / (1024 ** 2))
-
-
-def _progress_printer(stage_started: float, log_path: pathlib.Path | None = None):
-    def emit(message: str) -> None:
-        rss = _process_rss_mb()
-        rss_text = f", rss={rss:,.0f}MB" if rss is not None else ""
-        line = f"{message}; stage_elapsed={time.perf_counter() - stage_started:.1f}s{rss_text}"
-        print(f"      {line}", flush=True)
-        if log_path is not None:
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-
-    return emit
-
-
-def _config_hash(payload: dict) -> str:
-    raw = json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def load_security_groups(tickers, path: str | pathlib.Path | None = "data/security_overrides.csv") -> pd.Series:
@@ -462,22 +414,6 @@ def run_live_smoke(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
     print(f"  Saved live smoke diagnostics: {path}")
     return path
-
-
-def write_manifest(path: pathlib.Path, payload: dict) -> None:
-    versions = {
-        "python": platform.python_version(),
-        "pandas": pd.__version__,
-        "numpy": np.__version__,
-    }
-    manifest = {
-        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "git_sha": _git_sha(),
-        "config_hash": _config_hash(payload),
-        "library_versions": versions,
-        **payload,
-    }
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
 
 
 def _load_active_benchmark_weights_by_month(
@@ -1007,6 +943,20 @@ def _idio_vol_frame_to_cache(frame: pd.DataFrame) -> dict[pd.Timestamp, pd.Serie
     return out
 
 
+def _complete_idio_vol_cache_months(
+    cache: dict[pd.Timestamp, pd.Series],
+    months,
+) -> dict[pd.Timestamp, pd.Series]:
+    """Restore requested empty months omitted by long-form Parquet storage."""
+    normalized = {
+        pd.Timestamp(month).to_period("M").to_timestamp("M"): pd.Series(values, dtype=float)
+        for month, values in cache.items()
+    }
+    for month in pd.Index(pd.to_datetime(months)).to_period("M").to_timestamp("M"):
+        normalized.setdefault(pd.Timestamp(month), pd.Series(dtype=float))
+    return dict(sorted(normalized.items()))
+
+
 def _idio_vol_summary(
     cache: dict[pd.Timestamp, pd.Series],
     *,
@@ -1093,6 +1043,7 @@ def _idiosyncratic_vol_artifacts(
             json.dumps({"cache_key_payload": cache_key_payload}, indent=2, sort_keys=True, default=_json_default),
             encoding="utf-8",
         )
+    cache = _complete_idio_vol_cache_months(cache, months)
     summary = _idio_vol_summary(
         cache,
         prices=prices,
@@ -1204,378 +1155,6 @@ def _manager_filter_artifacts(
     return classification, overrides, summary
 
 
-def _trace_core_diagnostics(trace: dict[str, pd.DataFrame]) -> dict[str, Any]:
-    summary = trace.get("summary", pd.DataFrame())
-    holdings = trace.get("holdings", pd.DataFrame())
-    if summary.empty:
-        return {
-            "avg_top_issuer_exposure": np.nan,
-            "max_top_issuer_exposure": np.nan,
-            "avg_effective_number": np.nan,
-            "core_90_overlap_frac": np.nan,
-            "permanent_core_name_count": 0,
-            "permanent_core_names": "",
-            "latest_top_holdings": "",
-        }
-    avg_top_issuer = float(pd.to_numeric(summary.get("max_issuer_weight", pd.Series(dtype=float)), errors="coerce").mean())
-    max_top_issuer = float(pd.to_numeric(summary.get("max_issuer_weight", pd.Series(dtype=float)), errors="coerce").max())
-    avg_eff = float(pd.to_numeric(summary.get("effective_number", pd.Series(dtype=float)), errors="coerce").mean())
-    latest_top = str(summary.iloc[-1].get("top_holdings", ""))
-    if holdings.empty:
-        return {
-            "avg_top_issuer_exposure": avg_top_issuer,
-            "max_top_issuer_exposure": max_top_issuer,
-            "avg_effective_number": avg_eff,
-            "core_90_overlap_frac": np.nan,
-            "permanent_core_name_count": 0,
-            "permanent_core_names": "",
-            "latest_top_holdings": latest_top,
-        }
-    sets = []
-    for _, g in holdings.groupby("rebalance_month", sort=True):
-        sets.append(set(g["ticker"].astype(str)))
-    overlaps = []
-    for prev, cur in zip(sets, sets[1:]):
-        denom = min(len(prev), len(cur))
-        if denom:
-            overlaps.append(len(prev.intersection(cur)) / denom)
-    core_90_frac = float(np.mean([x >= 0.90 for x in overlaps])) if overlaps else np.nan
-    months = holdings["rebalance_month"].nunique()
-    freq = holdings.groupby("ticker")["rebalance_month"].nunique().sort_values(ascending=False)
-    permanent = freq[freq >= max(1, int(np.ceil(months * 0.90)))].index.tolist()
-    return {
-        "avg_top_issuer_exposure": avg_top_issuer,
-        "max_top_issuer_exposure": max_top_issuer,
-        "avg_effective_number": avg_eff,
-        "core_90_overlap_frac": core_90_frac,
-        "permanent_core_name_count": int(len(permanent)),
-        "permanent_core_names": ";".join(permanent[:25]),
-        "latest_top_holdings": latest_top,
-    }
-
-
-def write_manager_filter_acceptance(
-    out_dir: pathlib.Path,
-    *,
-    holdings: pd.DataFrame,
-    prices: pd.DataFrame,
-    base_cfg: BacktestConfig,
-    factors: pd.DataFrame,
-    benchmark: pd.Series | None,
-    value_scores=None,
-    benchmark_weights=None,
-    chars=None,
-    visible_versions_cache=None,
-    security_groups=None,
-    active_benchmark_weights_by_month=None,
-    idiosyncratic_vol_by_month=None,
-    manager_classification=None,
-    manager_overrides=None,
-) -> dict[str, Any]:
-    rows = []
-    for mode in ["all", "dedicated_like"]:
-        cfg = replace(base_cfg, manager_filter_mode=mode)
-        ret = run_backtest(
-            holdings,
-            prices,
-            cfg,
-            value_scores,
-            benchmark_weights,
-            chars,
-            visible_versions_cache,
-            security_groups,
-            active_benchmark_weights_by_month,
-            manager_classification,
-            manager_overrides,
-            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
-        )
-        trace = rebalance_trace(
-            holdings,
-            prices,
-            cfg,
-            value_scores=value_scores,
-            benchmark_weights=benchmark_weights,
-            chars=chars,
-            visible_versions_cache=visible_versions_cache,
-            security_groups=security_groups,
-            active_benchmark_weights_by_month=active_benchmark_weights_by_month,
-            manager_classification=manager_classification,
-            manager_overrides=manager_overrides,
-            idiosyncratic_vol_by_month=idiosyncratic_vol_by_month,
-        )
-        att = attribution(ret, factors, benchmark)
-        diag = _trace_core_diagnostics(trace)
-        rows.append({
-            "manager_filter_mode": mode,
-            "ann_return": att.get("ann_return"),
-            "ann_alpha": att.get("ann_alpha"),
-            "alpha_t": att.get("alpha_t"),
-            "smb_beta": (att.get("betas") or {}).get("SMB"),
-            **diag,
-        })
-    df = pd.DataFrame(rows)
-    if len(df) == 2:
-        all_row = df[df["manager_filter_mode"].eq("all")].iloc[0]
-        ded_row = df[df["manager_filter_mode"].eq("dedicated_like")].iloc[0]
-        unchanged = (
-            pd.notna(all_row.get("smb_beta"))
-            and pd.notna(ded_row.get("smb_beta"))
-            and abs(float(all_row["smb_beta"]) - float(ded_row["smb_beta"])) < 0.05
-            and float(ded_row.get("core_90_overlap_frac", 0) or 0) >= 0.80
-        )
-        finding = (
-            "manager_cleaning_did_not_materially_move_core_book"
-            if unchanged
-            else "manager_cleaning_changed_book_diagnostics"
-        )
-    else:
-        finding = "insufficient_acceptance_rows"
-    df["finding"] = finding
-    path = out_dir / "manager_filter_acceptance.csv"
-    df.to_csv(path, index=False)
-    print(f"  Saved manager-filter acceptance diagnostics: {path}")
-    print(df[[
-        "manager_filter_mode",
-        "smb_beta",
-        "avg_top_issuer_exposure",
-        "avg_effective_number",
-        "core_90_overlap_frac",
-        "permanent_core_name_count",
-        "finding",
-    ]].to_string(index=False))
-    return {"path": str(path), "finding": finding}
-
-
-def value_unit_continuity_diagnostics(
-    chars: pd.DataFrame,
-    *,
-    cutoff: str | pd.Timestamp = "2023-01-01",
-) -> pd.DataFrame:
-    """Check for suspicious AUM jumps around the historical SEC value-unit cutoff."""
-    columns = [
-        "manager",
-        "prev_period_date",
-        "period_date",
-        "prev_filing_date",
-        "filing_date",
-        "prev_aum",
-        "aum",
-        "aum_ratio",
-        "abs_log10_ratio",
-        "suspicious_unit_jump",
-    ]
-    if chars is None or chars.empty:
-        return pd.DataFrame(columns=columns)
-    cutoff = pd.Timestamp(cutoff)
-    latest = (
-        chars.sort_values(["manager", "period_date", "filing_date", "accession_number"])
-        .groupby(["manager", "period_date"], as_index=False)
-        .tail(1)
-        .sort_values(["manager", "period_date"])
-    )
-    rows: list[dict[str, Any]] = []
-    for manager, g in latest.groupby("manager", sort=False):
-        g = g.sort_values("period_date")
-        prev = None
-        for row in g.itertuples(index=False):
-            if prev is not None and pd.Timestamp(prev.filing_date) < cutoff <= pd.Timestamp(row.filing_date):
-                prev_aum = float(prev.aum)
-                aum = float(row.aum)
-                ratio = aum / prev_aum if prev_aum > 0 else np.nan
-                abs_log10_ratio = abs(float(np.log10(ratio))) if ratio and np.isfinite(ratio) and ratio > 0 else np.nan
-                rows.append({
-                    "manager": manager,
-                    "prev_period_date": pd.Timestamp(prev.period_date).date().isoformat(),
-                    "period_date": pd.Timestamp(row.period_date).date().isoformat(),
-                    "prev_filing_date": pd.Timestamp(prev.filing_date).date().isoformat(),
-                    "filing_date": pd.Timestamp(row.filing_date).date().isoformat(),
-                    "prev_aum": prev_aum,
-                    "aum": aum,
-                    "aum_ratio": ratio,
-                    "abs_log10_ratio": abs_log10_ratio,
-                    "suspicious_unit_jump": bool(pd.notna(ratio) and (ratio >= 50.0 or ratio <= 0.02)),
-                })
-            prev = row
-    out = pd.DataFrame(rows, columns=columns)
-    if not out.empty:
-        out = out.sort_values("abs_log10_ratio", ascending=False, na_position="last")
-    return out
-
-
-def _pct(value: float) -> str:
-    return f"{value:.1%}" if pd.notna(value) else "n/a"
-
-
-def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
-    if summary.empty:
-        return {"rebalance_months": 0}
-    out: dict[str, Any] = {"rebalance_months": int(len(summary))}
-    numeric_cols = [
-        "selected_managers",
-        "visible_managers",
-        "stale_managers_dropped",
-        "stale_filing_managers",
-        "stale_period_managers",
-        "active_eligible_managers",
-        "zero_contributor_managers",
-        "market_cap_covered_names",
-        "market_cap_eligible_managers",
-        "market_cap_mean_book_coverage",
-        "max_distinct_ideas_upper_bound",
-        "raw_idea_rows",
-        "raw_idea_names",
-        "consensus_idea_names",
-        "effective_names",
-        "target_names",
-        "target_names_before_caps",
-        "carried_names",
-        "turnover_one_way",
-        "cost_bps",
-        "max_weight",
-        "issuer_groups",
-        "max_issuer_weight",
-        "top5_weight",
-        "top10_weight",
-        "effective_number",
-        "traded_names",
-        "buy_names",
-        "sell_names",
-    ]
-    for col in numeric_cols:
-        if col not in summary:
-            continue
-        s = pd.to_numeric(summary[col], errors="coerce").dropna()
-        if s.empty:
-            continue
-        out[f"avg_{col}"] = float(s.mean())
-        out[f"max_{col}"] = float(s.max())
-    last = summary.iloc[-1]
-    for col in ["name_cap_feasible", "issuer_cap_feasible"]:
-        if col in summary:
-            s = summary[col].astype(bool)
-            out[f"{col}_months"] = int(s.sum())
-            out[f"{col}_ratio"] = float(s.mean()) if len(s) else float("nan")
-    if "valid_rebalance" in summary:
-        s = summary["valid_rebalance"].astype(bool)
-        out["valid_rebalance_months"] = int(s.sum())
-        out["valid_rebalance_ratio"] = float(s.mean()) if len(s) else float("nan")
-        out["invalid_rebalance_months"] = int((~s).sum())
-    if "effective_names" in summary:
-        invested = pd.to_numeric(summary["effective_names"], errors="coerce").fillna(0).gt(0)
-        out["invested_month_frac"] = float(invested.mean()) if len(invested) else float("nan")
-    if {"zero_contributor_managers", "selected_managers"}.issubset(summary.columns):
-        zero = pd.to_numeric(summary["zero_contributor_managers"], errors="coerce").fillna(0).sum()
-        selected = pd.to_numeric(summary["selected_managers"], errors="coerce").fillna(0).sum()
-        out["zero_contributor_manager_frac"] = float(zero / selected) if selected > 0 else float("nan")
-    out["last_rebalance_month"] = str(last.get("rebalance_month", ""))
-    out["last_effective_names"] = int(last.get("effective_names", 0) or 0)
-    out["last_turnover_one_way"] = float(last.get("turnover_one_way", 0.0) or 0.0)
-    out["last_max_weight"] = float(last.get("max_weight", 0.0) or 0.0)
-    out["last_max_issuer_weight"] = float(last.get("max_issuer_weight", 0.0) or 0.0)
-    out["last_top_holdings"] = str(last.get("top_holdings", ""))
-    out["last_top_issuer_exposures"] = str(last.get("top_issuer_exposures", ""))
-    out["last_multi_class_exposures"] = str(last.get("multi_class_exposures", ""))
-    return out
-
-
-def _print_rebalance_summary(stats: dict[str, Any]) -> None:
-    if not stats or stats.get("rebalance_months", 0) == 0:
-        print("  Rebalance summary: no rebalance months")
-        return
-    print("\n  Rebalance Summary")
-    print(f"  months                 {stats['rebalance_months']}")
-    print(
-        "  holdings avg/max       "
-        f"{stats.get('avg_effective_names', float('nan')):.1f}/"
-        f"{stats.get('max_effective_names', float('nan')):.0f}"
-    )
-    if "valid_rebalance_ratio" in stats:
-        print(
-            "  valid/invested months  "
-            f"{_pct(stats.get('valid_rebalance_ratio', float('nan')))}/"
-            f"{_pct(stats.get('invested_month_frac', float('nan')))}"
-        )
-    if "zero_contributor_manager_frac" in stats:
-        print(
-            "  zero contributor mgrs  "
-            f"{_pct(stats.get('zero_contributor_manager_frac', float('nan')))}"
-        )
-    if "avg_market_cap_mean_book_coverage" in stats:
-        print(
-            "  market-cap book cover  "
-            f"avg={_pct(stats.get('avg_market_cap_mean_book_coverage', float('nan')))} | "
-            f"eligible_mgrs={stats.get('avg_market_cap_eligible_managers', float('nan')):.1f} avg | "
-            f"covered_names={stats.get('avg_market_cap_covered_names', float('nan')):.0f} avg"
-        )
-    if "avg_max_distinct_ideas_upper_bound" in stats:
-        print(
-            "  idea count upper bound "
-            f"avg/max={stats.get('avg_max_distinct_ideas_upper_bound', float('nan')):.1f}/"
-            f"{stats.get('max_max_distinct_ideas_upper_bound', float('nan')):.0f}"
-        )
-    if "avg_stale_managers_dropped" in stats:
-        print(
-            "  stale mgrs dropped avg/max "
-            f"{stats.get('avg_stale_managers_dropped', float('nan')):.1f}/"
-            f"{stats.get('max_stale_managers_dropped', float('nan')):.0f}"
-        )
-    print(
-        "  traded names avg/max   "
-        f"{stats.get('avg_traded_names', float('nan')):.1f}/"
-        f"{stats.get('max_traded_names', float('nan')):.0f}"
-    )
-    print(
-        "  one-way turnover avg/max "
-        f"{_pct(stats.get('avg_turnover_one_way', float('nan')))}/"
-        f"{_pct(stats.get('max_turnover_one_way', float('nan')))}"
-    )
-    print(
-        "  max weight avg/max     "
-        f"{_pct(stats.get('avg_max_weight', float('nan')))}/"
-        f"{_pct(stats.get('max_max_weight', float('nan')))}"
-    )
-    print(
-        "  max issuer avg/max     "
-        f"{_pct(stats.get('avg_max_issuer_weight', float('nan')))}/"
-        f"{_pct(stats.get('max_max_issuer_weight', float('nan')))}"
-    )
-    print(
-        "  issuer groups avg/max  "
-        f"{stats.get('avg_issuer_groups', float('nan')):.1f}/"
-        f"{stats.get('max_issuer_groups', float('nan')):.0f}"
-    )
-    if "name_cap_feasible_ratio" in stats or "issuer_cap_feasible_ratio" in stats:
-        print(
-            "  cap feasible months    "
-            f"name={_pct(stats.get('name_cap_feasible_ratio', float('nan')))} | "
-            f"issuer={_pct(stats.get('issuer_cap_feasible_ratio', float('nan')))}"
-        )
-    print(
-        "  top10 weight avg/max   "
-        f"{_pct(stats.get('avg_top10_weight', float('nan')))}/"
-        f"{_pct(stats.get('max_top10_weight', float('nan')))}"
-    )
-    print(
-        "  cost bps avg/max       "
-        f"{stats.get('avg_cost_bps', float('nan')):.2f}/"
-        f"{stats.get('max_cost_bps', float('nan')):.2f}"
-    )
-    print(
-        "  latest rebalance       "
-        f"{stats.get('last_rebalance_month')} | "
-        f"names={stats.get('last_effective_names')} | "
-        f"turnover={_pct(stats.get('last_turnover_one_way', float('nan')))} | "
-        f"max_weight={_pct(stats.get('last_max_weight', float('nan')))}"
-    )
-    top = stats.get("last_top_holdings")
-    if top:
-        print(f"  latest top holdings    {top}")
-    issuers = stats.get("last_top_issuer_exposures")
-    if issuers:
-        print(f"  latest top issuers     {issuers}")
-    multi = stats.get("last_multi_class_exposures")
-    if multi:
-        print(f"  latest multi-class     {multi}")
 
 
 def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, int]:
@@ -1594,7 +1173,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         portfolio=PortfolioConfig(
             idea_signal="cps_ir",
             top_n_ideas=1,
-            idea_aggregation="equal_name",
+            idea_aggregation="score",
             min_consensus_funds=1,
             min_portfolio_names=10,
             max_portfolio_names=30,
@@ -2158,7 +1737,32 @@ def run(
         print(f"  Deflated Sharpe (DSR)  {dsr.get('DSR', float('nan')):.2f}")
 
     if skip_sweep:
-        sweep_outputs = {}
+        interactive_config_id = "thesis"
+        interactive_grid = single_config_result_grid(
+            interactive_config_id,
+            ret_a,
+            config={
+                "manager_filter_mode": cfg_a.manager_filter_mode,
+                "aum_band": f"{cfg_a.universe.min_aum / 1e9:g}-{cfg_a.universe.max_aum / 1e9:g}B",
+                "use_concentration": cfg_a.universe.use_concentration,
+                "use_low_turnover": cfg_a.universe.use_low_turnover,
+                "use_value_tilt": cfg_a.universe.use_value_tilt,
+                "idea_signal": cfg_a.portfolio.idea_signal,
+                "top_n_ideas": cfg_a.portfolio.top_n_ideas,
+                "min_consensus_funds": cfg_a.portfolio.min_consensus_funds,
+                "holding_horizon_q": cfg_a.portfolio.holding_horizon_q,
+                "min_portfolio_names": cfg_a.portfolio.min_portfolio_names,
+                "max_portfolio_names": cfg_a.portfolio.max_portfolio_names,
+                "min_active_weight_holdings": cfg_a.portfolio.min_active_weight_holdings,
+            },
+            metrics=att_a,
+            rebalance_stats=stage3_stats,
+        )
+        interactive_returns = {interactive_config_id: ret_a}
+        sweep_outputs = {
+            "interactive_html": str(out_dir / "interactive_results.html"),
+            "status": "sweep_skipped_single_thesis_config",
+        }
     else:
         print("\n[6/6] Writing sweep result files")
         sweep_outputs = write_sweep_outputs(
@@ -2169,7 +1773,8 @@ def run(
         )
         print(f"  Saved sweep grid:       {sweep_outputs['grid']}")
         print(f"  Saved sweep returns:    {sweep_outputs['returns']}")
-        print(f"  Saved interactive HTML: {sweep_outputs['interactive_html']}")
+        interactive_grid = grid
+        interactive_returns = grid.attrs.get("returns_by_config_id") or {}
 
     print("\n[6/6] Rendering strategy dashboard")
     dashboard_path = dashboard(
@@ -2262,34 +1867,37 @@ def run(
     }
     manifest_path = out_dir / "manifest.json"
     write_manifest(manifest_path, manifest_payload)
-    if not skip_sweep:
-        manifest_for_html = json.loads(manifest_path.read_text(encoding="utf-8"))
-        input_summary_for_html = dict(manifest_for_html.get("input_summary") or {})
-        input_summary_for_html["mapping"] = input_summary_for_html.get("mapping_diagnostics") or {}
-        rules_for_html = json.loads(pathlib.Path(rebalance_outputs["rules"]).read_text(encoding="utf-8"))
-        portfolio_config_id = _sweep_config_id_for_cfg(grid, axes, cfg_a)
-        interactive_results(
-            grid,
-            grid.attrs.get("returns_by_config_id") or {},
-            benchmark=bench_ret,
-            path=sweep_outputs["interactive_html"],
-            portfolio_holdings=pd.read_csv(rebalance_outputs["holdings"]),
-            rebalance_summary=pd.read_csv(rebalance_outputs["summary"]),
-            portfolio_config_id=portfolio_config_id,
-            meta_payload={
-                "benchmarkName": getattr(bench_ret, "name", None),
-                "thesisConfigId": portfolio_config_id,
-                "configHash": manifest_for_html.get("config_hash"),
-                "gitSha": manifest_for_html.get("git_sha"),
-                "runTimestampUtc": manifest_for_html.get("run_timestamp_utc"),
-                "dashboardParameterSummary": dashboard_params,
-                "metrics": manifest_for_html.get("metrics") or {},
-                "rebalanceSummaryStats": manifest_for_html.get("rebalance_summary_stats") or {},
-                "inputSummary": input_summary_for_html,
-                "rules": rules_for_html,
-            },
-        )
-        print(f"  Enriched interactive HTML with thesis holdings: {sweep_outputs['interactive_html']}")
+    manifest_for_html = json.loads(manifest_path.read_text(encoding="utf-8"))
+    input_summary_for_html = dict(manifest_for_html.get("input_summary") or {})
+    input_summary_for_html["mapping"] = input_summary_for_html.get("mapping_diagnostics") or {}
+    rules_for_html = json.loads(pathlib.Path(rebalance_outputs["rules"]).read_text(encoding="utf-8"))
+    portfolio_config_id = (
+        interactive_config_id
+        if skip_sweep
+        else _sweep_config_id_for_cfg(grid, axes, cfg_a)
+    )
+    interactive_results(
+        interactive_grid,
+        interactive_returns,
+        benchmark=bench_ret,
+        path=sweep_outputs["interactive_html"],
+        portfolio_holdings=pd.read_csv(rebalance_outputs["holdings"]),
+        rebalance_summary=pd.read_csv(rebalance_outputs["summary"]),
+        portfolio_config_id=portfolio_config_id,
+        meta_payload={
+            "benchmarkName": getattr(bench_ret, "name", None),
+            "thesisConfigId": portfolio_config_id,
+            "configHash": manifest_for_html.get("config_hash"),
+            "gitSha": manifest_for_html.get("git_sha"),
+            "runTimestampUtc": manifest_for_html.get("run_timestamp_utc"),
+            "dashboardParameterSummary": dashboard_params,
+            "metrics": manifest_for_html.get("metrics") or {},
+            "rebalanceSummaryStats": manifest_for_html.get("rebalance_summary_stats") or {},
+            "inputSummary": input_summary_for_html,
+            "rules": rules_for_html,
+        },
+    )
+    print(f"  Saved interactive HTML: {sweep_outputs['interactive_html']}")
     print(f"  Saved dashboard: {dashboard_path}")
     print(f"  Saved manifest:  {manifest_path}")
     return out_dir

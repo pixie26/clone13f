@@ -431,6 +431,41 @@ def _render_interactive_template(data: dict, portfolio: dict, meta: dict) -> str
     return template
 
 
+def single_config_result_grid(
+    config_id: str,
+    returns: pd.Series,
+    *,
+    config: dict | None = None,
+    metrics: dict | None = None,
+    rebalance_stats: dict | None = None,
+) -> pd.DataFrame:
+    """Build one interactive-result row when a parameter sweep was skipped."""
+    clean_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    total_return = (
+        float((1.0 + clean_returns).prod() - 1.0)
+        if not clean_returns.empty
+        else np.nan
+    )
+    max_drawdown = (
+        float(_drawdown(clean_returns).min())
+        if not clean_returns.empty
+        else np.nan
+    )
+    row = {
+        "config_id": config_id,
+        **(config or {}),
+        **(rebalance_stats or {}),
+        **(metrics or {}),
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+        "valid_config": bool(not clean_returns.empty),
+    }
+    if "ir_vs_benchmark" in row:
+        row.setdefault("ir", row["ir_vs_benchmark"])
+        row.setdefault("active_sharpe", row["ir_vs_benchmark"])
+    return pd.DataFrame([row])
+
+
 def interactive_results(
     grid_df: pd.DataFrame,
     returns_by_config_id: dict[str, pd.Series],
