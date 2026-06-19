@@ -43,18 +43,21 @@ from run_example import (
     run as run_example_run,
     value_unit_continuity_diagnostics,
 )
+from run_diagnostics import manager_characteristics_audit
 from sweep import deflated_sharpe
 
 
-def test_default_thesis_uses_manager_held_mcap_cps_best_idea_and_48_trial_sweep():
+def test_default_thesis_uses_manager_held_mcap_cps_best_idea_and_96_trial_sweep():
     thesis, _, axes, _, _ = _default_run_configs()
 
     assert thesis.portfolio.idea_signal == "cps_ir"
     assert thesis.active_benchmark_source == "manager_held_mcap"
     assert thesis.portfolio.top_n_ideas == 1
     assert thesis.portfolio.idea_aggregation == "score"
+    assert thesis.universe.use_concentration is True
     assert thesis.portfolio.min_consensus_funds == 1
-    assert int(np.prod([len(values) for values in axes.values()])) == 48
+    assert axes[("portfolio", "idea_aggregation")] == ["equal_name", "score"]
+    assert int(np.prod([len(values) for values in axes.values()])) == 96
 
 
 def test_idio_cache_restores_requested_empty_months_after_parquet_roundtrip():
@@ -66,6 +69,85 @@ def test_idio_cache_restores_requested_empty_months_after_parquet_roundtrip():
     assert list(completed) == months.tolist()
     assert completed[pd.Timestamp("2015-01-31")].empty
     assert completed[pd.Timestamp("2015-02-28")].to_dict() == {"AAPL": 0.25}
+
+
+def test_manager_characteristics_audit_compares_raw_and_investable_books():
+    keys = {
+        "manager": "m1",
+        "period_date": pd.Timestamp("2020-03-31"),
+        "filing_date": pd.Timestamp("2020-05-15"),
+        "accession_number": "a1",
+        "submission_type": "13F-HR",
+    }
+    raw = pd.DataFrame([{**keys, "aum": 100.0, "n_holdings": 4, "top10_weight": 1.0, "put_weight": 0.0, "active_share": np.nan, "turnover": 0.2, "hist_q": 1}])
+    investable = pd.DataFrame([{**keys, "aum": 75.0, "n_holdings": 3, "top10_weight": 1.0, "put_weight": 0.0, "active_share": np.nan, "turnover": 0.1, "hist_q": 1}])
+
+    audit = manager_characteristics_audit(raw, investable)
+
+    assert audit.loc[0, "raw_aum"] == 100.0
+    assert audit.loc[0, "investable_aum"] == 75.0
+    assert audit.loc[0, "investable_value_coverage"] == pytest.approx(0.75)
+    assert audit.loc[0, "investable_holding_coverage"] == pytest.approx(0.75)
+
+
+def test_rebalance_trace_exports_candidate_idea_weight_and_market_cap_audits():
+    month = pd.Timestamp("2020-01-31")
+    holdings = pd.DataFrame([
+        {"manager": "m1", "period_date": pd.Timestamp("2019-12-31"), "filing_date": pd.Timestamp("2020-01-15"), "accession_number": "a1", "submission_type": "13F-HR", "ticker": "A", "value": 70.0, "sec_type": "SH"},
+        {"manager": "m1", "period_date": pd.Timestamp("2019-12-31"), "filing_date": pd.Timestamp("2020-01-15"), "accession_number": "a1", "submission_type": "13F-HR", "ticker": "B", "value": 30.0, "sec_type": "SH"},
+    ])
+    prices = pd.DataFrame({"A": [0.0], "B": [0.0]}, index=[month])
+    cfg = BacktestConfig(
+        active_benchmark_source="manager_held_mcap",
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            use_size_band=False,
+            use_concentration=True,
+            min_top_n_weight=0.5,
+            max_holdings=40,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(
+            idea_signal="cps_ir",
+            top_n_ideas=1,
+            idea_aggregation="score",
+            min_portfolio_names=1,
+            max_name_weight=1.0,
+            max_issuer_weight=1.0,
+            min_active_weight_holdings=1,
+        ),
+    )
+    trace = rebalance_trace(
+        holdings,
+        prices,
+        cfg,
+        active_benchmark_weights_by_month={month: pd.Series({"A": 0.5, "B": 0.5})},
+        idiosyncratic_vol_by_month={month: pd.Series({"A": 0.5, "B": 0.2})},
+    )
+
+    candidate = trace["manager_candidates_audit"].iloc[0]
+    assert bool(candidate["concentration_active"]) is True
+    assert bool(candidate["pass_concentration"]) is True
+    assert bool(candidate["pass_final"]) is True
+    idea = trace["ideas"].iloc[0]
+    assert idea["ticker"] == "A"
+    assert idea["active_weight"] == pytest.approx(0.2)
+    assert idea["idio_vol"] == pytest.approx(0.5)
+    assert idea["cps_score"] == pytest.approx(0.1)
+    assert idea["contributor_count"] == 1
+    summary = trace["summary"].iloc[0]
+    assert summary["market_cap_covered_names"] == 2
+    assert summary["market_cap_eligible_managers"] == 1
+    assert summary["market_cap_mean_book_coverage"] == pytest.approx(1.0)
+    final_holding = trace["holdings"].iloc[0]
+    assert final_holding["ticker"] == "A"
+    assert final_holding["pre_cap_weight"] == pytest.approx(1.0)
+    assert final_holding["post_cap_weight"] == pytest.approx(1.0)
+    assert final_holding["carry_age_q"] == 0
+    assert final_holding["source_manager_count"] == 1
+    assert trace["holding_sources"].iloc[0]["ticker"] == "A"
 
 
 def test_run_backtest_raises_on_missing_held_return():
@@ -186,7 +268,14 @@ def test_rebalance_skips_target_without_current_month_price(tmp_path):
         "ticker",
         "issuer_group",
         "weight",
+        "pre_cap_weight",
+        "target_weight_pre_cap",
+        "target_weight_post_name_cap",
+        "post_cap_weight",
         "is_carried",
+        "carry_age_q",
+        "source_manager_count",
+        "source_managers",
     ]
 
 

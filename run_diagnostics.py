@@ -11,6 +11,33 @@ import pandas as pd
 from engine import BacktestConfig, attribution, rebalance_trace, run_backtest
 
 
+def manager_characteristics_audit(
+    raw_chars: pd.DataFrame,
+    investable_chars: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compare raw mapped and investable manager books by filing version."""
+    keys = ["manager", "period_date", "filing_date", "accession_number", "submission_type"]
+    metrics = ["aum", "n_holdings", "top10_weight", "put_weight", "active_share", "turnover", "hist_q"]
+
+    def scalar_view(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        columns = [column for column in keys + metrics if column in frame.columns]
+        out = frame.loc[:, columns].copy()
+        return out.rename(columns={metric: f"{prefix}_{metric}" for metric in metrics if metric in out})
+
+    raw = scalar_view(raw_chars, "raw")
+    investable = scalar_view(investable_chars, "investable")
+    out = raw.merge(investable, on=keys, how="outer", validate="one_to_one", indicator="book_coverage_status")
+    out["investable_value_coverage"] = (
+        pd.to_numeric(out.get("investable_aum"), errors="coerce")
+        / pd.to_numeric(out.get("raw_aum"), errors="coerce").replace(0.0, np.nan)
+    )
+    out["investable_holding_coverage"] = (
+        pd.to_numeric(out.get("investable_n_holdings"), errors="coerce")
+        / pd.to_numeric(out.get("raw_n_holdings"), errors="coerce").replace(0.0, np.nan)
+    )
+    return out.sort_values(["manager", "period_date", "filing_date", "accession_number"]).reset_index(drop=True)
+
+
 def trace_core_diagnostics(trace: dict[str, pd.DataFrame]) -> dict[str, Any]:
     summary = trace.get("summary", pd.DataFrame())
     holdings = trace.get("holdings", pd.DataFrame())

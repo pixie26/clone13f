@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-from manager_classifier import filter_selected_versions
+from manager_classifier import apply_manager_overrides, filter_selected_versions
 
 
 # --------------------------------------------------------------------------- #
@@ -748,6 +748,126 @@ def _manager_filter_diagnostics(selected_versions: pd.DataFrame, cfg: BacktestCo
     }
 
 
+def _manager_candidates_audit(
+    visible_versions: pd.DataFrame,
+    fresh_versions: pd.DataFrame,
+    universe_selected: pd.DataFrame,
+    final_selected: pd.DataFrame,
+    month,
+    cfg: BacktestConfig,
+    value_scores=None,
+    manager_classification: pd.DataFrame | None = None,
+    manager_overrides: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Describe every visible manager and the exact filters active at a rebalance."""
+    if visible_versions is None or visible_versions.empty:
+        return pd.DataFrame()
+    audit = visible_versions.copy()
+    audit["manager"] = audit["manager"].astype(str).str.zfill(10)
+    asof = pd.Timestamp(month).normalize()
+    u = cfg.universe
+    filing_cutoff = (
+        asof - pd.DateOffset(months=int(u.max_stale_filing_months))
+        if u.max_stale_filing_months is not None else pd.NaT
+    )
+    period_cutoff = (
+        asof - pd.DateOffset(months=int(u.max_stale_period_months))
+        if u.max_stale_period_months is not None else pd.NaT
+    )
+    audit["rebalance_month"] = asof.date().isoformat()
+    audit["filing_date_cutoff"] = filing_cutoff
+    audit["period_date_cutoff"] = period_cutoff
+    audit["pass_filing_fresh"] = True if pd.isna(filing_cutoff) else pd.to_datetime(audit["filing_date"]).ge(filing_cutoff)
+    audit["pass_period_fresh"] = True if pd.isna(period_cutoff) else pd.to_datetime(audit["period_date"]).ge(period_cutoff)
+    audit["min_history_quarters_cutoff"] = int(u.min_history_quarters)
+    audit["pass_min_history"] = audit["hist_q"].ge(u.min_history_quarters)
+    audit["size_band_active"] = bool(u.use_size_band)
+    audit["min_aum_cutoff"] = float(u.min_aum)
+    audit["max_aum_cutoff"] = float(u.max_aum)
+    audit["pass_size_band"] = (not u.use_size_band) | audit["aum"].between(u.min_aum, u.max_aum)
+    audit["concentration_active"] = bool(u.use_concentration)
+    audit["min_top_n_weight_cutoff"] = float(u.min_top_n_weight)
+    audit["max_holdings_cutoff"] = int(u.max_holdings)
+    concentration_pass = audit["top10_weight"].ge(u.min_top_n_weight) | audit["n_holdings"].le(u.max_holdings)
+    audit["pass_concentration"] = (not u.use_concentration) | concentration_pass
+    audit["hedge_filter_active"] = bool(u.use_hedge_filter)
+    audit["hedge_put_max_weight_cutoff"] = float(u.hedge_put_max_weight)
+    audit["pass_hedge_filter"] = (not u.use_hedge_filter) | audit["put_weight"].le(u.hedge_put_max_weight)
+    audit["active_share_filter_active"] = bool(u.use_active_share and audit["active_share"].notna().any())
+    audit["min_active_share_cutoff"] = float(u.min_active_share)
+    audit["pass_active_share"] = (~audit["active_share_filter_active"]) | audit["active_share"].ge(u.min_active_share)
+    fresh_turnover = pd.to_numeric(fresh_versions.get("turnover", pd.Series(dtype=float)), errors="coerce").dropna()
+    turnover_cutoff = float(fresh_turnover.quantile(u.turnover_quantile)) if len(fresh_turnover) >= 3 else np.nan
+    audit["low_turnover_filter_active"] = bool(u.use_low_turnover and pd.notna(turnover_cutoff))
+    audit["turnover_quantile_cutoff"] = float(u.turnover_quantile)
+    audit["turnover_value_cutoff"] = turnover_cutoff
+    audit["pass_low_turnover"] = (~audit["low_turnover_filter_active"]) | audit["turnover"].le(turnover_cutoff)
+    value_tilt_active = bool(u.use_value_tilt and value_scores is not None)
+    audit["value_tilt_filter_active"] = value_tilt_active
+    audit["value_tilt_min_pctl_cutoff"] = float(u.value_tilt_min_pctl)
+    if value_tilt_active:
+        audit["book_value_pctl"] = [
+            _book_value_pctl(
+                row.bw,
+                value_scores.loc[row.period_date] if row.period_date in value_scores.index else None,
+            )
+            for row in audit.itertuples(index=False)
+        ]
+    else:
+        audit["book_value_pctl"] = np.nan
+    audit["pass_value_tilt"] = (~audit["value_tilt_filter_active"]) | audit["book_value_pctl"].ge(u.value_tilt_min_pctl)
+
+    mode = cfg.manager_filter_mode
+    audit["manager_filter_mode"] = mode
+    if mode == "all":
+        audit["pass_manager_type"] = True
+    elif manager_classification is None or manager_classification.empty:
+        audit["manager_style"] = pd.NA
+        audit["dirty_flag"] = True
+        audit["dirty_reason"] = "missing_classification"
+        audit["pass_manager_type"] = False
+    else:
+        classification = manager_classification[
+            pd.to_datetime(manager_classification["asof_month"]).eq(asof)
+        ].copy()
+        classification["manager"] = classification["manager"].astype(str).str.zfill(10)
+        classification = apply_manager_overrides(classification, manager_overrides)
+        meta_cols = ["manager", "manager_style", "dirty_flag", "dirty_reason", "classification_source"]
+        audit = audit.merge(classification[meta_cols], on="manager", how="left", suffixes=("", "_class"))
+        dirty = audit["dirty_flag"].map(lambda value: bool(value) if pd.notna(value) else True)
+        if mode == "exclude_dirty":
+            audit["pass_manager_type"] = ~dirty
+        elif mode == "dedicated_like":
+            audit["pass_manager_type"] = (~dirty) & audit["manager_style"].eq("dedicated")
+        else:
+            audit["pass_manager_type"] = True
+
+    fresh_ids = set(fresh_versions["manager"].astype(str).str.zfill(10))
+    universe_ids = set(universe_selected["manager"].astype(str).str.zfill(10))
+    final_ids = set(final_selected["manager"].astype(str).str.zfill(10))
+    audit["pass_freshness"] = audit["manager"].isin(fresh_ids)
+    audit["pass_universe_filters"] = audit["manager"].isin(universe_ids)
+    audit["pass_final"] = audit["manager"].isin(final_ids)
+    columns = [
+        "rebalance_month", "manager", "period_date", "filing_date", "accession_number",
+        "aum", "n_holdings", "top10_weight", "put_weight", "active_share", "turnover", "hist_q",
+        "filing_date_cutoff", "period_date_cutoff", "pass_filing_fresh", "pass_period_fresh", "pass_freshness",
+        "min_history_quarters_cutoff", "pass_min_history",
+        "size_band_active", "min_aum_cutoff", "max_aum_cutoff", "pass_size_band",
+        "concentration_active", "min_top_n_weight_cutoff", "max_holdings_cutoff", "pass_concentration",
+        "hedge_filter_active", "hedge_put_max_weight_cutoff", "pass_hedge_filter",
+        "active_share_filter_active", "min_active_share_cutoff", "pass_active_share",
+        "low_turnover_filter_active", "turnover_quantile_cutoff", "turnover_value_cutoff", "pass_low_turnover",
+        "value_tilt_filter_active", "book_value_pctl", "value_tilt_min_pctl_cutoff", "pass_value_tilt",
+        "manager_filter_mode", "manager_style", "dirty_flag", "dirty_reason", "classification_source",
+        "pass_manager_type", "pass_universe_filters", "pass_final",
+    ]
+    for column in columns:
+        if column not in audit:
+            audit[column] = pd.NA
+    return audit[columns]
+
+
 # --------------------------------------------------------------------------- #
 def _idea_scores(
     cur: pd.Series,
@@ -824,6 +944,51 @@ def _idea_scores(
     return s[s > 0].sort_values(ascending=False).head(cfg.top_n_ideas)
 
 
+def _idea_component_rows(
+    manager,
+    cur: pd.Series,
+    picks: pd.Series,
+    cfg: PortfolioConfig,
+    active_benchmark_weights: pd.Series | None,
+    idiosyncratic_vol: pd.Series | None,
+    eligible_tickers=None,
+    active_benchmark_source: str = "visible_13f_aggregate",
+) -> list[dict]:
+    """Return the score components for the exact manager ideas that were selected."""
+    if picks.empty:
+        return []
+    current = cur.copy()
+    if eligible_tickers is not None:
+        eligible = pd.Index(eligible_tickers).astype(str).str.upper()
+        current = current[current.index.astype(str).str.upper().isin(eligible)]
+    benchmark = pd.Series(dtype=float)
+    active = pd.Series(dtype=float)
+    if _needs_active_benchmark_weights(cfg.idea_signal):
+        benchmark_input = _require_active_benchmark_weights(cfg, active_benchmark_weights)
+        if _uses_manager_held_mcap_benchmark(active_benchmark_source):
+            current, benchmark = _manager_held_mcap_weights(current, benchmark_input)
+        else:
+            benchmark = benchmark_input.reindex(current.index).fillna(0.0)
+        active = (current - benchmark.reindex(current.index).fillna(0.0)).clip(lower=0.0)
+    rows = []
+    for rank, (ticker, signal_score) in enumerate(picks.items(), start=1):
+        active_weight = float(active.get(ticker, np.nan)) if not active.empty else np.nan
+        idio = float(idiosyncratic_vol.get(ticker, np.nan)) if idiosyncratic_vol is not None else np.nan
+        cps = active_weight * idio if pd.notna(active_weight) and pd.notna(idio) else np.nan
+        rows.append({
+            "manager": str(manager),
+            "ticker": str(ticker),
+            "manager_book_weight": float(current.get(ticker, np.nan)),
+            "benchmark_weight": float(benchmark.get(ticker, np.nan)) if not benchmark.empty else np.nan,
+            "active_weight": active_weight,
+            "idio_vol": idio,
+            "cps_score": cps,
+            "signal_score": float(signal_score),
+            "manager_idea_rank": int(rank),
+        })
+    return rows
+
+
 def target_weights_from_versions(
     latest_versions: pd.DataFrame,
     cfg: PortfolioConfig,
@@ -846,6 +1011,9 @@ def target_weights_from_versions(
         "market_cap_eligible_managers": 0,
         "market_cap_mean_book_coverage": np.nan,
         "max_distinct_ideas_upper_bound": int(len(latest_versions) * max(int(cfg.top_n_ideas), 0)),
+        "_idea_audit": pd.DataFrame(),
+        "_target_weights_pre_cap": pd.Series(dtype=float),
+        "_source_managers": {},
     }
     if latest_versions.empty:
         empty = pd.Series(dtype=float)
@@ -859,6 +1027,8 @@ def target_weights_from_versions(
     score: dict[str, float] = {}
     max_score: dict[str, float] = {}
     count: dict[str, int] = {}
+    source_managers: dict[str, list[str]] = {}
+    idea_rows: list[dict] = []
     market_cap_book_coverages: list[float] = []
     for cur_row in latest_versions.itertuples(index=False):
         cur = getattr(cur_row, "bw")
@@ -883,6 +1053,16 @@ def target_weights_from_versions(
             eligible_tickers,
             active_benchmark_source,
         )
+        idea_rows.extend(_idea_component_rows(
+            getattr(cur_row, "manager", ""),
+            cur,
+            picks,
+            cfg,
+            active_benchmark_weights,
+            idiosyncratic_vol,
+            eligible_tickers,
+            active_benchmark_source,
+        ))
         if picks.empty:
             diagnostics["zero_contributor_managers"] += 1
         diagnostics["raw_idea_rows"] += int(len(picks))
@@ -893,9 +1073,19 @@ def target_weights_from_versions(
             score[tkr] = score.get(tkr, 0.0) + (float(wt) if aggregation == "score" else 1.0)
             max_score[tkr] = max(max_score.get(tkr, float("-inf")), float(wt))
             count[tkr] = count.get(tkr, 0) + 1
+            source_managers.setdefault(str(tkr), []).append(str(getattr(cur_row, "manager", "")))
     diagnostics["raw_idea_names"] = int(len(score))
     if market_cap_book_coverages:
         diagnostics["market_cap_mean_book_coverage"] = float(np.mean(market_cap_book_coverages))
+    idea_audit = pd.DataFrame(idea_rows)
+    if not idea_audit.empty:
+        idea_audit["contributor_count"] = idea_audit["ticker"].map(count).fillna(0).astype(int)
+        idea_audit["aggregate_score"] = idea_audit["ticker"].map(score)
+        idea_audit["selected_after_consensus_and_name_limit"] = False
+    diagnostics["_idea_audit"] = idea_audit
+    diagnostics["_source_managers"] = {
+        ticker: sorted(set(managers)) for ticker, managers in source_managers.items()
+    }
     s = pd.Series(score)
     if s.empty:
         return (s, diagnostics) if return_diagnostics else s
@@ -916,7 +1106,12 @@ def target_weights_from_versions(
     diagnostics["target_names_before_caps"] = int(len(s))
     if aggregation == "equal_name":
         s = pd.Series(1.0, index=s.index, dtype=float)
+    pre_cap = s / s.sum() if s.sum() > 0 else s
     target = _cap_weights(s, cfg.max_name_weight)
+    if not idea_audit.empty:
+        idea_audit["selected_after_consensus_and_name_limit"] = idea_audit["ticker"].isin(target.index)
+    diagnostics["_idea_audit"] = idea_audit
+    diagnostics["_target_weights_pre_cap"] = pre_cap
     return (target, diagnostics) if return_diagnostics else target
 
 
@@ -937,7 +1132,8 @@ def _apply_rebalance_target(cur: pd.Series,
                             tgt: pd.Series,
                             cfg: BacktestConfig,
                             month: pd.Timestamp,
-                            security_groups=None) -> tuple[pd.Series, float, list[str]]:
+                            security_groups=None,
+                            return_pre_cap: bool = False):
     tgt = tgt / tgt.sum()
     for n in tgt.index:
         last_in_tgt[n] = month
@@ -956,14 +1152,18 @@ def _apply_rebalance_target(cur: pd.Series,
         elif H <= 0 or q_gap > H:
             last_in_tgt.pop(n, None)
 
+    pre_cap = pd.Series(eff, dtype=float)
+    pre_cap = pre_cap / pre_cap.sum() if pre_cap.sum() > 0 else pre_cap
     eff_s = _cap_weights_with_groups(
-        pd.Series(eff, dtype=float),
+        pre_cap,
         cfg.portfolio.max_name_weight,
         cfg.portfolio.max_issuer_weight,
         security_groups,
     )
     alln = eff_s.index.union(cur.index)
     traded = 0.5 * (eff_s.reindex(alln).fillna(0) - cur.reindex(alln).fillna(0)).abs().sum()
+    if return_pre_cap:
+        return eff_s, float(traded), carried, pre_cap
     return eff_s, float(traded), carried
 
 
@@ -1118,19 +1318,23 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
 
     cur = pd.Series(dtype=float)
     last_in_tgt: dict[str, pd.Timestamp] = {}
+    last_sources: dict[str, list[str]] = {}
     summary_rows: list[dict] = []
     holding_rows: list[dict] = []
+    holding_source_rows: list[dict] = []
     manager_rows: list[dict] = []
+    manager_candidate_rows: list[dict] = []
+    idea_rows: list[dict] = []
 
     for m in months:
         cur, _ = _apply_monthly_returns(cur, prices, m, cfg)
         if m not in rebal_months:
             continue
 
-        latest_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
-        if latest_versions is None:
-            latest_versions = _visible_manager_versions(chars, m)
-        latest_versions, stale_diag = _filter_fresh_versions(latest_versions, m, cfg.universe)
+        visible_versions = visible_versions_cache.get(pd.Timestamp(m)) if visible_versions_cache is not None else None
+        if visible_versions is None:
+            visible_versions = _visible_manager_versions(chars, m)
+        latest_versions, stale_diag = _filter_fresh_versions(visible_versions, m, cfg.universe)
         active_benchmark_weights = _active_benchmark_for_month(
             cfg,
             m,
@@ -1138,7 +1342,8 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             active_benchmark_weights_by_month,
         )
         idiosyncratic_vol = _idiosyncratic_vol_for_month(cfg, m, idiosyncratic_vol_by_month)
-        selected_versions = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+        universe_selected = filter_universe_versions(latest_versions, cfg.universe, value_scores)
+        selected_versions = universe_selected
         selected_versions = _apply_manager_type_filter(
             selected_versions,
             m,
@@ -1146,6 +1351,19 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             manager_classification,
             manager_overrides,
         )
+        candidate_audit = _manager_candidates_audit(
+            visible_versions,
+            latest_versions,
+            universe_selected,
+            selected_versions,
+            m,
+            cfg,
+            value_scores,
+            manager_classification,
+            manager_overrides,
+        )
+        if not candidate_audit.empty:
+            manager_candidate_rows.extend(candidate_audit.to_dict(orient="records"))
         manager_filter_diag = _manager_filter_diagnostics(selected_versions, cfg)
         selected_managers = selected_versions["manager"].tolist() if not selected_versions.empty else []
         for row in selected_versions.itertuples(index=False):
@@ -1173,6 +1391,11 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             return_diagnostics=True,
             active_benchmark_source=cfg.active_benchmark_source,
         )
+        idea_audit = idea_diag.get("_idea_audit", pd.DataFrame())
+        if isinstance(idea_audit, pd.DataFrame) and not idea_audit.empty:
+            idea_audit = idea_audit.copy()
+            idea_audit.insert(0, "rebalance_month", m.date().isoformat())
+            idea_rows.extend(idea_audit.to_dict(orient="records"))
         target_names_before_price_filter = int(len(tgt))
         tgt = tgt[tgt.index.isin(priced_now)]
         invalid_reason = _minimum_target_failure(tgt, cfg)
@@ -1215,9 +1438,22 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             })
             cur = eff
             last_in_tgt.clear()
+            last_sources.clear()
             continue
 
-        eff, traded, carried = _apply_rebalance_target(cur, last_in_tgt, tgt, cfg, m, security_groups)
+        current_sources = idea_diag.get("_source_managers", {})
+        for ticker in tgt.index:
+            last_sources[str(ticker)] = list(current_sources.get(str(ticker), []))
+        eff, traded, carried, combined_pre_cap = _apply_rebalance_target(
+            cur,
+            last_in_tgt,
+            tgt,
+            cfg,
+            m,
+            security_groups,
+            return_pre_cap=True,
+        )
+        last_sources = {ticker: sources for ticker, sources in last_sources.items() if ticker in last_in_tgt}
         cost_bps = traded * cfg.cost.bps_per_side
         portfolio_stats = _portfolio_summary_stats(eff)
         issuer_stats = _issuer_exposure_summary(eff, security_groups)
@@ -1238,6 +1474,10 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             "target_names_before_price_filter": target_names_before_price_filter,
             "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
             "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
+            "market_cap_covered_names": int(idea_diag["market_cap_covered_names"]),
+            "market_cap_eligible_managers": int(idea_diag["market_cap_eligible_managers"]),
+            "market_cap_mean_book_coverage": float(idea_diag["market_cap_mean_book_coverage"]),
+            "max_distinct_ideas_upper_bound": int(idea_diag["max_distinct_ideas_upper_bound"]),
             "effective_names": int(len(eff)),
             "carried_names": int(len(carried)),
             "valid_rebalance": True,
@@ -1251,24 +1491,52 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             "note": "",
         })
         carried_set = set(carried)
+        target_pre_cap = idea_diag.get("_target_weights_pre_cap", pd.Series(dtype=float))
         groups = _security_groups_for(eff.index, security_groups).reindex(eff.index)
         for rank, (ticker, weight) in enumerate(eff.sort_values(ascending=False).items(), start=1):
+            sources = last_sources.get(str(ticker), [])
+            carry_age_q = int((m.to_period("Q") - last_in_tgt[ticker].to_period("Q")).n) if ticker in last_in_tgt else 0
             holding_rows.append({
                 "rebalance_month": m.date().isoformat(),
                 "rank": int(rank),
                 "ticker": ticker,
                 "issuer_group": groups.loc[ticker],
                 "weight": float(weight),
+                "pre_cap_weight": float(combined_pre_cap.get(ticker, np.nan)),
+                "target_weight_pre_cap": float(target_pre_cap.get(ticker, np.nan)),
+                "target_weight_post_name_cap": float(tgt.get(ticker, np.nan)),
+                "post_cap_weight": float(weight),
                 "is_carried": bool(ticker in carried_set),
+                "carry_age_q": carry_age_q,
+                "source_manager_count": int(len(sources)),
+                "source_managers": ";".join(sources),
             })
+            for manager in sources:
+                holding_source_rows.append({
+                    "rebalance_month": m.date().isoformat(),
+                    "ticker": ticker,
+                    "manager": manager,
+                    "is_carried": bool(ticker in carried_set),
+                    "carry_age_q": carry_age_q,
+                })
         cur = eff
 
     return {
         "summary": pd.DataFrame(summary_rows),
         "holdings": pd.DataFrame(
             holding_rows,
-            columns=["rebalance_month", "rank", "ticker", "issuer_group", "weight", "is_carried"],
+            columns=[
+                "rebalance_month", "rank", "ticker", "issuer_group", "weight",
+                "pre_cap_weight", "target_weight_pre_cap", "target_weight_post_name_cap",
+                "post_cap_weight", "is_carried", "carry_age_q", "source_manager_count", "source_managers",
+            ],
         ),
+        "holding_sources": pd.DataFrame(
+            holding_source_rows,
+            columns=["rebalance_month", "ticker", "manager", "is_carried", "carry_age_q"],
+        ),
+        "manager_candidates_audit": pd.DataFrame(manager_candidate_rows),
+        "ideas": pd.DataFrame(idea_rows),
         "managers": pd.DataFrame(
             manager_rows,
             columns=[

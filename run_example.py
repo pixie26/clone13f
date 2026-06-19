@@ -46,6 +46,7 @@ from manager_classifier import (
 from market_cap import fetch_market_cap_history, load_market_cap_table, market_caps_by_month
 from report import dashboard, interactive_results, single_config_result_grid
 from run_diagnostics import (
+    manager_characteristics_audit,
     print_rebalance_summary as _print_rebalance_summary,
     rebalance_summary_stats as _rebalance_summary_stats,
     trace_core_diagnostics as _trace_core_diagnostics,
@@ -550,6 +551,8 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
         },
         "missing_price_policy": cfg.missing_price_policy,
         "active_filter_status": {
+            "concentration_configured": bool(cfg.universe.use_concentration),
+            "concentration_active": bool(cfg.universe.use_concentration),
             "value_tilt_configured": bool(cfg.universe.use_value_tilt),
             "value_tilt_active": bool(cfg.universe.use_value_tilt and value_scores is not None),
             "active_share_configured": bool(cfg.universe.use_active_share),
@@ -598,7 +601,8 @@ def _dashboard_parameter_summary(
         "Universe": (
             f"min_aum={u.min_aum:.0f}, max_aum={u.max_aum:.0f}, "
             f"manager_filter={cfg.manager_filter_mode}, "
-            f"max_holdings={u.max_holdings}, min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
+            f"use_concentration={u.use_concentration}, max_holdings={u.max_holdings}, "
+            f"min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
             f"turnover_q={u.turnover_quantile}, min_history_q={u.min_history_quarters}, "
             f"hedge_put_max={u.hedge_put_max_weight:.0%}, value_tilt_min={u.value_tilt_min_pctl:.0%}"
         ),
@@ -661,7 +665,12 @@ def write_rebalance_outputs(
     )
     outputs: dict[str, str] = {}
     for name, df in trace.items():
-        path = out_dir / f"rebalance_{name}_{label}.csv"
+        filename = (
+            "rebalance_manager_candidates_audit.csv"
+            if name == "manager_candidates_audit" and label == "thesis"
+            else f"rebalance_{name}_{label}.csv"
+        )
+        path = out_dir / filename
         df.to_csv(path, index=False)
         outputs[name] = str(path)
 
@@ -1162,7 +1171,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         universe=UniverseConfig(
             min_aum=0.5e9,
             max_aum=5e9,
-            use_concentration=False,
+            use_concentration=True,
             min_top_n_weight=0.50,
             max_holdings=40,
             turnover_quantile=0.34,
@@ -1207,7 +1216,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             "cps_ir",
         ],
         ("portfolio", "top_n_ideas"): [1, 3, 5],
-        ("portfolio", "idea_aggregation"): ["equal_name"],
+        ("portfolio", "idea_aggregation"): ["equal_name", "score"],
         ("portfolio", "min_consensus_funds"): [1],
         ("portfolio", "holding_horizon_q"): [0, 1],
         ("portfolio", "min_portfolio_names"): [10],
@@ -1286,7 +1295,8 @@ def _print_startup_parameters(
             "  thesis universe       "
             f"manager_filter={cfg_a.manager_filter_mode}, "
             f"min_aum={u.min_aum:.0f}, max_aum={u.max_aum:.0f}, "
-            f"max_holdings={u.max_holdings}, min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
+            f"use_concentration={u.use_concentration}, max_holdings={u.max_holdings}, "
+            f"min_top{u.top_n_concentration}_weight={u.min_top_n_weight:.0%}, "
             f"turnover_q={u.turnover_quantile}, min_history_q={u.min_history_quarters}, "
             f"max_stale_filing_m={u.max_stale_filing_months}, max_stale_period_m={u.max_stale_period_months}, "
             f"hedge_put_max={u.hedge_put_max_weight:.0%}, value_tilt_min={u.value_tilt_min_pctl:.0%}"
@@ -1436,6 +1446,16 @@ def run(
         f"2a/5 characteristics done: rows={len(chars):,}, shallow={_frame_shallow_mb(chars):,.1f}MB, "
         f"step={time.perf_counter() - t_step:.1f}s"
     )
+    progress("2a/5 raw-book characteristics audit starting")
+    raw_chars = manager_characteristics(raw_holdings_for_classification, bench_w, progress=progress)
+    characteristics_audit = manager_characteristics_audit(raw_chars, chars)
+    characteristics_audit_path = out_dir / "manager_characteristics_raw_investable.csv"
+    characteristics_audit.to_csv(characteristics_audit_path, index=False)
+    progress(
+        f"2a/5 raw/investable characteristics saved: {characteristics_audit_path} "
+        f"rows={len(characteristics_audit):,}"
+    )
+    del raw_chars
     progress("2b/5 visible-version snapshots starting")
     t_step = time.perf_counter()
     try:
@@ -1860,6 +1880,7 @@ def run(
         "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),
         "outputs": {
             "dashboard": dashboard_path,
+            "manager_characteristics_raw_investable": str(characteristics_audit_path),
             "rebalance_thesis": rebalance_outputs,
             "sweep": sweep_outputs,
             "stage2_progress_log": str(stage2_log_path),
