@@ -609,14 +609,25 @@ def manager_characteristics(holdings: pd.DataFrame,
         if missing_metrics:
             raise ValueError(f"filing_put_weights missing columns: {missing_metrics}")
         metrics = filing_put_weights.loc[:, metric_keys + ["filing_put_weight"]].copy()
-        chars = chars.merge(metrics, on=metric_keys, how="left", validate="one_to_one")
-        missing_versions = chars["filing_put_weight"].isna()
+        chars = chars.merge(
+            metrics,
+            on=metric_keys,
+            how="left",
+            validate="one_to_one",
+            indicator="_filing_put_metric_merge",
+        )
+        # A matched zero-total-value filing legitimately has an undefined PUT
+        # ratio (NaN). Distinguish that from a missing exact-version metric;
+        # the hedge screen later treats NaN fail-closed rather than fabricating
+        # a zero exposure.
+        missing_versions = chars["_filing_put_metric_merge"].ne("both")
         if missing_versions.any():
             sample = chars.loc[missing_versions, metric_keys].head(5).to_dict(orient="records")
             raise ValueError(
                 "missing raw filing PUT weights for manager versions; "
                 f"count={int(missing_versions.sum())}, sample={sample}"
             )
+        chars = chars.drop(columns="_filing_put_metric_merge")
     chars["hist_q"] = chars.groupby("manager")["period_date"].rank(method="dense").astype(int)
 
     # Known issue: prior-period turnover uses the latest version of that prior

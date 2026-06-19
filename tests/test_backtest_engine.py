@@ -160,6 +160,41 @@ def test_hedge_filter_uses_raw_filing_put_weight_before_equity_filter():
     assert bool(audit["pass_hedge_filter"]) is False
 
 
+def test_zero_value_filing_has_undefined_raw_put_weight_and_fails_closed():
+    keys = {
+        "manager": "0000000001",
+        "period_date": pd.Timestamp("2020-03-31"),
+        "filing_date": pd.Timestamp("2020-05-15"),
+        "accession_number": "zero-value-filing",
+        "submission_type": "13F-HR/A",
+    }
+    raw = pd.DataFrame([
+        {**keys, "ticker": "A", "value": 0.0, "sec_type": "SH"},
+    ])
+    filing_put = raw_filing_put_weights(raw)
+
+    chars = en.manager_characteristics(raw, filing_put_weights=filing_put)
+    cfg = UniverseConfig(
+        min_history_quarters=1,
+        use_size_band=False,
+        use_concentration=False,
+        use_low_turnover=False,
+        use_hedge_filter=True,
+        hedge_put_max_weight=0.05,
+        use_value_tilt=False,
+    )
+
+    assert pd.isna(filing_put.loc[0, "filing_put_weight"])
+    assert pd.isna(chars.loc[0, "filing_put_weight"])
+    assert filter_universe_versions(chars, cfg).empty
+
+    with pytest.raises(ValueError, match="missing raw filing PUT weights"):
+        en.manager_characteristics(
+            raw,
+            filing_put_weights=filing_put.iloc[0:0],
+        )
+
+
 def test_idio_cache_restores_requested_empty_months_after_parquet_roundtrip():
     months = pd.to_datetime(["2015-01-31", "2015-02-28"])
     loaded = {pd.Timestamp("2015-02-28"): pd.Series({"AAPL": 0.25})}
