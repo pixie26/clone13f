@@ -70,12 +70,22 @@ Full live run:
 python -B run_example.py --mode live
 ```
 
-The live thesis default currently uses
-`active_benchmark_source="visible_13f_aggregate"` for active-weight signals.
-Treat this as a diagnostic peer-13F/crowding proxy, not a true market-cap
-benchmark. A proper thesis active-weight benchmark requires point-in-time market
-capitalization or index-constituent weights; the repository does not currently
-include that data.
+The live thesis default uses `active_benchmark_source="manager_held_mcap"`.
+For each visible manager filing, the engine restricts that month's market caps
+to the manager's security-filtered common-stock holdings and normalizes them to
+one. Active weight is `manager_weight - held_portfolio_market_cap_weight`.
+Missing market caps are excluded and audited; they are never filled with zero,
+and there is no fallback to the peer-13F aggregate.
+
+The first live run incrementally builds
+`data/processed/market_cap_history.parquet` from Yahoo historical shares and
+month-end closes. Split events are applied so prices and shares use a
+consistent share basis, including split-transition months. Each batch is
+checkpointed and subsequent runs reuse the cache. This free source is explicitly
+labelled `yahoo_shares_proxy`: Yahoo may revise historical shares, so it is a
+research-infrastructure proxy, not strict CRSP/Compustat point-in-time market
+capitalization. Replace the cache with an audited long table containing
+`month_end,ticker,market_cap,available_date,source,strict_pit` for publishable work.
 
 The live thesis default uses `manager_filter_mode="dedicated_like"`, while
 `all` remains the untouched baseline. Manager filtering modes:
@@ -139,17 +149,25 @@ cps_score = positive_active_overweight * trailing_CAPM_residual_vol
 ```
 
 Residual volatility is point-in-time: by default it uses the prior 24 monthly
-returns, requires 24 observations, and never uses the as-of month itself. The
+returns, requires 12 observations, and never uses the as-of month itself. Price
+and factor history starts in 2014 as warm-up while reported backtest returns
+still start in 2015. The
 24-month window plus the 10%/80% floor/cap and 5%/95% winsorization are pragmatic
 guardrails, not academically calibrated constants. They are written to the run
 manifest and should be treated as research assumptions.
 
 Future v2 data/research items:
 
-- Add PIT market-cap data and a `manager_held_mcap` benchmark.
+- Replace the Yahoo shares proxy with audited PIT market-cap data.
 - Add true historical SPY/SPX constituent-weight support.
 - Evaluate FF5+MOM residual volatility with longer windows.
 - Add ADV/Bushee enrichment for manager-type classification.
+
+The thesis portfolio takes one CPS-IR best idea per manager, deduplicates names,
+and equal-weights the resulting names (`idea_aggregation="equal_name"`). It does
+not require manager overlap (`min_consensus_funds=1`). The default formal sweep
+contains 48 predeclared variants: two AUM bands, raw active-weight vs CPS-IR,
+top 1/3/5 ideas, 0/1-quarter carry, and concentration-filter off/on.
 
 The live default uses `--price-source chart` through `LIVE_CONFIG` to avoid
 `yfinance` hangs on restricted networks. To compare against yfinance manually:

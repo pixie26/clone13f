@@ -56,7 +56,13 @@ Use the judgment expected from an experienced institutional quant strategy archi
    * Do not overwrite previous research outputs unless requested.
    * Save important outputs under `reports/`, `artifacts/`, or another clearly named output directory.
 
-4. Prefer simple, testable code.
+4. Preserve the interactive-report template.
+
+   * `interactive_results_template.html` is the canonical UI source for generated interactive sweep reports.
+   * `report.py` should inject run payloads into its explicit placeholders; do not reintroduce a separate embedded HTML implementation.
+   * Preserve user-authored layout and interaction changes in the template unless the user explicitly requests a redesign.
+
+5. Prefer simple, testable code.
 
    * Separate data loading, signal calculation, portfolio construction, backtesting, and reporting.
    * Avoid large monolithic scripts.
@@ -64,7 +70,7 @@ Use the judgment expected from an experienced institutional quant strategy archi
    * Use deterministic seeds when randomness is involved.
    * Prefer small, reviewable patches over large rewrites.
 
-5. Do not fabricate market data, SEC data, factor data, or performance numbers.
+6. Do not fabricate market data, SEC data, factor data, or performance numbers.
 
    * If data is missing, say it is missing.
    * If a result is approximate, label it clearly.
@@ -229,6 +235,8 @@ Priority order:
 4. Keep PIT-sensitive structures such as manager book weights, turnover, amendment handling, target generation, and carry horizon conservative until covered by tests.
 5. Consider a more structured sparse holdings representation if 10-year full-universe runs become memory-bound.
 6. Upgrade the cost model from flat bps to an ADV/order-size-aware market-impact model.
+7. Raise CUSIP mapping coverage above the current 81.7% of long-share value with an audited supplemental identifier source; treat the residual as a research-result risk, not only an operational warning.
+8. Enforce and test a true common-stock eligibility rule before portfolio construction. The equity-only path must not admit warrants, units, mutual funds, or other non-common instruments merely because Yahoo accepts the ticker string.
 
 Known issues to track:
 
@@ -236,6 +244,7 @@ Known issues to track:
 * The `missing_price_policy="exit"` behavior is a yfinance-compatible fallback, not a replacement for true delisting returns.
 * CUSIP/OpenFIGI mapping coverage remains incomplete. The current mapper handles CUSIP vs CINS and common share-class ticker normalization, but residual unmapped value can still be systematic around stale identifiers, corporate actions, foreign issuers, renamed/merged securities, or non-common 13F instruments. Always report all-value and price-candidate coverage, top unmapped CUSIPs by value, and treat large unmapped value as a research validity risk until resolved with CRSP/WRDS or a supplemental audited identifier map.
 * ETF/ETN/fund-like holdings are excluded by default for equity-only idea-generation runs. If the research question explicitly studies hedge fund beta allocation, enable ETF exposure deliberately, label the run as ETF-inclusive, and report ETF exposure separately.
+* `manager_held_mcap` currently auto-builds a free-data research proxy from Yahoo historical shares and split-adjusted historical closes. The engine is PIT with respect to the dates stored in that table, but Yahoo can revise historical share counts, so the source itself is not strict vendor point-in-time data. Publishable results require an audited CRSP/Compustat-equivalent replacement. Never relabel proxy rows as strict PIT.
 
 ## Testing Expectations
 

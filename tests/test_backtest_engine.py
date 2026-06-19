@@ -35,8 +35,25 @@ from engine import (
     run_backtest,
     target_weights_from_versions,
 )
-from run_example import _rebalance_summary_stats, load_security_groups, run as run_example_run, value_unit_continuity_diagnostics
+from run_example import (
+    _default_run_configs,
+    _rebalance_summary_stats,
+    load_security_groups,
+    run as run_example_run,
+    value_unit_continuity_diagnostics,
+)
 from sweep import deflated_sharpe
+
+
+def test_default_thesis_uses_manager_held_mcap_cps_best_idea_and_48_trial_sweep():
+    thesis, _, axes, _, _ = _default_run_configs()
+
+    assert thesis.portfolio.idea_signal == "cps_ir"
+    assert thesis.active_benchmark_source == "manager_held_mcap"
+    assert thesis.portfolio.top_n_ideas == 1
+    assert thesis.portfolio.idea_aggregation == "equal_name"
+    assert thesis.portfolio.min_consensus_funds == 1
+    assert int(np.prod([len(values) for values in axes.values()])) == 48
 
 
 def test_run_backtest_raises_on_missing_held_return():
@@ -146,6 +163,30 @@ def test_rebalance_skips_target_without_current_month_price():
 
     assert feb["target_names"] == 0
     assert feb["effective_names"] == 0
+
+
+def test_manager_characteristics_turnover_uses_latest_prior_period_amendment():
+    holdings = pd.DataFrame(
+        [
+            {"manager": "m1", "period_date": "2019-12-31", "filing_date": "2020-01-15", "accession_number": "q1", "submission_type": "13F-HR", "ticker": "A", "value": 60.0, "sec_type": "SH"},
+            {"manager": "m1", "period_date": "2019-12-31", "filing_date": "2020-01-15", "accession_number": "q1", "submission_type": "13F-HR", "ticker": "B", "value": 40.0, "sec_type": "SH"},
+            {"manager": "m1", "period_date": "2019-12-31", "filing_date": "2020-01-20", "accession_number": "q1a", "submission_type": "13F-HR/A", "ticker": "A", "value": 50.0, "sec_type": "SH"},
+            {"manager": "m1", "period_date": "2019-12-31", "filing_date": "2020-01-20", "accession_number": "q1a", "submission_type": "13F-HR/A", "ticker": "B", "value": 50.0, "sec_type": "SH"},
+            {"manager": "m1", "period_date": "2020-03-31", "filing_date": "2020-05-15", "accession_number": "q2", "submission_type": "13F-HR", "ticker": "A", "value": 25.0, "sec_type": "SH"},
+            {"manager": "m1", "period_date": "2020-03-31", "filing_date": "2020-05-15", "accession_number": "q2", "submission_type": "13F-HR", "ticker": "B", "value": 75.0, "sec_type": "SH"},
+        ]
+    )
+    holdings[["period_date", "filing_date"]] = holdings[["period_date", "filing_date"]].apply(pd.to_datetime)
+
+    chars = en.manager_characteristics(holdings)
+    q2 = chars[chars["accession_number"].eq("q2")].iloc[0]
+
+    assert q2["turnover"] == pytest.approx(0.25)
+    pd.testing.assert_series_equal(
+        q2["prev_bw"].sort_index(),
+        pd.Series({"A": 0.5, "B": 0.5}),
+        check_names=False,
+    )
 
 
 def test_cap_weights_enforces_feasible_name_cap():
@@ -386,6 +427,114 @@ def test_cps_ir_scores_positive_overweight_times_idio_vol():
 
     assert target.index.tolist() == ["B"]
     assert target.loc["B"] == pytest.approx(1.0)
+
+
+def test_manager_held_mcap_benchmark_is_normalized_within_each_manager_book():
+    caps = pd.Series({"A": 100.0, "B": 300.0, "C": 600.0})
+    manager_one, bench_one = en._manager_held_mcap_weights(
+        pd.Series({"A": 0.60, "B": 0.40}),
+        caps,
+    )
+    manager_two, bench_two = en._manager_held_mcap_weights(
+        pd.Series({"A": 0.60, "C": 0.40}),
+        caps,
+    )
+
+    assert manager_one.sum() == pytest.approx(1.0)
+    assert bench_one.sum() == pytest.approx(1.0)
+    assert bench_two.sum() == pytest.approx(1.0)
+    assert bench_one.loc["A"] == pytest.approx(0.25)
+    assert bench_two.loc["A"] == pytest.approx(1.0 / 7.0)
+
+
+def test_manager_held_mcap_drops_missing_caps_instead_of_zero_filling():
+    manager, benchmark = en._manager_held_mcap_weights(
+        pd.Series({"A": 0.50, "B": 0.30, "C": 0.20}),
+        pd.Series({"A": 100.0, "B": 300.0}),
+    )
+
+    assert manager.index.tolist() == ["A", "B"]
+    assert benchmark.index.tolist() == ["A", "B"]
+    assert manager.to_dict() == pytest.approx({"A": 0.625, "B": 0.375})
+    assert benchmark.to_dict() == pytest.approx({"A": 0.25, "B": 0.75})
+
+
+def test_equal_name_aggregation_deduplicates_manager_picks_without_extra_weight():
+    latest_versions = pd.DataFrame(
+        [
+            {"manager": "m1", "bw": pd.Series({"A": 0.8, "B": 0.2}), "prev_bw": None},
+            {"manager": "m2", "bw": pd.Series({"A": 0.7, "C": 0.3}), "prev_bw": None},
+            {"manager": "m3", "bw": pd.Series({"D": 0.9, "E": 0.1}), "prev_bw": None},
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="level",
+        top_n_ideas=1,
+        idea_aggregation="equal_name",
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg)
+
+    assert target.to_dict() == pytest.approx({"A": 0.5, "D": 0.5})
+
+
+def test_manager_held_mcap_cps_ir_uses_each_manager_held_subset():
+    latest_versions = pd.DataFrame(
+        [
+            {"manager": "m1", "bw": pd.Series({"A": 0.60, "B": 0.40}), "prev_bw": None},
+            {"manager": "m2", "bw": pd.Series({"A": 0.60, "C": 0.40}), "prev_bw": None},
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="cps_ir",
+        top_n_ideas=1,
+        idea_aggregation="equal_name",
+        min_consensus_funds=1,
+        min_active_weight_holdings=2,
+        max_name_weight=1.0,
+    )
+    caps = pd.Series({"A": 100.0, "B": 300.0, "C": 600.0})
+    idio = pd.Series({"A": 0.50, "B": 0.20, "C": 0.20})
+
+    target = target_weights_from_versions(
+        latest_versions,
+        cfg,
+        caps,
+        idio,
+        active_benchmark_source="manager_held_mcap",
+    )
+
+    assert target.index.tolist() == ["A"]
+    assert target.iloc[0] == pytest.approx(1.0)
+
+
+def test_manager_held_mcap_initiation_preserves_original_previous_membership():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "bw": pd.Series({"A": 0.50, "B": 0.50}),
+                "prev_bw": pd.Series({"A": 1.0}),
+            }
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="active_weight_initiation",
+        top_n_ideas=1,
+        min_active_weight_holdings=2,
+        max_name_weight=1.0,
+    )
+
+    target = target_weights_from_versions(
+        latest_versions,
+        cfg,
+        pd.Series({"A": 900.0, "B": 100.0}),
+        active_benchmark_source="manager_held_mcap",
+    )
+
+    assert target.index.tolist() == ["B"]
 
 
 def test_cps_ir_change_requires_positive_increase_and_overweight():
@@ -1084,7 +1233,8 @@ def test_active_selection_cache_backtest_matches_direct_run_with_same_benchmark(
     pd.testing.assert_series_equal(cached, direct)
 
 
-def test_external_active_benchmark_direct_and_cached_paths_match():
+@pytest.mark.parametrize("active_source", ["spy_holdings", "manager_held_mcap"])
+def test_external_active_benchmark_direct_and_cached_paths_match(active_source):
     months = pd.date_range("2020-01-31", periods=4, freq="ME")
     holdings = pd.DataFrame(
         [
@@ -1108,7 +1258,7 @@ def test_external_active_benchmark_direct_and_cached_paths_match():
     )
     prices = pd.DataFrame({"A": [0.01, 0.02, 0.03, 0.04], "B": [0.0, 0.0, 0.0, 0.0]}, index=months)
     cfg = BacktestConfig(
-        active_benchmark_source="spy_holdings",
+        active_benchmark_source=active_source,
         universe=UniverseConfig(
             min_history_quarters=1,
             use_size_band=False,
@@ -1768,6 +1918,119 @@ def test_cusip_to_ticker_uses_cins_id_type_and_normalizes_ticker(monkeypatch, tm
     assert pd.notna(metadata.loc["084670702", "metadata_version"])
 
 
+def test_openfigi_unmapped_negative_cache_is_not_requested_twice(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{}]
+
+    def fake_post(url, json, headers, timeout):
+        calls.append(json)
+        return FakeResponse()
+
+    monkeypatch.setattr(da.requests, "post", fake_post)
+    monkeypatch.setattr(da.time, "sleep", lambda *_: None)
+    cache_path = tmp_path / "openfigi.parquet"
+
+    assert cusip_to_ticker(["ZZCXTSUT2"], cache_path=cache_path, require_metadata=True) == {}
+    assert cusip_to_ticker(["ZZCXTSUT2"], cache_path=cache_path, require_metadata=True) == {}
+
+    assert len(calls) == 1
+    cached = pd.read_parquet(cache_path).set_index("cusip").loc["ZZCXTSUT2"]
+    assert cached["status"] == "unmapped"
+    assert cached["attempt_version"] == da.OPENFIGI_ATTEMPT_VERSION
+    assert pd.isna(cached["metadata_version"])
+
+
+def test_openfigi_unmapped_status_does_not_refresh_for_missing_metadata(monkeypatch, tmp_path):
+    cache_path = tmp_path / "openfigi.parquet"
+    _write_openfigi_cache(
+        cache_path,
+        {
+            "ZZCXTSUT2": {
+                "ticker": None,
+                "status": "unmapped",
+                "attempt_version": da.OPENFIGI_ATTEMPT_VERSION,
+                "attempted_at": pd.Timestamp("2026-06-19"),
+                "metadata_version": pd.NA,
+                "error_type": "no_data",
+            }
+        },
+    )
+
+    def unexpected_post(*args, **kwargs):
+        raise AssertionError("current unmapped cache row must not be requested")
+
+    monkeypatch.setattr(da.requests, "post", unexpected_post)
+
+    assert cusip_to_ticker(["ZZCXTSUT2"], cache_path=cache_path, require_metadata=True) == {}
+
+
+def test_openfigi_force_refresh_retries_current_unmapped_row(monkeypatch, tmp_path):
+    cache_path = tmp_path / "openfigi.parquet"
+    _write_openfigi_cache(cache_path, {"037833100": None})
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "data": [
+                        {
+                            "ticker": "AAPL",
+                            "marketSector": "Equity",
+                            "exchCode": "US",
+                            "securityType2": "Common Stock",
+                        }
+                    ]
+                }
+            ]
+
+    def fake_post(url, json, headers, timeout):
+        calls.append(json)
+        return FakeResponse()
+
+    monkeypatch.setattr(da.requests, "post", fake_post)
+    monkeypatch.setattr(da.time, "sleep", lambda *_: None)
+
+    assert cusip_to_ticker(["037833100"], cache_path=cache_path, force_refresh=True) == {
+        "037833100": "AAPL"
+    }
+    assert len(calls) == 1
+
+
+def test_openfigi_retryable_error_obeys_backoff(monkeypatch, tmp_path):
+    cache_path = tmp_path / "openfigi.parquet"
+    calls = []
+
+    def failing_post(*args, **kwargs):
+        calls.append(1)
+        raise da.requests.Timeout("test timeout")
+
+    monkeypatch.setattr(da.requests, "post", failing_post)
+
+    with pytest.raises(da.requests.Timeout):
+        cusip_to_ticker(["037833100"], cache_path=cache_path)
+    with pytest.raises(RuntimeError, match="inside the retry backoff"):
+        cusip_to_ticker(["037833100"], cache_path=cache_path)
+
+    assert len(calls) == 1
+    cached = pd.read_parquet(cache_path).set_index("cusip").loc["037833100"]
+    assert cached["status"] == "error_retryable"
+    assert cached["error_type"] == "Timeout"
+
+
 def test_priceable_holdings_drops_prn_and_bond_descriptions():
     holdings = pd.DataFrame(
         {
@@ -1852,8 +2115,16 @@ def test_build_live_data_requires_openfigi_metadata_for_equity_only(monkeypatch)
 
     monkeypatch.setattr("build_universe.build_holdings_universe", lambda *args, **kwargs: h_cusip)
 
-    def fake_cusip_to_ticker(cusips, api_key=None, *, cache_path=None, require_metadata=False):
+    def fake_cusip_to_ticker(
+        cusips,
+        api_key=None,
+        *,
+        cache_path=None,
+        require_metadata=False,
+        force_refresh=False,
+    ):
         calls["require_metadata"] = require_metadata
+        calls["force_refresh"] = force_refresh
         return {"037833100": "AAPL"}
 
     monkeypatch.setattr(da, "cusip_to_ticker", fake_cusip_to_ticker)
@@ -1887,6 +2158,7 @@ def test_build_live_data_requires_openfigi_metadata_for_equity_only(monkeypatch)
     )
 
     assert calls["require_metadata"] is True
+    assert calls["force_refresh"] is False
 
 
 def test_load_benchmark_weight_table_normalizes_tickers_and_percent_weights(tmp_path):
@@ -2113,6 +2385,103 @@ def test_price_cache_overwrites_stale_ticker_history(tmp_path):
     assert loaded.loc[pd.Timestamp("2015-01-31"), "SPY"] == 200.0
 
 
+def test_fetch_prices_skips_no_close_ticker_inside_ttl(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
+    _write_price_cache(cache_path, pd.DataFrame({"AAPL": [100.0, 110.0, 121.0]}, index=dates))
+    da._write_price_coverage(
+        cache_path,
+        ["ZZNC"],
+        "2025-01-01",
+        "2025-03-31",
+        "no_close_retryable",
+    )
+
+    def unexpected_download(*args, **kwargs):
+        raise AssertionError("no_close_retryable must not be retried inside TTL")
+
+    monkeypatch.setattr(da, "_yf_download_close", unexpected_download)
+
+    returns = da.fetch_prices(
+        ["AAPL", "ZZNC"],
+        "2025-01-01",
+        "2025-03-31",
+        cache_path=cache_path,
+        use_chart_fallback=False,
+    )
+
+    assert returns.columns.tolist() == ["AAPL"]
+    assert returns.attrs["price_diagnostics"]["tickers_skipped_known_no_close"] == 1
+
+
+def test_fetch_prices_refreshes_stale_ticker_incrementally(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    _write_price_cache(
+        cache_path,
+        pd.DataFrame(
+            {"AAPL": [100.0, 110.0]},
+            index=pd.to_datetime(["2025-01-31", "2025-02-28"]),
+        ),
+    )
+    calls = []
+
+    def fake_download(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame(
+            {"AAPL": [121.0, 133.1]},
+            index=pd.to_datetime(["2025-03-31", "2025-04-30"]),
+        )
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_download)
+
+    da.fetch_prices(
+        ["AAPL"],
+        "2025-01-01",
+        "2025-04-30",
+        cache_path=cache_path,
+        use_chart_fallback=False,
+    )
+
+    assert calls == [(("AAPL",), "2025-03-01", "2025-04-30")]
+    cached = _load_price_cache(cache_path, "2025-01-01", "2025-04-30")["AAPL"].dropna()
+    assert cached.index.tolist() == pd.to_datetime(
+        ["2025-01-31", "2025-02-28", "2025-03-31", "2025-04-30"]
+    ).tolist()
+
+
+def test_fetch_prices_retries_expired_temporary_error(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    dates = pd.to_datetime(["2025-01-31", "2025-02-28", "2025-03-31"])
+    _write_price_cache(cache_path, pd.DataFrame({"AAPL": [100.0, 110.0, 121.0]}, index=dates))
+    da._write_price_coverage(
+        cache_path,
+        ["MSFT"],
+        "2025-01-01",
+        "2025-03-31",
+        "temporary_error",
+        attempted_at=da._utc_now_naive() - pd.Timedelta(days=2),
+        error_type="TimeoutError",
+    )
+    calls = []
+
+    def fake_download(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame({"MSFT": [200.0, 220.0, 242.0]}, index=dates)
+
+    monkeypatch.setattr(da, "_yf_download_close", fake_download)
+
+    returns = da.fetch_prices(
+        ["AAPL", "MSFT"],
+        "2025-01-01",
+        "2025-03-31",
+        cache_path=cache_path,
+        use_chart_fallback=False,
+    )
+
+    assert calls == [(("MSFT",), "2025-01-01", "2025-03-31")]
+    assert set(returns.columns) == {"AAPL", "MSFT"}
+
+
 def test_fetch_prices_refetches_cached_ticker_when_cache_does_not_cover_window(monkeypatch, tmp_path):
     cache_path = tmp_path / "prices.parquet"
     _write_price_cache(
@@ -2245,6 +2614,77 @@ def test_fetch_prices_reuses_trusted_partial_history_cache(monkeypatch, tmp_path
     assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 0
 
 
+def test_fetch_prices_keeps_real_partial_cache_when_prefix_refresh_is_empty(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    cached = pd.DataFrame(
+        {"AAPL": [100.0, 110.0, 121.0]},
+        index=pd.to_datetime(["2015-01-31", "2015-02-28", "2026-03-31"]),
+    )
+    _write_price_cache(cache_path, cached)
+    calls = []
+
+    def empty_download(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(da, "_yf_download_close", empty_download)
+
+    returns = da.fetch_prices(
+        ["AAPL"],
+        "2014-01-01",
+        "2026-03-31",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+        use_chart_fallback=False,
+    )
+
+    assert calls == [(("AAPL",), "2014-01-01", "2026-03-31")]
+    assert "AAPL" in returns.columns
+    assert returns["AAPL"].dropna().index.min() == pd.Timestamp("2015-02-28")
+    coverage = da._load_price_coverage(cache_path)
+    latest = coverage.sort_values("attempted_at").iloc[-1]
+    assert latest["status"] == "no_close_retryable"
+
+
+def test_no_close_tail_status_does_not_suppress_missing_prefix_refresh(monkeypatch, tmp_path):
+    cache_path = tmp_path / "prices.parquet"
+    cached = pd.DataFrame(
+        {"AAPL": [100.0, 110.0]},
+        index=pd.to_datetime(["2015-01-31", "2026-03-31"]),
+    )
+    _write_price_cache(cache_path, cached)
+    da._write_price_coverage(
+        cache_path,
+        ["AAPL"],
+        "2026-04-01",
+        "2026-04-30",
+        "no_close_retryable",
+    )
+    calls = []
+
+    def full_download(yf, batch, start, end):
+        calls.append((tuple(batch), start, end))
+        return pd.DataFrame(
+            {"AAPL": [80.0, 100.0, 120.0]},
+            index=pd.to_datetime(["2014-01-31", "2015-01-31", "2026-04-30"]),
+        )
+
+    monkeypatch.setattr(da, "_yf_download_close", full_download)
+
+    da.fetch_prices(
+        ["AAPL"],
+        "2014-01-01",
+        "2026-04-30",
+        batch_size=1,
+        max_retries=0,
+        cache_path=cache_path,
+        use_chart_fallback=False,
+    )
+
+    assert calls == [(("AAPL",), "2014-01-01", "2026-04-30")]
+
+
 def test_fetch_prices_does_not_use_partial_cache_when_full_window_required(monkeypatch, tmp_path):
     cache_path = tmp_path / "prices.parquet"
     partial = pd.DataFrame(
@@ -2306,7 +2746,7 @@ def test_fetch_prices_refetches_stale_partial_history_cache(monkeypatch, tmp_pat
         use_chart_fallback=False,
     )
 
-    assert calls == [(("AAAU",), "2015-01-01", "2026-03-31")]
+    assert calls == [(("AAAU",), "2026-01-01", "2026-03-31")]
     assert returns.attrs["price_diagnostics"]["tickers_from_trusted_partial_cache"] == 0
     assert returns.attrs["price_diagnostics"]["tickers_refetched_due_to_incomplete_cache"] == 1
 
@@ -2358,7 +2798,7 @@ def test_price_cache_audit_flags_false_full_coverage(tmp_path):
     assert row["ticker"] == "AAPL"
     assert row["actual_first_close"] == pd.Timestamp("2025-01-31")
     assert row["actual_spans_requested_window"] == False
-    assert row["coverage_status"] == "fetched"
+    assert row["coverage_status"] == "ok"
     assert row["false_full_coverage"] == True
 
 
@@ -2553,3 +2993,45 @@ def test_interactive_results_writes_self_contained_html(tmp_path):
     assert "splitter" in text
     assert "valid_config" in text
     assert "invested_month_frac" in text
+    assert "13F Parameter Sweep Results — Enhanced" in text
+    assert "holdingsPanel" in text
+    assert "__DATA_PAYLOAD__" not in text
+    assert "__PORTFOLIO_PAYLOAD__" not in text
+    assert "__META_PAYLOAD__" not in text
+
+
+def test_interactive_results_template_embeds_thesis_holdings_and_exits(tmp_path):
+    idx = pd.date_range("2020-01-31", periods=2, freq="ME")
+    config_id = "idea_signal=active_weight"
+    grid = pd.DataFrame([{"config_id": config_id, "idea_signal": "active_weight", "valid_config": True}])
+    returns = {config_id: pd.Series([0.01, 0.02], index=idx)}
+    holdings = pd.DataFrame(
+        [
+            {"rebalance_month": "2020-01-31", "rank": 1, "ticker": "AAPL", "issuer_group": "AAPL", "weight": 0.6, "is_carried": False},
+            {"rebalance_month": "2020-01-31", "rank": 2, "ticker": "MSFT", "issuer_group": "MSFT", "weight": 0.4, "is_carried": False},
+            {"rebalance_month": "2020-02-29", "rank": 1, "ticker": "AAPL", "issuer_group": "AAPL", "weight": 1.0, "is_carried": False},
+        ]
+    )
+    summary = pd.DataFrame(
+        [
+            {"rebalance_month": "2020-01-31", "selected_managers": 5, "effective_names": 2},
+            {"rebalance_month": "2020-02-29", "selected_managers": 4, "effective_names": 1},
+        ]
+    )
+    path = tmp_path / "interactive.html"
+
+    rp.interactive_results(
+        grid,
+        returns,
+        path=str(path),
+        portfolio_holdings=holdings,
+        rebalance_summary=summary,
+        portfolio_config_id=config_id,
+        meta_payload={"configHash": "abc123", "inputSummary": {"manager_count": 5}},
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert '"configId":"idea_signal=active_weight"' in text
+    assert '"ticker":"MSFT"' in text
+    assert '"status":"exit"' in text
+    assert '"configHash":"abc123"' in text

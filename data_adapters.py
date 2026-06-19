@@ -28,7 +28,14 @@ PRICE_ELIGIBLE_SEC_TYPES = {"SH"}
 YFINANCE_TICKER_RE = r"^[A-Z]{1,6}([.\-][A-Z]{1,2})?$"
 OPENFIGI_SELECTOR_VERSION = 2
 OPENFIGI_METADATA_VERSION = 1
-PRICE_COVERAGE_SCHEMA_VERSION = 2
+PRICE_COVERAGE_SCHEMA_VERSION = 3
+OPENFIGI_ATTEMPT_VERSION = 1
+OPENFIGI_RETRY_BACKOFF = pd.Timedelta(days=1)
+PRICE_STATUS_TTLS = {
+    "no_close_retryable": pd.Timedelta(days=7),
+    "no_close_terminal": pd.Timedelta(days=60),
+    "temporary_error": pd.Timedelta(days=1),
+}
 OPENFIGI_US_EQUITY_FILTERS = {
     "currency": "USD",
     "marketSecDes": "Equity",
@@ -276,7 +283,20 @@ def _select_openfigi_ticker(data: list[dict] | None) -> str | None:
     return None if rec is None else _normalise_yfinance_ticker(rec.get("ticker"))
 
 
-def _openfigi_cache_row(cusip: str, ticker: str | None, rec: dict | None = None) -> dict:
+def _utc_now_naive() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC").tz_localize(None)
+
+
+def _openfigi_cache_row(
+    cusip: str,
+    ticker: str | None,
+    rec: dict | None = None,
+    *,
+    status: str | None = None,
+    attempted_at=None,
+    attempt_version: int | None = None,
+    error_type: str | None = None,
+) -> dict:
     ticker_norm = _normalise_yfinance_ticker(ticker)
     fund_like = _is_openfigi_fund_like(ticker_norm, rec)
     row = {
@@ -284,7 +304,11 @@ def _openfigi_cache_row(cusip: str, ticker: str | None, rec: dict | None = None)
         "ticker": ticker_norm,
         "id_type": _openfigi_id_type(cusip),
         "selector_version": OPENFIGI_SELECTOR_VERSION,
+        "status": status or ("mapped" if ticker_norm is not None else "unmapped"),
+        "attempted_at": pd.to_datetime(attempted_at) if pd.notna(attempted_at) else _utc_now_naive(),
+        "attempt_version": OPENFIGI_ATTEMPT_VERSION if attempt_version is None else int(attempt_version),
         "metadata_version": OPENFIGI_METADATA_VERSION if rec else pd.NA,
+        "error_type": error_type,
         "is_fund_like": bool(fund_like),
         "is_common_stock_like": bool(_is_openfigi_common_stock_like(rec, fund_like=fund_like)),
     }
@@ -304,6 +328,7 @@ def _load_openfigi_cache_entries(cache_path: str | Path | None) -> dict[str, dic
         return {}
     entries: dict[str, dict] = {}
     has_selector_version = "selector_version" in df.columns
+    cache_attempted_at = pd.Timestamp(path.stat().st_mtime, unit="s")
     for raw in df.to_dict(orient="records"):
         cusip = str(raw.get("cusip", "")).strip().upper()
         if not cusip:
@@ -318,7 +343,24 @@ def _load_openfigi_cache_entries(cache_path: str | Path | None) -> dict[str, dic
         )
         if ticker is None and not is_current_negative:
             continue
-        row = _openfigi_cache_row(cusip, ticker, None)
+        raw_status = raw.get("status")
+        if pd.isna(raw_status) or not str(raw_status).strip():
+            raw_status = "mapped" if ticker is not None else "unmapped"
+        raw_attempt_version = raw.get("attempt_version")
+        if pd.isna(raw_attempt_version):
+            raw_attempt_version = OPENFIGI_ATTEMPT_VERSION if is_current_negative or ticker is not None else pd.NA
+        raw_attempted_at = raw.get("attempted_at")
+        row = _openfigi_cache_row(
+            cusip,
+            ticker,
+            None,
+            status=str(raw_status),
+            attempted_at=cache_attempted_at if pd.isna(raw_attempted_at) else raw_attempted_at,
+            attempt_version=(
+                OPENFIGI_ATTEMPT_VERSION if pd.isna(raw_attempt_version) else int(raw_attempt_version)
+            ),
+            error_type=None if pd.isna(raw.get("error_type")) else str(raw.get("error_type")),
+        )
         for key, value in raw.items():
             row[key] = value
         row["cusip"] = cusip
@@ -343,7 +385,11 @@ def load_openfigi_metadata(cache_path: str | Path | None) -> pd.DataFrame:
     keep = [
         "cusip",
         "ticker",
+        "status",
+        "attempted_at",
+        "attempt_version",
         "metadata_version",
+        "error_type",
         "is_fund_like",
         "is_common_stock_like",
         *OPENFIGI_METADATA_FIELDS,
@@ -708,9 +754,11 @@ def _fetch_yahoo_chart_batches(
     cache_path: str | Path | None,
     max_workers: int,
     batch_timeout_seconds: int | None = 90,
+    terminal_if_no_close: set[str] | None = None,
 ) -> tuple[list[pd.DataFrame], list[str]]:
     frames: list[pd.DataFrame] = []
     failed_batches: list[str] = []
+    terminal_if_no_close = terminal_if_no_close or set()
     n_batches = int(np.ceil(len(tickers) / batch_size)) if tickers else 0
     print(f"  Yahoo Chart fallback: {len(tickers)} tickers in {n_batches} batches")
     for i in range(0, len(tickers), batch_size):
@@ -736,6 +784,21 @@ def _fetch_yahoo_chart_batches(
         elapsed = time.perf_counter() - t0
         if non_nan_close.empty:
             failed_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
+            status = "temporary_error" if batch_failures else None
+            if status:
+                _write_price_coverage(
+                    cache_path,
+                    batch,
+                    start,
+                    end,
+                    status,
+                    error_type="chart_batch_failure",
+                )
+            else:
+                terminal = sorted(set(batch).intersection(terminal_if_no_close))
+                retryable = sorted(set(batch) - set(terminal))
+                _write_price_coverage(cache_path, terminal, start, end, "no_close_terminal")
+                _write_price_coverage(cache_path, retryable, start, end, "no_close_retryable")
             print(
                 f"      yahoo-chart batch {batch_no}/{n_batches}: "
                 f"0/{len(batch)} close columns in {elapsed:.1f}s"
@@ -743,9 +806,23 @@ def _fetch_yahoo_chart_batches(
         else:
             frames.append(non_nan_close)
             _write_price_cache(cache_path, non_nan_close)
-            _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched", non_nan_close)
+            _write_price_coverage(cache_path, non_nan_close.columns, start, end, "ok", non_nan_close)
             no_close_in_batch = sorted(set(batch) - set(non_nan_close.columns))
-            _write_price_coverage(cache_path, no_close_in_batch, start, end, "no_close")
+            terminal = sorted(set(no_close_in_batch).intersection(terminal_if_no_close))
+            retryable = sorted(set(no_close_in_batch) - set(terminal))
+            missing_status = "temporary_error" if batch_failures else None
+            if missing_status:
+                _write_price_coverage(
+                    cache_path,
+                    no_close_in_batch,
+                    start,
+                    end,
+                    missing_status,
+                    error_type="chart_batch_failure",
+                )
+            else:
+                _write_price_coverage(cache_path, terminal, start, end, "no_close_terminal")
+                _write_price_coverage(cache_path, retryable, start, end, "no_close_retryable")
             print(
                 f"      yahoo-chart batch {batch_no}/{n_batches}: "
                 f"{len(non_nan_close.columns)}/{len(batch)} close columns in {elapsed:.1f}s"
@@ -783,18 +860,23 @@ def _price_coverage_cache_path(cache_path: str | Path | None) -> Path | None:
 def _load_price_coverage(cache_path: str | Path | None) -> pd.DataFrame:
     path = _price_coverage_cache_path(cache_path)
     if path is None or not path.exists():
-        return pd.DataFrame(columns=["ticker", "start", "end", "status"])
+        return pd.DataFrame(columns=["ticker", "start", "end", "status", "attempted_at", "error_type"])
     try:
         cov = pd.read_parquet(path)
     except Exception:
-        return pd.DataFrame(columns=["ticker", "start", "end", "status"])
+        return pd.DataFrame(columns=["ticker", "start", "end", "status", "attempted_at", "error_type"])
     if cov.empty:
-        return pd.DataFrame(columns=["ticker", "start", "end", "status"])
+        return pd.DataFrame(columns=["ticker", "start", "end", "status", "attempted_at", "error_type"])
     cov = cov.copy()
     cov["ticker"] = cov["ticker"].astype(str).str.strip().str.upper()
     cov["start"] = pd.to_datetime(cov["start"])
     cov["end"] = pd.to_datetime(cov["end"])
-    cov["status"] = cov["status"].astype(str)
+    cov["status"] = cov["status"].astype(str).replace({"fetched": "ok", "no_close": "no_close_retryable"})
+    if "attempted_at" not in cov:
+        cov["attempted_at"] = pd.Timestamp(path.stat().st_mtime, unit="s")
+    cov["attempted_at"] = pd.to_datetime(cov["attempted_at"], errors="coerce")
+    if "error_type" not in cov:
+        cov["error_type"] = None
     for col in ("actual_first_close", "actual_last_close"):
         if col not in cov:
             cov[col] = pd.NaT
@@ -806,7 +888,16 @@ def _load_price_coverage(cache_path: str | Path | None) -> pd.DataFrame:
     return cov
 
 
-def _price_coverage_rows(tickers, start: str, end: str, status: str, px: pd.DataFrame | None = None) -> list[dict]:
+def _price_coverage_rows(
+    tickers,
+    start: str,
+    end: str,
+    status: str,
+    px: pd.DataFrame | None = None,
+    *,
+    attempted_at=None,
+    error_type: str | None = None,
+) -> list[dict]:
     clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
     if not clean:
         return []
@@ -831,6 +922,8 @@ def _price_coverage_rows(tickers, start: str, end: str, status: str, px: pd.Data
             "start": pd.Timestamp(start),
             "end": pd.Timestamp(end),
             "status": status,
+            "attempted_at": _utc_now_naive() if attempted_at is None else pd.to_datetime(attempted_at),
+            "error_type": error_type,
             "actual_first_close": actual_first,
             "actual_last_close": actual_last,
             "rows": n_rows,
@@ -846,23 +939,34 @@ def _write_price_coverage(
     end: str,
     status: str,
     px: pd.DataFrame | None = None,
+    *,
+    attempted_at=None,
+    error_type: str | None = None,
 ) -> None:
     path = _price_coverage_cache_path(cache_path)
     if path is None:
         return
-    rows = _price_coverage_rows(tickers, start, end, status, px)
+    rows = _price_coverage_rows(
+        tickers,
+        start,
+        end,
+        status,
+        px,
+        attempted_at=attempted_at,
+        error_type=error_type,
+    )
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     current = _load_price_coverage(cache_path)
     new = pd.DataFrame(rows)
     out = new if current.empty else pd.concat([current, new], ignore_index=True)
-    out = (out.sort_values(["ticker", "start", "end", "status"])
-              .drop_duplicates(["ticker", "start", "end", "status"], keep="last"))
+    out = (out.sort_values(["ticker", "start", "end", "attempted_at"])
+              .drop_duplicates(["ticker", "start", "end"], keep="last"))
     out.to_parquet(path, index=False)
 
 
-def _coverage_covers(cov: pd.DataFrame, tickers, start: str, end: str, statuses=("fetched", "no_close")) -> set[str]:
+def _coverage_covers(cov: pd.DataFrame, tickers, start: str, end: str, statuses=("ok",)) -> set[str]:
     if cov.empty:
         return set()
     clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
@@ -874,6 +978,54 @@ def _coverage_covers(cov: pd.DataFrame, tickers, start: str, end: str, statuses=
         & (cov["end"] >= e)
     ]
     return set(hit["ticker"].tolist())
+
+
+def _active_price_statuses(
+    cov: pd.DataFrame,
+    tickers,
+    start: str,
+    end: str,
+    *,
+    now: pd.Timestamp | None = None,
+) -> dict[str, str]:
+    """Return retry-suppressing cache states whose TTL has not expired."""
+    if cov.empty:
+        return {}
+    clean = sorted({str(t).strip().upper() for t in tickers if pd.notna(t)})
+    now = _utc_now_naive() if now is None else pd.to_datetime(now)
+    candidates = cov[
+        cov["ticker"].isin(clean)
+        & (cov["start"] <= pd.Timestamp(start))
+        & (cov["end"] >= pd.Timestamp(end))
+        & cov["attempted_at"].notna()
+    ].sort_values(["ticker", "attempted_at"])
+    active: dict[str, str] = {}
+    for row in candidates.groupby("ticker", as_index=False).tail(1).itertuples(index=False):
+        if str(row.status) not in PRICE_STATUS_TTLS:
+            continue
+        ttl = PRICE_STATUS_TTLS[str(row.status)]
+        if now - pd.Timestamp(row.attempted_at) < ttl:
+            active[str(row.ticker)] = str(row.status)
+    return active
+
+
+def _cached_series_request_start(series: pd.Series, start: str, end: str) -> pd.Timestamp:
+    """Choose a refresh start without confusing a missing prefix with a stale tail."""
+    requested_start = pd.Timestamp(start)
+    requested_end = pd.Timestamp(end)
+    values = series.dropna().sort_index()
+    if values.empty:
+        return requested_start
+    required_months = pd.date_range(requested_start, requested_end, freq="ME")
+    if len(required_months) == 0:
+        return requested_start
+    monthly = values.resample("ME").last().dropna()
+    if monthly.empty or monthly.index.min() > required_months[0]:
+        # Missing history at the beginning requires a full-prefix request.
+        return requested_start
+    if monthly.index.max() < required_months[-1]:
+        return max(requested_start, values.index.max().normalize() + pd.Timedelta(days=1))
+    return requested_start
 
 
 def _series_spans_requested_window(s: pd.Series, start: str, end: str) -> bool:
@@ -919,7 +1071,7 @@ def _trusted_partial_cache_cols(
     s, e = pd.Timestamp(start), pd.Timestamp(end)
     cov = coverage[
         coverage["ticker"].isin(clean)
-        & coverage["status"].eq("fetched")
+        & coverage["status"].eq("ok")
         & (coverage["start"] <= s)
         & (coverage["end"] >= e)
         & coverage["actual_first_close"].notna()
@@ -948,6 +1100,48 @@ def _trusted_partial_cache_cols(
             and expected_rows == len(series)
             and 0 <= end_lag_days <= max_end_lag_days
             and _series_has_requested_window_data(series, start, end)
+        ):
+            out.add(ticker)
+    return out
+
+
+def _documented_partial_prefix_cols(
+    coverage: pd.DataFrame,
+    cache_px: pd.DataFrame,
+    tickers,
+    start: str,
+    end: str,
+) -> set[str]:
+    """Late-start histories already observed from a full requested window.
+
+    These are usually IPOs. If their tail is stale, refresh only the tail rather
+    than repeatedly asking Yahoo for years before the security existed.
+    """
+    if coverage.empty or cache_px.empty:
+        return set()
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    candidates = coverage[
+        coverage["ticker"].isin(sorted(set(tickers)))
+        & coverage["status"].eq("ok")
+        & (coverage["start"] <= s)
+        & (coverage["end"] >= e)
+        & coverage["actual_first_close"].notna()
+        & (coverage["coverage_schema_version"].fillna(1).astype(int) >= PRICE_COVERAGE_SCHEMA_VERSION)
+    ]
+    first_required = pd.date_range(s, e, freq="ME")
+    if len(first_required) == 0:
+        return set()
+    out: set[str] = set()
+    for row in candidates.sort_values(["ticker", "attempted_at"]).itertuples(index=False):
+        ticker = str(row.ticker).strip().upper()
+        if ticker not in cache_px:
+            continue
+        series = cache_px[ticker].dropna()
+        if series.empty:
+            continue
+        if (
+            pd.Timestamp(row.actual_first_close) > first_required[0]
+            and abs((series.index.min() - pd.Timestamp(row.actual_first_close)).total_seconds()) <= 86400
         ):
             out.add(ticker)
     return out
@@ -1040,7 +1234,7 @@ def audit_price_cache_coverage(
             & (c["end"] >= pd.Timestamp(end))
         ] if not c.empty else pd.DataFrame()
         status = ",".join(sorted(covering["status"].dropna().astype(str).unique())) if not covering.empty else ""
-        false_full_coverage = bool(("fetched" in status.split(",")) and not spans)
+        false_full_coverage = bool(("ok" in status.split(",")) and not spans)
         rows.append({
             "ticker": ticker,
             "requested_start": pd.Timestamp(start),
@@ -1073,11 +1267,13 @@ def _write_price_cache(cache_path: str | Path | None, px: pd.DataFrame) -> None:
     px.index = pd.to_datetime(px.index)
     px.columns = [str(c).strip().upper() for c in px.columns]
     if not current.empty:
-        # New downloads must replace stale shorter histories for the same
-        # ticker. Keeping the old duplicate column silently corrupts later
-        # cache reads, most visibly for the benchmark series.
-        current = current.drop(columns=[c for c in px.columns if c in current.columns], errors="ignore")
-        merged = pd.concat([current, px], axis=1)
+        # Merge per ticker so incremental refreshes retain older history while
+        # newly downloaded values replace any overlapping stale observations.
+        merged = current.reindex(current.index.union(px.index))
+        for ticker in px.columns:
+            fresh = px[ticker].reindex(merged.index)
+            prior = merged[ticker] if ticker in merged else pd.Series(index=merged.index, dtype=float)
+            merged[ticker] = fresh.combine_first(prior)
     else:
         merged = px
     merged = merged.loc[:, ~merged.columns.duplicated()].sort_index()
@@ -1144,6 +1340,8 @@ def cusip_to_ticker(
     *,
     cache_path: str | Path | None = None,
     require_metadata: bool = False,
+    force_refresh: bool = False,
+    retry_backoff: pd.Timedelta = OPENFIGI_RETRY_BACKOFF,
 ) -> dict[str, str]:
     ## FRICTION: this is THE assembly bottleneck. Cache the map to disk and only
     ##           query new CUSIPs. ~25 req/min without a (free) OpenFIGI key.
@@ -1156,19 +1354,43 @@ def cusip_to_ticker(
     cached = {c: cache[c].get("ticker") for c in uniq if c in cache}
     mp: dict[str, str] = {c: t for c, t in cached.items() if t is not None}
     todo = []
+    deferred_errors = []
+    now = _utc_now_naive()
     for c in uniq:
+        if force_refresh:
+            todo.append(c)
+            continue
         if c not in cache:
             todo.append(c)
             continue
-        if require_metadata:
-            metadata_version = cache[c].get("metadata_version")
-            if pd.isna(metadata_version) or int(metadata_version) < OPENFIGI_METADATA_VERSION:
-                todo.append(c)
+        row = cache[c]
+        status = str(row.get("status") or ("mapped" if row.get("ticker") else "unmapped"))
+        attempt_version = row.get("attempt_version")
+        current_attempt = pd.notna(attempt_version) and int(attempt_version) >= OPENFIGI_ATTEMPT_VERSION
+        if status in {"mapped", "unmapped"} and current_attempt:
+            continue
+        if status == "error_retryable" and current_attempt:
+            attempted_at = pd.to_datetime(row.get("attempted_at"), errors="coerce")
+            if pd.notna(attempted_at) and now - attempted_at < retry_backoff:
+                deferred_errors.append(c)
+                continue
+        todo.append(c)
     if cache_path is not None:
         print(f"  OpenFIGI cache: {len(cached)}/{len(uniq)} CUSIPs found at {cache_path}")
         if require_metadata:
-            missing_meta = len([c for c in uniq if c in cache and c in todo])
-            print(f"  OpenFIGI metadata refresh: {missing_meta} cached CUSIPs missing current metadata")
+            missing_meta = len(
+                [
+                    c for c in uniq
+                    if c in cache
+                    and cache[c].get("status") == "mapped"
+                    and pd.isna(cache[c].get("metadata_version"))
+                ]
+            )
+            if missing_meta:
+                print(
+                    "  [warn] OpenFIGI cache: "
+                    f"{missing_meta} mapped CUSIPs lack metadata; use force_refresh=True to refresh"
+                )
     n_batches = int(np.ceil(len(todo) / 100)) if todo else 0
     todo_label = "CUSIPs needing mapping/metadata" if require_metadata else "uncached CUSIPs"
     print(f"  OpenFIGI mapping: {len(todo)} {todo_label} in {n_batches} batches")
@@ -1180,11 +1402,29 @@ def cusip_to_ticker(
             {"idType": _openfigi_id_type(c), "idValue": c, **OPENFIGI_US_EQUITY_FILTERS}
             for c in batch_cusips
         ]
-        r = requests.post(url, json=batch, headers=hdr, timeout=30)
-        if r.status_code == 429:
-            print("    [warn] OpenFIGI rate limited; sleeping 6s then retrying batch")
-            time.sleep(6); r = requests.post(url, json=batch, headers=hdr, timeout=30)
-        r.raise_for_status()
+        try:
+            r = requests.post(url, json=batch, headers=hdr, timeout=30)
+            if r.status_code == 429:
+                print("    [warn] OpenFIGI rate limited; sleeping 6s then retrying batch")
+                time.sleep(6)
+                r = requests.post(url, json=batch, headers=hdr, timeout=30)
+            r.raise_for_status()
+        except Exception as exc:
+            attempted_at = _utc_now_naive()
+            for c in batch_cusips:
+                prior = cache.get(c, {})
+                if prior.get("ticker") is not None:
+                    continue
+                cache[c] = _openfigi_cache_row(
+                    c,
+                    None,
+                    None,
+                    status="error_retryable",
+                    attempted_at=attempted_at,
+                    error_type=type(exc).__name__,
+                )
+            _write_openfigi_cache(cache_path, cache)
+            raise
         batch_mapped = 0
         batch_rejected = 0
         for c, res in zip(batch_cusips, r.json()):
@@ -1193,15 +1433,27 @@ def cusip_to_ticker(
             ticker = None if rec is None else _normalise_yfinance_ticker(rec.get("ticker"))
             if ticker is not None and rec is not None:
                 mp[c] = ticker
-                cache[c] = _openfigi_cache_row(c, ticker, rec)
+                cache[c] = _openfigi_cache_row(c, ticker, rec, status="mapped")
                 batch_mapped += 1
             elif data:
                 if c not in cache or cache[c].get("ticker") is None:
-                    cache[c] = _openfigi_cache_row(c, None, None)
+                    cache[c] = _openfigi_cache_row(
+                        c,
+                        None,
+                        None,
+                        status="unmapped",
+                        error_type="rejected_non_yahoo_us",
+                    )
                 batch_rejected += 1
             else:
                 if c not in cache or cache[c].get("ticker") is None:
-                    cache[c] = _openfigi_cache_row(c, None, None)
+                    cache[c] = _openfigi_cache_row(
+                        c,
+                        None,
+                        None,
+                        status="unmapped",
+                        error_type="no_data",
+                    )
         print(
             f"    OpenFIGI batch {batch_no}/{n_batches}: "
             f"mapped {batch_mapped}/{len(batch_cusips)}, rejected_non_yahoo_us {batch_rejected}"
@@ -1209,6 +1461,13 @@ def cusip_to_ticker(
         _write_openfigi_cache(cache_path, cache)
         time.sleep(2.5 if not api_key else 0.3)
     _write_openfigi_cache(cache_path, cache)
+    if deferred_errors:
+        sample = ", ".join(deferred_errors[:10])
+        raise RuntimeError(
+            "OpenFIGI retryable errors are still inside the retry backoff for "
+            f"{len(deferred_errors)} CUSIPs; sample: {sample}. "
+            "Use force_refresh=True to retry immediately."
+        )
     print(f"  OpenFIGI mapping complete: {len(mp)}/{len(uniq)} CUSIPs mapped")
     return mp
 
@@ -1517,29 +1776,52 @@ def fetch_prices(
 
     cache_px = _load_price_cache(cache_path, start, end)
     coverage = _load_price_coverage(cache_path)
-    coverage_fetched = _coverage_covers(coverage, clean, start, end, statuses=("fetched",))
-    # Treat cached no_close rows as diagnostics only. Free Yahoo endpoints can
-    # omit individual tickers during partial/rate-limited responses, so this is
-    # not strong enough evidence to skip future download attempts.
-    coverage_no_close: set[str] = set()
+    coverage_fetched = _coverage_covers(coverage, clean, start, end, statuses=("ok",))
+    active_statuses = _active_price_statuses(coverage, clean, start, end)
+    coverage_no_close = set(active_statuses)
     cache_symbol_cols = sorted(set(clean).intersection(cache_px.columns)) if not cache_px.empty else []
     trusted_partial_cols = (
         set()
         if require_full_window
         else _trusted_partial_cache_cols(coverage, cache_px, cache_symbol_cols, start, end)
     )
-    cached_cols = sorted(
+    documented_partial_prefix_cols = _documented_partial_prefix_cols(
+        coverage,
+        cache_px,
+        cache_symbol_cols,
+        start,
+        end,
+    )
+    valid_cached_cols = sorted(
         t for t in cache_symbol_cols
         if _series_spans_requested_window(cache_px[t], start, end) or t in trusted_partial_cols
     )
-    stale_cached_cols = sorted(set(cache_symbol_cols) - set(cached_cols))
+    all_stale_cached_cols = sorted(set(cache_symbol_cols) - set(valid_cached_cols))
+    deferred_stale_cols = sorted(set(all_stale_cached_cols).intersection(coverage_no_close))
+    cached_cols = sorted(set(valid_cached_cols).union(deferred_stale_cols))
+    stale_cached_cols = sorted(set(all_stale_cached_cols) - set(deferred_stale_cols))
     false_coverage_cols = sorted(set(stale_cached_cols).intersection(coverage_fetched))
     frames: list[pd.DataFrame] = []
+    fresh_downloaded_cols: set[str] = set()
+
+    def add_fresh_frames(new_frames: list[pd.DataFrame]) -> None:
+        frames.extend(new_frames)
+        for fresh_frame in new_frames:
+            fresh_downloaded_cols.update(map(str, fresh_frame.columns))
+
     if cached_cols:
         cached_px = cache_px[cached_cols].dropna(axis=1, how="all")
         if not cached_px.empty:
             frames.append(cached_px)
         print(f"  yfinance cache: {len(cached_cols)}/{len(clean)} coverage-valid tickers found at {cache_path}")
+    if stale_cached_cols and not require_full_window:
+        stale_fallback = cache_px[stale_cached_cols].dropna(axis=1, how="all")
+        if not stale_fallback.empty:
+            frames.append(stale_fallback)
+            print(
+                "  price cache: retaining "
+                f"{len(stale_fallback.columns)} real partial histories while attempting refresh"
+            )
     if trusted_partial_cols:
         sample = ", ".join(sorted(trusted_partial_cols)[:20])
         print(
@@ -1561,9 +1843,62 @@ def fetch_prices(
         )
     if coverage_no_close:
         sample = ", ".join(sorted(coverage_no_close)[:20])
-        print(f"  yfinance cache: {len(coverage_no_close)} tickers previously fetched with no close data; sample: {sample}")
+        print(
+            "  price cache: "
+            f"deferring {len(coverage_no_close)} tickers inside retry TTL; sample: {sample}"
+        )
 
     todo = sorted(set(clean) - set(cached_cols) - set(coverage_no_close))
+    request_start_by_ticker = {ticker: str(pd.Timestamp(start).date()) for ticker in todo}
+    for ticker in stale_cached_cols:
+        series = cache_px[ticker].dropna()
+        if series.empty:
+            continue
+        request_start = (
+            max(pd.Timestamp(start), series.index.max().normalize() + pd.Timedelta(days=1))
+            if ticker in documented_partial_prefix_cols
+            else _cached_series_request_start(series, start, end)
+        )
+        if request_start > pd.Timestamp(end):
+            request_start = pd.Timestamp(start)
+        request_start_by_ticker[ticker] = str(request_start.date())
+
+    stale_by_start: dict[str, list[str]] = {}
+    for ticker in stale_cached_cols:
+        stale_by_start.setdefault(request_start_by_ticker[ticker], []).append(ticker)
+    for request_start, request_tickers in stale_by_start.items():
+        _write_price_coverage(cache_path, request_tickers, request_start, end, "stale")
+
+    terminal_no_close_tickers = {
+        ticker
+        for ticker in stale_cached_cols
+        if pd.Timestamp(request_start_by_ticker[ticker]) > pd.Timestamp(start)
+    }
+
+    def grouped_requests(selected) -> list[tuple[str, list[str]]]:
+        groups: dict[str, list[str]] = {}
+        for ticker in sorted(set(selected)):
+            groups.setdefault(request_start_by_ticker[ticker], []).append(ticker)
+        return sorted(groups.items())
+
+    def fetch_chart_grouped(selected) -> tuple[list[pd.DataFrame], list[str]]:
+        chart_frames: list[pd.DataFrame] = []
+        chart_failures: list[str] = []
+        for request_start, request_tickers in grouped_requests(selected):
+            group_frames, group_failures = _fetch_yahoo_chart_batches(
+                request_tickers,
+                request_start,
+                end,
+                batch_size=batch_size,
+                cache_path=cache_path,
+                max_workers=chart_fallback_workers,
+                batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
+                terminal_if_no_close=terminal_no_close_tickers,
+            )
+            chart_frames.extend(group_frames)
+            chart_failures.extend(group_failures)
+        return chart_frames, chart_failures
+
     failed_batches: list[str] = []
     empty_batches: list[str] = []
     empty_batch_tickers: list[list[str]] = []
@@ -1572,40 +1907,43 @@ def fetch_prices(
     partial_history_patch_failures: list[str] = []
     used_chart_fallback = False
     consecutive_empty = 0
-    n_batches = int(np.ceil(len(todo) / batch_size)) if todo else 0
+    n_batches = sum(
+        int(np.ceil(len(request_tickers) / batch_size))
+        for _, request_tickers in grouped_requests(todo)
+    )
     print(f"  price download: {len(todo)} uncached / {len(clean)} requested tickers in {n_batches} batches")
     if todo and price_source == "chart":
-        chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
-            todo,
-            start,
-            end,
-            batch_size=batch_size,
-            cache_path=cache_path,
-            max_workers=chart_fallback_workers,
-            batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
-        )
-        frames.extend(chart_frames)
+        chart_frames, chart_failed_batches = fetch_chart_grouped(todo)
+        add_fresh_frames(chart_frames)
         used_chart_fallback = True
         todo = []
+    request_batches = [
+        (request_start, request_tickers[i:i + batch_size])
+        for request_start, request_tickers in grouped_requests(todo)
+        for i in range(0, len(request_tickers), batch_size)
+    ]
     stop_yfinance_loop = False
-    for i in range(0, len(todo), batch_size):
-        batch = todo[i:i + batch_size]
-        batch_no = i // batch_size + 1
-        print(f"    yfinance batch {batch_no}/{n_batches}: {batch[0]}..{batch[-1]}")
+    for batch_index, (batch_start, batch) in enumerate(request_batches):
+        batch_no = batch_index + 1
+        print(f"    yfinance batch {batch_no}/{len(request_batches)}: {batch[0]}..{batch[-1]}")
         for attempt in range(max_retries + 1):
             try:
-                close = _yf_download_close_guarded(yf, batch, start, end, yfinance_batch_timeout_seconds)
+                close = _yf_download_close_guarded(yf, batch, batch_start, end, yfinance_batch_timeout_seconds)
                 if not close.empty:
                     non_nan_close = close.dropna(axis=1, how="all")
                     if non_nan_close.empty:
                         empty_batches.append(f"{batch[0]}..{batch[-1]}: all_nan_close")
                         empty_batch_tickers.append(batch)
+                        terminal = sorted(set(batch).intersection(terminal_no_close_tickers))
+                        retryable = sorted(set(batch) - set(terminal))
+                        _write_price_coverage(cache_path, terminal, batch_start, end, "no_close_terminal")
+                        _write_price_coverage(cache_path, retryable, batch_start, end, "no_close_retryable")
                         consecutive_empty += 1
                     else:
                         if use_chart_fallback:
                             patched_close, improved, patch_failures = _patch_partial_close_with_chart(
                                 non_nan_close,
-                                start,
+                                batch_start,
                                 end,
                                 max_workers=chart_fallback_workers,
                                 timeout_seconds=chart_fallback_batch_timeout_seconds,
@@ -1622,10 +1960,14 @@ def fetch_prices(
                             if patch_failures:
                                 partial_history_patch_failures.extend(patch_failures[:5])
                         frames.append(non_nan_close)
+                        fresh_downloaded_cols.update(map(str, non_nan_close.columns))
                         _write_price_cache(cache_path, non_nan_close)
-                        _write_price_coverage(cache_path, non_nan_close.columns, start, end, "fetched", non_nan_close)
+                        _write_price_coverage(cache_path, non_nan_close.columns, batch_start, end, "ok", non_nan_close)
                         no_close_in_batch = sorted(set(batch) - set(non_nan_close.columns))
-                        _write_price_coverage(cache_path, no_close_in_batch, start, end, "no_close")
+                        terminal = sorted(set(no_close_in_batch).intersection(terminal_no_close_tickers))
+                        retryable = sorted(set(no_close_in_batch) - set(terminal))
+                        _write_price_coverage(cache_path, terminal, batch_start, end, "no_close_terminal")
+                        _write_price_coverage(cache_path, retryable, batch_start, end, "no_close_retryable")
                         consecutive_empty = 0
                     break
                 last_attempt = attempt >= max_retries
@@ -1639,28 +1981,32 @@ def fetch_prices(
                     continue
                 empty_batches.append(f"{batch[0]}..{batch[-1]}: empty_close")
                 empty_batch_tickers.append(batch)
+                terminal = sorted(set(batch).intersection(terminal_no_close_tickers))
+                retryable = sorted(set(batch) - set(terminal))
+                _write_price_coverage(cache_path, terminal, batch_start, end, "no_close_terminal")
+                _write_price_coverage(cache_path, retryable, batch_start, end, "no_close_retryable")
                 consecutive_empty += 1
                 if price_source == "auto" and use_chart_fallback:
-                    remaining = todo[i + batch_size:]
+                    remaining = [t for _, pending in request_batches[batch_index + 1:] for t in pending]
                     fallback_tickers = sorted(set(batch).union(remaining))
                     print(
                         "    [warn] yfinance returned empty Close frame. "
                         f"Switching immediately to Yahoo Chart API fallback for {len(fallback_tickers)} tickers"
                     )
-                    chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
-                        fallback_tickers,
-                        start,
-                        end,
-                        batch_size=batch_size,
-                        cache_path=cache_path,
-                        max_workers=chart_fallback_workers,
-                        batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
-                    )
-                    frames.extend(chart_frames)
+                    chart_frames, chart_failed_batches = fetch_chart_grouped(fallback_tickers)
+                    add_fresh_frames(chart_frames)
                     used_chart_fallback = True
                     stop_yfinance_loop = True
                 break
             except TimeoutError as exc:
+                _write_price_coverage(
+                    cache_path,
+                    batch,
+                    batch_start,
+                    end,
+                    "temporary_error",
+                    error_type=type(exc).__name__,
+                )
                 failed_batches.append(f"{batch[0]}..{batch[-1]}: {exc}")
                 print(f"    [warn] {exc}")
                 if not use_chart_fallback:
@@ -1668,7 +2014,7 @@ def fetch_prices(
                         f"Stopping yfinance download after timed-out batch; "
                         f"recent failed batches: {failed_batches[-3:]}"
                     ) from exc
-                remaining = todo[i + batch_size:]
+                remaining = [t for _, pending in request_batches[batch_index + 1:] for t in pending]
                 fallback_tickers = sorted(set(batch).union(remaining))
                 chart_probe = _yahoo_chart_probe(start, end, chart_fallback_batch_timeout_seconds)
                 if "chart_probe_ok=" not in chart_probe:
@@ -1681,16 +2027,8 @@ def fetch_prices(
                     "    [warn] yfinance batch timed out. "
                     f"Switching to Yahoo Chart API fallback for {len(fallback_tickers)} tickers; {chart_probe}"
                 )
-                chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
-                    fallback_tickers,
-                    start,
-                    end,
-                    batch_size=batch_size,
-                    cache_path=cache_path,
-                    max_workers=chart_fallback_workers,
-                    batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
-                )
-                frames.extend(chart_frames)
+                chart_frames, chart_failed_batches = fetch_chart_grouped(fallback_tickers)
+                add_fresh_frames(chart_frames)
                 used_chart_fallback = True
                 stop_yfinance_loop = True
                 break
@@ -1705,6 +2043,14 @@ def fetch_prices(
                     time.sleep(wait)
                     continue
                 failed_batches.append(f"{batch[0]}..{batch[-1]}: {exc}")
+                _write_price_coverage(
+                    cache_path,
+                    batch,
+                    batch_start,
+                    end,
+                    "temporary_error",
+                    error_type=type(exc).__name__,
+                )
                 print(f"    [warn] yfinance batch failed: {batch[0]}..{batch[-1]}: {exc}")
                 break
         if stop_yfinance_loop:
@@ -1727,22 +2073,14 @@ def fetch_prices(
                         f"recent empty batches: {empty_batches[-max_consecutive_empty_batches:]}"
                     )
                 prior_empty = [t for batch_tickers in empty_batch_tickers for t in batch_tickers]
-                remaining = todo[i + batch_size:]
+                remaining = [t for _, pending in request_batches[batch_index + 1:] for t in pending]
                 fallback_tickers = sorted(set(prior_empty).union(remaining))
                 print(
                     "    [warn] yfinance returned consecutive empty batches and probe failed; "
                     f"{probe}. Switching to Yahoo Chart API fallback; {chart_probe}"
                 )
-                chart_frames, chart_failed_batches = _fetch_yahoo_chart_batches(
-                    fallback_tickers,
-                    start,
-                    end,
-                    batch_size=batch_size,
-                    cache_path=cache_path,
-                    max_workers=chart_fallback_workers,
-                    batch_timeout_seconds=chart_fallback_batch_timeout_seconds,
-                )
-                frames.extend(chart_frames)
+                chart_frames, chart_failed_batches = fetch_chart_grouped(fallback_tickers)
+                add_fresh_frames(chart_frames)
                 used_chart_fallback = True
                 break
             print(
@@ -1762,8 +2100,30 @@ def fetch_prices(
         detail_parts.append(probe)
         raise RuntimeError("No price data downloaded from yfinance or fallback; " + "; ".join(detail_parts))
 
-    px = pd.concat(frames, axis=1)
-    px = px.loc[:, ~px.columns.duplicated()].sort_index()
+    px = pd.DataFrame()
+    for frame in frames:
+        frame = frame.copy()
+        frame.index = pd.to_datetime(frame.index)
+        if px.empty and len(px.index) == 0:
+            px = frame.copy()
+            continue
+        merged_index = px.index.union(frame.index)
+        px = px.reindex(merged_index)
+        for ticker in frame.columns:
+            fresh = frame[ticker].reindex(merged_index)
+            prior = px[ticker] if ticker in px else pd.Series(index=merged_index, dtype=float)
+            px[ticker] = fresh.combine_first(prior)
+    px = px.sort_index()
+    downloaded_cols = sorted(fresh_downloaded_cols - set(cached_cols))
+    if cache_path is not None and downloaded_cols:
+        full_cache = _load_price_cache(cache_path, start, end)
+        available = sorted(set(downloaded_cols).intersection(full_cache.columns))
+        if available:
+            _write_price_coverage(cache_path, available, start, end, "ok", full_cache[available])
+            merged_index = px.index.union(full_cache.index)
+            px = px.reindex(merged_index)
+            for ticker in available:
+                px[ticker] = full_cache[ticker].reindex(merged_index)
     missing_cols = sorted(set(clean) - set(px.columns))
     all_nan_cols = sorted(px.columns[px.isna().all()].tolist())
     no_price = sorted(set(missing_cols).union(all_nan_cols))
@@ -1774,6 +2134,12 @@ def fetch_prices(
     if px.empty:
         raise RuntimeError("All downloaded yfinance price columns were empty.")
 
+    try:
+        px.index = pd.DatetimeIndex(pd.to_datetime(px.index, errors="raise"))
+    except Exception as exc:
+        sample = [str(x) for x in px.index[:5]]
+        raise RuntimeError(f"price frame index is not datetime-compatible; sample={sample}") from exc
+    px = px[~px.index.duplicated(keep="last")].sort_index()
     monthly = px.resample("ME").last()
     returns = monthly.pct_change(fill_method=None).iloc[1:]
     # Keep partial-history tickers. Dropping any column with a single NaN creates

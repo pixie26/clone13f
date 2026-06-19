@@ -1,0 +1,695 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>13F Sweep Dashboard — Enhanced</title>
+  <style>
+    :root {
+      --ink:#15171d; --muted:#606572; --subtle:#8a909c; --line:#d9dde5; --soft-line:#edf0f5;
+      --bg:#f6f7fa; --panel:#ffffff; --panel-2:#fbfcfe; --accent:#0b6e4f; --accent-soft:#e7f3ee;
+      --bench:#7b8494; --bad:#b0413e; --warn:#a66600; --blue:#2f5f9f; --purple:#6f4ca0;
+      --left-panel-width:440px; --radius:10px; --shadow:0 1px 2px rgba(20,25,35,.06),0 8px 24px rgba(20,25,35,.04);
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Segoe UI, Arial, "Microsoft YaHei", sans-serif; color:var(--ink); background:var(--bg); }
+    header { padding:16px 20px 12px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:20; }
+    h1 { margin:0 0 5px; font-size:19px; line-height:1.25; font-weight:700; }
+    .sub { color:var(--muted); font-size:12.5px; display:flex; gap:12px; flex-wrap:wrap; }
+    main { display:grid; grid-template-columns:minmax(320px,var(--left-panel-width)) 9px minmax(720px,1fr); gap:9px; padding:12px 14px 18px; align-items:start; min-height:calc(100vh - 66px); }
+    aside, section, .card { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); }
+    aside { padding:12px; max-height:calc(100vh - 92px); overflow:auto; min-width:0; }
+    section { padding:12px; min-width:0; }
+    #splitter { align-self:stretch; min-height:calc(100vh - 92px); border-radius:10px; cursor:col-resize; background:linear-gradient(to right,transparent 0 2px,var(--line) 2px 7px,transparent 7px 9px); opacity:.9; touch-action:none; }
+    #splitter:hover, body.dragging-splitter #splitter { background:linear-gradient(to right,transparent 0 2px,var(--accent) 2px 7px,transparent 7px 9px); opacity:1; }
+    body.dragging-splitter { cursor:col-resize; user-select:none; }
+    .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+    .toolbar input[type="search"] { flex:1 1 180px; }
+    input, select, button { font-family:inherit; font-size:12px; }
+    input[type="search"], select { width:100%; padding:7px 8px; border:1px solid var(--line); border-radius:7px; background:#fff; color:var(--ink); outline:none; }
+    input[type="search"]:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+    button { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:7px; padding:7px 9px; cursor:pointer; }
+    button:hover { border-color:var(--accent); background:var(--accent-soft); }
+    .filters { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:10px; }
+    label { display:grid; gap:4px; font-size:11.5px; color:var(--muted); }
+    .small { color:var(--muted); font-size:11.5px; line-height:1.45; }
+    .table-wrap { overflow:auto; border:1px solid var(--soft-line); border-radius:8px; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    #results { min-width:1050px; }
+    th, td { padding:7px 6px; border-bottom:1px solid var(--soft-line); text-align:right; white-space:nowrap; vertical-align:middle; }
+    th { position:sticky; top:0; background:var(--panel); color:var(--muted); font-weight:650; cursor:pointer; z-index:3; }
+    td:first-child, th:first-child { text-align:left; }
+    tbody tr { cursor:pointer; }
+    tbody tr:hover { background:#f7fbf9; }
+    tr.active { background:var(--accent-soft); }
+    tr.invalid { color:#88413a; background:#fff8f6; }
+    .pill { display:inline-flex; align-items:center; gap:4px; border:1px solid var(--line); border-radius:999px; padding:2px 7px; font-size:11px; line-height:1.4; background:#fff; color:var(--muted); }
+    .pill.good { background:var(--accent-soft); color:var(--accent); border-color:#b7d9cb; }
+    .pill.bad { background:#fff1ef; color:#a23b35; border-color:#f0c6c0; }
+    .pill.warn { background:#fff8e8; color:#8a5a00; border-color:#ecd090; }
+    .pill.blue { background:#edf4ff; color:#2f5f9f; border-color:#bfd1ed; }
+    .pill.purple { background:#f3effa; color:#6f4ca0; border-color:#d6c6ef; }
+    .top-layout { display:grid; grid-template-columns:1fr; gap:10px; }
+    .summary { display:grid; grid-template-columns:repeat(7,minmax(104px,1fr)); gap:8px; margin-bottom:10px; }
+    .metric { border:1px solid var(--soft-line); border-radius:9px; padding:9px; background:var(--panel-2); min-width:0; }
+    .metric span { display:block; color:var(--muted); font-size:11.5px; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .metric strong { font-size:17px; font-weight:700; }
+    .chart-grid { display:grid; grid-template-columns:minmax(520px,1fr) 310px; gap:10px; align-items:stretch; }
+    .chart-wrap { border:1px solid var(--soft-line); border-radius:9px; padding:9px; position:relative; min-width:0; background:#fff; }
+    svg { width:100%; height:430px; display:block; }
+    .legend { display:flex; gap:14px; font-size:11.5px; color:var(--muted); margin:7px 0 0; flex-wrap:wrap; }
+    .key { display:inline-flex; align-items:center; gap:6px; } .swatch { width:18px; height:3px; display:inline-block; }
+    .tooltip { position:absolute; pointer-events:none; background:rgba(255,255,255,.96); border:1px solid var(--line); box-shadow:var(--shadow); border-radius:8px; padding:8px; min-width:245px; max-width:330px; font-size:12px; z-index:10; display:none; }
+    .tooltip .title { font-weight:700; margin-bottom:5px; }
+    .tooltip .grid { display:grid; grid-template-columns:1fr auto; gap:4px 12px; color:var(--muted); }
+    .side-card { border:1px solid var(--soft-line); border-radius:9px; padding:10px; background:var(--panel-2); min-width:0; }
+    .month-title { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:8px; }
+    .month-title h2 { margin:0; font-size:15px; }
+    .month-title .small { text-align:right; }
+    .status-grid { display:grid; grid-template-columns:1fr 1fr; gap:7px; margin:8px 0; }
+    .status-box { border:1px solid var(--soft-line); background:#fff; border-radius:8px; padding:7px; }
+    .status-box span { display:block; color:var(--muted); font-size:11px; }
+    .status-box strong { font-size:16px; }
+    .bars { display:grid; gap:5px; margin-top:8px; }
+    .bar-row { display:grid; grid-template-columns:44px 1fr 48px; gap:7px; align-items:center; font-size:11.5px; }
+    .bar-track { height:8px; background:#edf0f5; border-radius:999px; overflow:hidden; }
+    .bar-fill { height:100%; background:var(--accent); border-radius:999px; }
+    .tabs { display:flex; gap:6px; flex-wrap:wrap; border-bottom:1px solid var(--soft-line); margin:12px 0 10px; padding-bottom:8px; }
+    .tab { padding:7px 10px; border-radius:999px; border:1px solid var(--line); background:#fff; cursor:pointer; font-size:12px; color:var(--muted); }
+    .tab.active { color:var(--accent); background:var(--accent-soft); border-color:#b7d9cb; font-weight:650; }
+    .panel { display:none; } .panel.active { display:block; }
+    .holdings-toolbar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; align-items:center; }
+    .holdings-toolbar input { min-width:170px; flex:1; }
+    #holdingsTable { min-width:850px; }
+    #holdingsTable tr.exit-row { color:#9a3d35; background:#fff8f6; }
+    #holdingsTable tr.carry-row { background:#fbf9ff; }
+    #holdingsTable tr.new-row { background:#f7fbf9; }
+    .delta-pos { color:var(--accent); font-weight:650; } .delta-neg { color:var(--bad); font-weight:650; }
+    .mono { font-family:Consolas, Menlo, monospace; }
+    .diag-grid { display:grid; grid-template-columns:repeat(2,minmax(250px,1fr)); gap:10px; }
+    .changes-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+    .changes-grid .diag-card { padding:8px; }
+    .diag-card { border:1px solid var(--soft-line); border-radius:9px; padding:10px; background:var(--panel-2); min-width:0; }
+    .diag-card h3 { margin:0 0 8px; font-size:13px; }
+    .mini-table-wrap { overflow:auto; border:1px solid var(--soft-line); border-radius:8px; background:#fff; }
+    .mini-table { min-width:620px; font-size:11.5px; }
+    .mini-table th, .mini-table td { padding:6px 6px; }
+    .mini-table .issuer-cell { max-width:180px; overflow:hidden; text-overflow:ellipsis; }
+    .simple-bar-wrap { border:1px solid var(--soft-line); border-radius:8px; background:#fff; padding:8px; min-height:238px; overflow:hidden; }
+    .simple-bar-list { display:grid; gap:5px; }
+    .simple-bar-row { display:grid; grid-template-columns:58px minmax(0,1fr) 62px; gap:8px; align-items:center; font-size:11.5px; line-height:1.2; }
+    .simple-bar-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650; color:var(--ink); }
+    .simple-bar-track { height:7px; background:#edf0f5; border-radius:999px; overflow:hidden; }
+    .simple-bar-fill { height:100%; background:var(--accent); border-radius:999px; min-width:2px; }
+    .simple-bar-fill.neg { background:var(--bad); }
+    .simple-bar-value { text-align:right; color:var(--muted); font-variant-numeric:tabular-nums; }
+    .changes-grid .simple-bar-wrap { min-height:238px; padding:7px; }
+    .changes-grid .simple-bar-list { gap:5px; }
+    .changes-grid .simple-bar-row { grid-template-columns:44px minmax(0,1fr) 54px; gap:5px; font-size:11px; }
+    .changes-grid .diag-card h3 { font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .kv { display:grid; grid-template-columns:minmax(130px,1fr) 1.5fr; gap:5px 12px; font-size:12px; }
+    .kv div:nth-child(odd) { color:var(--muted); }
+    .notice { padding:9px 10px; border:1px solid #ef9a9a; background:#fff1f0; color:#9f1d1d; border-radius:8px; font-size:12px; margin-bottom:8px; display:none; font-weight:650; }
+    .notice.ok { border-color:#b7d9cb; background:var(--accent-soft); color:var(--accent); font-weight:500; }
+    .empty { color:var(--muted); padding:16px; text-align:center; }
+    @media (max-width:980px) { main { grid-template-columns:1fr; } #splitter { display:none; } aside { max-height:none; } .chart-grid { grid-template-columns:1fr; } .summary { grid-template-columns:repeat(2,1fr); } .diag-grid { grid-template-columns:1fr; } .changes-grid { grid-template-columns:repeat(4,minmax(0,1fr)); overflow-x:visible; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>13F Parameter Sweep Results — Enhanced</h1>
+    <div class="sub">
+      <span>左侧参数 sweep，可拖拽分栏。</span>
+      <span>右侧曲线 hover/click 某个月，查看当期持仓和状态。</span>
+      <span id="metaLine"></span>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <div class="toolbar">
+        <input id="configSearch" type="search" placeholder="搜索 config / 参数，例如 active_weight, 0.5-5B">
+        <button id="resetFilters" type="button">重置</button>
+      </div>
+      <div class="filters" id="filters"></div>
+      <div class="small" id="rowCount"></div>
+      <div class="table-wrap"><table id="results"></table></div>
+    </aside>
+    <div id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize left and right panels" title="拖拽调整左右宽度；双击重置"></div>
+    <section>
+      <div id="configNotice" class="notice"></div>
+      <div class="summary" id="summary"></div>
+      <div class="chart-grid">
+        <div class="chart-wrap" id="chartWrap">
+          <svg id="chart" viewBox="0 0 940 430" preserveAspectRatio="none" role="img" aria-label="Historical return chart"></svg>
+          <div class="tooltip" id="tooltip"></div>
+          <div class="legend">
+            <span class="key"><span class="swatch" style="background:var(--accent)"></span>Strategy growth</span>
+            <span class="key"><span class="swatch" style="background:var(--bench)"></span>Benchmark growth</span>
+            <span class="key"><span class="swatch" style="background:var(--blue)"></span>Active growth = cumulative excess return</span>
+            <span class="key"><span class="swatch" style="background:var(--bad)"></span>Drawdown</span>
+            <button id="latestPoint" type="button">最新持仓</button>
+            <span class="key">点击曲线可锁定月份，再点一次释放</span>
+          </div>
+        </div>
+        <div class="side-card" id="monthCard"></div>
+      </div>
+
+      <div class="tabs" id="tabs">
+        <div class="tab active" data-tab="holdingsPanel">持仓 / 状态</div>
+        <div class="tab" data-tab="changesPanel">变化 Top</div>
+        <div class="tab" data-tab="rebalancePanel">Rebalance 质量</div>
+        <div class="tab" data-tab="diagnosticsPanel">数据/规则</div>
+      </div>
+
+      <div id="holdingsPanel" class="panel active">
+        <div class="holdings-toolbar">
+          <input id="tickerSearch" type="search" placeholder="搜索 ticker / issuer">
+          <select id="statusFilter">
+            <option value="">全部状态</option>
+            <option value="new">新加入</option>
+            <option value="keep">保持</option>
+            <option value="carry">Carry</option>
+            <option value="exit">退出</option>
+          </select>
+          <select id="actionFilter">
+            <option value="">全部动作</option>
+            <option value="new">新买</option>
+            <option value="increase">加仓</option>
+            <option value="decrease">减仓</option>
+            <option value="flat">基本不变</option>
+            <option value="carry">上一期延续</option>
+            <option value="sell">卖出</option>
+          </select>
+          <button id="exportHoldings" type="button">导出当前月 CSV</button>
+        </div>
+        <div class="table-wrap"><table id="holdingsTable"></table></div>
+      </div>
+
+      <div id="changesPanel" class="panel">
+        <div class="changes-grid">
+          <div class="diag-card"><h3>当前权重 Top 20</h3><div class="simple-bar-wrap"><div id="topCurrentTable" class="simple-bar-list"></div></div></div>
+          <div class="diag-card"><h3>当前权重 Top 20｜本月变化</h3><div class="simple-bar-wrap"><div id="topChangeTable" class="simple-bar-list"></div></div></div>
+          <div class="diag-card"><h3>增加 Top 20｜新买 + 加仓</h3><div class="simple-bar-wrap"><div id="topIncreaseTable" class="simple-bar-list"></div></div></div>
+          <div class="diag-card"><h3>减少 Top 20｜减仓 + 退出</h3><div class="simple-bar-wrap"><div id="topDecreaseTable" class="simple-bar-list"></div></div></div>
+        </div>
+      </div>
+
+      <div id="rebalancePanel" class="panel">
+        <div class="diag-grid" id="rebalanceCards"></div>
+      </div>
+
+      <div id="diagnosticsPanel" class="panel">
+        <div class="diag-grid" id="diagnosticsCards"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const DATA = __DATA_PAYLOAD__;
+    const PORTFOLIO = __PORTFOLIO_PAYLOAD__;
+    const META = __META_PAYLOAD__;
+
+    const filterFields = ["valid_config","aum_band","idea_signal","top_n_ideas","min_consensus_funds","holding_horizon_q","min_portfolio_names","max_portfolio_names","use_concentration","use_low_turnover","use_value_tilt"];
+    const tableFields = ["valid_config","aum_band","idea_signal","top_n_ideas","min_consensus_funds","holding_horizon_q","ann_return","ann_vol","max_drawdown","sharpe","active_sharpe","ir","invested_month_frac","avg_effective_names","avg_selected_managers","avg_max_weight"];
+    const labels = {
+      valid_config:"valid", aum_band:"AUM", idea_signal:"signal", top_n_ideas:"topN", min_consensus_funds:"min consensus", holding_horizon_q:"horizonQ",
+      min_portfolio_names:"min names", max_portfolio_names:"max names", use_concentration:"concentration", use_low_turnover:"low turnover", use_value_tilt:"value tilt",
+      ann_return:"ann ret", ann_vol:"ann vol", max_drawdown:"max DD", sharpe:"Sharpe", active_sharpe:"active Sharpe", ir:"IR", invested_month_frac:"invested", avg_effective_names:"avg names", avg_selected_managers:"avg mgrs", avg_max_weight:"avg max wt"
+    };
+    const statusText = {new:"新加入", keep:"保持", carry:"Carry", exit:"退出"};
+    const actionText = {new:"新买", increase:"加仓", decrease:"减仓", flat:"基本不变", carry:"上一期延续", sell:"卖出"};
+    const statusClass = {new:"good", keep:"blue", carry:"purple", exit:"bad"};
+    let sortField = "active_sharpe";
+    let sortDir = -1;
+    let selectedId = META.thesisConfigId || DATA.records[0]?.config_id || null;
+    let selectedDate = null;
+    let lockedDate = null;
+    let lastRows = [];
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function isNum(v) { return typeof v === "number" && Number.isFinite(v); }
+    function fmt(v, pct=false, digits=2) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "n/a";
+      if (pct) return (v * 100).toFixed(digits === undefined ? 1 : digits) + "%";
+      if (typeof v === "number") return v.toFixed(digits);
+      return String(v);
+    }
+    function fmtWeight(v) { return v === null || v === undefined ? "" : (v * 100).toFixed(2) + "%"; }
+    function fmtDelta(v) {
+      if (v === null || v === undefined) return "";
+      const bps = v * 10000;
+      const sign = bps > 0 ? "+" : "";
+      return sign + bps.toFixed(0) + " bp";
+    }
+    function pctField(field) {
+      return ["ann_return","ann_vol","max_drawdown","total_return","invested_month_frac","valid_rebalance_frac","invalid_rebalance_frac","avg_max_weight","avg_max_issuer_weight","name_cap_feasible_ratio","issuer_cap_feasible_ratio","zero_contributor_manager_frac","ann_alpha"].includes(field);
+    }
+    function compactId(id) {
+      if (!id) return "";
+      return id.replaceAll("|", " · ").replaceAll("_", "_");
+    }
+    function dateLabel(d) { return d || "n/a"; }
+
+    function initMeta() {
+      const dataLine = META.dashboardParameterSummary?.Data || "";
+      document.getElementById("metaLine").textContent = dataLine;
+    }
+
+    function initFilters() {
+      const root = document.getElementById("filters");
+      root.innerHTML = "";
+      for (const field of filterFields) {
+        if (!DATA.records.some(r => Object.prototype.hasOwnProperty.call(r, field))) continue;
+        const values = [...new Set(DATA.records.map(r => r[field]).filter(v => v !== null && v !== undefined))]
+          .sort((a,b) => String(a).localeCompare(String(b), undefined, {numeric:true}));
+        const label = document.createElement("label");
+        label.textContent = labels[field] || field;
+        const select = document.createElement("select");
+        select.dataset.field = field;
+        select.innerHTML = `<option value="">All</option>` + values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");
+        if (field === "valid_config" && values.includes(true)) select.value = "true";
+        select.addEventListener("change", render);
+        label.appendChild(select);
+        root.appendChild(label);
+      }
+      document.getElementById("configSearch").addEventListener("input", render);
+      document.getElementById("resetFilters").addEventListener("click", () => {
+        document.querySelectorAll("#filters select").forEach(sel => sel.value = sel.dataset.field === "valid_config" ? "true" : "");
+        document.getElementById("configSearch").value = "";
+        render();
+      });
+    }
+
+    function filteredRows() {
+      const selects = [...document.querySelectorAll("#filters select")];
+      const q = document.getElementById("configSearch")?.value.trim().toLowerCase() || "";
+      return DATA.records.filter(row => {
+        const okFilters = selects.every(sel => !sel.value || String(row[sel.dataset.field]) === sel.value);
+        if (!okFilters) return false;
+        if (!q) return true;
+        return row.config_id.toLowerCase().includes(q) || tableFields.some(f => String(row[f] ?? "").toLowerCase().includes(q));
+      }).sort((a, b) => {
+        const av = a[sortField], bv = b[sortField];
+        if (av === bv) return 0;
+        if (av === null || av === undefined) return 1;
+        if (bv === null || bv === undefined) return -1;
+        if (typeof av === "string" || typeof bv === "string") return String(av).localeCompare(String(bv), undefined, {numeric:true}) * sortDir;
+        return av > bv ? sortDir : -sortDir;
+      });
+    }
+
+    function renderTable(rows) {
+      const table = document.getElementById("results");
+      document.getElementById("rowCount").textContent = `${rows.length} / ${DATA.records.length} configs. 点击表格行切换曲线。`;
+      const head = `<thead><tr>${tableFields.map(f => `<th data-field="${f}">${escapeHtml(labels[f] || f)}${sortField===f ? (sortDir<0?" ↓":" ↑") : ""}</th>`).join("")}</tr></thead>`;
+      const body = rows.map(row => `<tr data-id="${escapeHtml(row.config_id)}" class="${row.config_id === selectedId ? "active" : ""} ${row.valid_config === false ? "invalid" : ""}">
+        ${tableFields.map(f => `<td>${f === "valid_config" ? (row[f] ? '<span class="pill good">true</span>' : '<span class="pill bad">false</span>') : escapeHtml(fmt(row[f], pctField(f), pctField(f)?1:2))}</td>`).join("")}
+      </tr>`).join("");
+      table.innerHTML = head + `<tbody>${body}</tbody>`;
+      table.querySelectorAll("th").forEach(th => th.addEventListener("click", () => {
+        const field = th.dataset.field;
+        if (sortField === field) sortDir *= -1; else { sortField = field; sortDir = -1; }
+        render();
+      }));
+      table.querySelectorAll("tr[data-id]").forEach(tr => tr.addEventListener("click", () => {
+        selectedId = tr.dataset.id;
+        lockedDate = null;
+        render();
+      }));
+    }
+
+    function scale(vals, minPx, maxPx) {
+      const finite = vals.filter(v => Number.isFinite(v));
+      const min = Math.min(...finite), max = Math.max(...finite);
+      const span = Math.max(1e-9, max - min);
+      return {min, max, map: v => maxPx - (v - min) / span * (maxPx - minPx)};
+    }
+    function xForIndex(i, n) { return i * (940 / Math.max(1, n - 1)); }
+    function pathFor(values, yMap) {
+      const n = values.length;
+      return values.map((v, i) => `${i === 0 ? "M" : "L"} ${xForIndex(i,n).toFixed(2)} ${yMap(v).toFixed(2)}`).join(" ");
+    }
+    function yTicks(scaleObj, pct=false) {
+      const ticks = [];
+      for (let i=0; i<4; i++) {
+        const v = scaleObj.min + (scaleObj.max - scaleObj.min) * i / 3;
+        ticks.push(v);
+      }
+      return ticks;
+    }
+
+    function renderChart(row) {
+      const svg = document.getElementById("chart");
+      const s = DATA.series[row.config_id];
+      if (!s) { svg.innerHTML = `<text x="470" y="205" text-anchor="middle" fill="#61636b">No return series</text>`; return; }
+      const combined = [...s.growth, ...(s.benchmark || []), ...(s.active_growth || [])].filter(isNum);
+      const y = scale(combined, 32, 284);
+      const minDD = Math.min(-0.01, ...s.drawdown.filter(isNum));
+      const yDD = v => 382 - (v / minDD) * 72;
+      const n = s.dates.length;
+      const benchPath = s.benchmark?.length ? `<path d="${pathFor(s.benchmark, y.map)}" fill="none" stroke="#7b8494" stroke-width="2"/>` : "";
+      const activePath = s.active_growth?.length ? `<path d="${pathFor(s.active_growth, y.map)}" fill="none" stroke="#2f5f9f" stroke-width="2" opacity=".75"/>` : "";
+      const yearTicks = [];
+      let lastYear = null;
+      s.dates.forEach((d, i) => {
+        const yr = d.slice(0,4);
+        if (yr !== lastYear && (i === 0 || d.slice(5,7) === "01" || i === n-1)) { yearTicks.push([i, yr]); lastYear = yr; }
+      });
+      const gridY = yTicks(y).map(v => `<line x1="0" y1="${y.map(v).toFixed(2)}" x2="940" y2="${y.map(v).toFixed(2)}" stroke="#edf0f5"/><text x="8" y="${(y.map(v)+4).toFixed(2)}" text-anchor="start" fill="#8a909c" font-size="11" stroke="white" stroke-width="3" paint-order="stroke">${fmt(v,false,1)}</text>`).join("");
+      const gridX = yearTicks.map(([i, yr]) => `<line x1="${xForIndex(i,n).toFixed(2)}" y1="30" x2="${xForIndex(i,n).toFixed(2)}" y2="386" stroke="#f0f2f6"/><text x="${xForIndex(i,n).toFixed(2)}" y="414" text-anchor="middle" fill="#8a909c" font-size="10">${yr}</text>`).join("");
+      svg.innerHTML = `
+        <rect x="0" y="0" width="940" height="430" fill="white"/>
+        ${gridX}${gridY}
+        <line x1="0" y1="284" x2="940" y2="284" stroke="#d9dde5"/>
+        <line x1="0" y1="382" x2="940" y2="382" stroke="#d9dde5"/>
+        <text x="6" y="18" fill="#15171d" font-size="13">${escapeHtml(compactId(row.config_id))}</text>
+        <text x="6" y="305" fill="#8a909c" font-size="11">Growth / Cumulative Excess Return</text>
+        <text x="6" y="365" fill="#8a909c" font-size="11">Drawdown</text>
+        <path d="${pathFor(s.growth, y.map)}" fill="none" stroke="#0b6e4f" stroke-width="3"/>
+        ${benchPath}
+        ${activePath}
+        <path d="${pathFor(s.drawdown, yDD)}" fill="none" stroke="#b0413e" stroke-width="2"/>
+        <line id="crosshair" x1="-10" y1="26" x2="-10" y2="386" stroke="#15171d" stroke-width="1" stroke-dasharray="3 3" opacity=".65"/>
+        <circle id="dotGrowth" cx="-10" cy="-10" r="4" fill="#0b6e4f" stroke="white" stroke-width="1.5"/>
+        <rect id="chartOverlay" x="0" y="0" width="940" height="430" fill="transparent" style="cursor:crosshair"/>
+      `;
+      const overlay = svg.querySelector("#chartOverlay");
+      const crosshair = svg.querySelector("#crosshair");
+      const dotGrowth = svg.querySelector("#dotGrowth");
+      function svgXFromPointer(event) {
+        // Use the browser's own SVG coordinate transform, not raw CSS pixels.
+        // This keeps the cursor, crosshair, and green dot on the same x-coordinate
+        // even when the SVG is resized by the split panel or browser zoom.
+        try {
+          const pt = svg.createSVGPoint();
+          pt.x = event.clientX;
+          pt.y = event.clientY;
+          const ctm = svg.getScreenCTM();
+          if (ctm) return pt.matrixTransform(ctm.inverse()).x;
+        } catch (err) {}
+        const box = svg.getBoundingClientRect();
+        return (event.clientX - box.left) / Math.max(1, box.width) * 940;
+      }
+      function updateFromEvent(event, pin=false) {
+        const xSvg = Math.max(0, Math.min(940, svgXFromPointer(event)));
+        const idx = Math.max(0, Math.min(n - 1, Math.round(xSvg / 940 * (n - 1))));
+        const d = s.dates[idx];
+        if (pin) lockedDate = (lockedDate === d ? null : d);
+        if (!lockedDate || pin) setSelectedDate(d, row, event, idx);
+      }
+      overlay.addEventListener("mousemove", ev => { if (!lockedDate) updateFromEvent(ev, false); });
+      overlay.addEventListener("click", ev => updateFromEvent(ev, true));
+      overlay.addEventListener("mouseleave", () => { if (!lockedDate) document.getElementById("tooltip").style.display = "none"; });
+      const initialDate = lockedDate || selectedDate || s.dates[s.dates.length - 1];
+      const idx = Math.max(0, s.dates.indexOf(initialDate));
+      moveCrosshair(row, idx, null);
+      if (!selectedDate) selectedDate = initialDate;
+    }
+
+    function resolveHoldingsDate(date) {
+      const dates = PORTFOLIO.availableDates || [];
+      if (PORTFOLIO.holdingsByDate[date]) return {date, exact:true};
+      let prev = null;
+      for (const d of dates) { if (d <= date) prev = d; else break; }
+      return {date:prev, exact:false};
+    }
+
+    function moveCrosshair(row, idx, event) {
+      const s = DATA.series[row.config_id]; if (!s) return;
+      const svg = document.getElementById("chart");
+      const x = xForIndex(idx, s.dates.length);
+      const combined = [...s.growth, ...(s.benchmark || []), ...(s.active_growth || [])].filter(isNum);
+      const y = scale(combined, 32, 284);
+      const crosshair = svg.querySelector("#crosshair");
+      const dot = svg.querySelector("#dotGrowth");
+      if (crosshair) { crosshair.setAttribute("x1", x); crosshair.setAttribute("x2", x); }
+      if (dot) { dot.setAttribute("cx", x); dot.setAttribute("cy", y.map(s.growth[idx])); }
+      const date = s.dates[idx];
+      selectedDate = date;
+      renderMonthViews(row, date);
+      renderTooltip(row, date, idx, event);
+    }
+
+    function setSelectedDate(date, row, event, idxOverride=null) {
+      const s = DATA.series[row.config_id]; if (!s) return;
+      const idx = idxOverride ?? s.dates.indexOf(date);
+      if (idx >= 0) moveCrosshair(row, idx, event);
+    }
+
+    function renderTooltip(row, date, idx, event) {
+      const tooltip = document.getElementById("tooltip");
+      const s = DATA.series[row.config_id];
+      const resolved = resolveHoldingsDate(date);
+      const stats = resolved.date ? PORTFOLIO.monthStats[resolved.date] : null;
+      const summary = resolved.date ? PORTFOLIO.summaryByDate[resolved.date] : null;
+      tooltip.innerHTML = `<div class="title">${escapeHtml(date)}${lockedDate ? " · 已锁定" : ""}</div>
+        <div class="grid">
+          <div>Strategy</div><div>${fmt(s.growth[idx], false, 3)}</div>
+          <div>Benchmark</div><div>${fmt(s.benchmark?.[idx], false, 3)}</div>
+          <div>Active growth</div><div>${fmt(s.active_growth?.[idx], false, 3)} <span class="small">(cum. strategy − benchmark)</span></div>
+          <div>Drawdown</div><div>${fmt(s.drawdown?.[idx], true, 1)}</div>
+          <div>Holdings date</div><div>${resolved.date ? escapeHtml(resolved.date) + (resolved.exact ? "" : "*") : "n/a"}</div>
+          <div>Names</div><div>${stats ? stats.current_names : "n/a"}</div>
+          <div>New / Carry / Exit</div><div>${stats ? `${stats.status_counts.new || 0} / ${stats.status_counts.carry || 0} / ${stats.status_counts.exit || 0}` : "n/a"}</div>
+          <div>Turnover</div><div>${summary ? fmt(summary.turnover_one_way, true, 1) : "n/a"}</div>
+        </div>
+        ${resolved.exact ? "" : '<div class="small" style="margin-top:6px">*该收益月份没有持仓快照，显示最近上一期组合。</div>'}`;
+      if (event) {
+        const wrap = document.getElementById("chartWrap").getBoundingClientRect();
+        let left = event.clientX - wrap.left + 12;
+        let top = event.clientY - wrap.top + 12;
+        if (left > wrap.width - 340) left = Math.max(8, left - 350);
+        if (top > wrap.height - 190) top = Math.max(8, top - 200);
+        tooltip.style.left = left + "px"; tooltip.style.top = top + "px";
+      } else { tooltip.style.left = "75px"; tooltip.style.top = "36px"; }
+      tooltip.style.display = "block";
+    }
+
+    function renderSummary(row) {
+      const items = [
+        ["Valid", row.valid_config ? "true" : "false"],
+        ["Total return", fmt(row.total_return, true, 1)],
+        ["Ann. return", fmt(row.ann_return, true, 1)],
+        ["Ann. vol", fmt(row.ann_vol, true, 1)],
+        ["Max DD", fmt(row.max_drawdown, true, 1)],
+        ["Sharpe", fmt(row.sharpe, false, 2)],
+        ["Active Sharpe", fmt(row.active_sharpe, false, 2)]
+      ];
+      document.getElementById("summary").innerHTML = items.map(([k, v]) => `<div class="metric"><span>${escapeHtml(k)}</span><strong>${escapeHtml(v)}</strong></div>`).join("");
+    }
+
+    function renderNotice(row) {
+      const n = document.getElementById("configNotice");
+      n.classList.remove("ok");
+      if (row.config_id !== PORTFOLIO.configId) {
+        n.style.display = "block";
+        n.innerHTML = `⚠ 当前曲线对应所选 sweep config；但逐月持仓明细文件只对应 <b>thesis config</b>。因此下方持仓/状态显示的是 thesis 组合，不代表当前表格所选 config。`;
+      } else {
+        n.style.display = "block";
+        n.classList.add("ok");
+        n.innerHTML = `当前曲线与下方持仓同属 thesis config；切到其他 sweep config 时，下方持仓仍只代表 thesis 组合。`;
+      }
+    }
+
+    function renderMonthViews(row, date) {
+      const resolved = resolveHoldingsDate(date);
+      renderMonthCard(date, resolved);
+      renderHoldingsTable(resolved.date);
+      renderBars(resolved.date);
+      renderRebalanceCards(resolved.date);
+    }
+
+    function renderMonthCard(seriesDate, resolved) {
+      const date = resolved.date;
+      const stats = date ? PORTFOLIO.monthStats[date] : null;
+      const summary = date ? PORTFOLIO.summaryByDate[date] : null;
+      if (!date || !stats) { document.getElementById("monthCard").innerHTML = `<div class="empty">没有对应持仓。</div>`; return; }
+      const sc = stats.status_counts || {};
+      const sw = stats.status_weights || {};
+      const exactNote = resolved.exact ? "" : `<div class="small">收益月：${escapeHtml(seriesDate)}；持仓用最近上一期 ${escapeHtml(date)}。</div>`;
+      document.getElementById("monthCard").innerHTML = `
+        <div class="month-title">
+          <div><h2>${escapeHtml(date)} 持仓状态</h2>${exactNote}</div>
+          <div class="small">${lockedDate ? "曲线已锁定" : "hover 自动更新"}</div>
+        </div>
+        <div class="status-grid">
+          <div class="status-box"><span>当前持仓</span><strong>${stats.current_names}</strong></div>
+          <div class="status-box"><span>组合权重</span><strong>${fmt(stats.current_weight, true, 1)}</strong></div>
+          <div class="status-box"><span>新加入</span><strong>${sc.new || 0}</strong><span>${fmt(sw.new || 0, true, 1)}</span></div>
+          <div class="status-box"><span>保持</span><strong>${sc.keep || 0}</strong><span>${fmt(sw.keep || 0, true, 1)}</span></div>
+          <div class="status-box"><span>Carry</span><strong>${sc.carry || 0}</strong><span>${fmt(sw.carry || 0, true, 1)}</span></div>
+          <div class="status-box"><span>退出</span><strong>${sc.exit || 0}</strong><span>${fmt(sw.exit || 0, true, 1)}</span></div>
+        </div>
+        <div class="small">
+          turnover=${summary ? fmt(summary.turnover_one_way, true, 1) : "n/a"}；cost=${summary ? fmt(summary.cost_bps, false, 1) : "n/a"}bp；selected managers=${summary ? fmt(summary.selected_managers, false, 0) : "n/a"}；carried names=${summary ? fmt(summary.carried_names, false, 0) : "n/a"}
+        </div>`;
+    }
+
+    function holdingRowsForDate(date) { return date ? (PORTFOLIO.eventsByDate[date] || []) : []; }
+
+    function renderHoldingsTable(date) {
+      const table = document.getElementById("holdingsTable");
+      const q = document.getElementById("tickerSearch")?.value.trim().toLowerCase() || "";
+      const sf = document.getElementById("statusFilter")?.value || "";
+      const af = document.getElementById("actionFilter")?.value || "";
+      let rows = holdingRowsForDate(date);
+      rows = rows.filter(r => (!q || r.ticker.toLowerCase().includes(q) || String(r.issuer_group).toLowerCase().includes(q)) && (!sf || r.status === sf) && (!af || r.action === af));
+      const head = `<thead><tr><th>rank</th><th>ticker</th><th>issuer</th><th>status</th><th>action</th><th>weight</th><th>prev</th><th>Δ weight</th></tr></thead>`;
+      const body = rows.map(r => {
+        const dcls = r.delta > 0 ? "delta-pos" : (r.delta < 0 ? "delta-neg" : "");
+        const rowCls = r.status === "exit" ? "exit-row" : (r.status === "carry" ? "carry-row" : (r.status === "new" ? "new-row" : ""));
+        return `<tr class="${rowCls}"><td>${r.rank ?? ""}</td><td><b>${escapeHtml(r.ticker)}</b></td><td>${escapeHtml(r.issuer_group)}</td><td><span class="pill ${statusClass[r.status] || ""}">${statusText[r.status] || r.status}</span></td><td>${escapeHtml(actionText[r.action] || r.action)}</td><td>${fmtWeight(r.weight)}</td><td>${fmtWeight(r.prev_weight)}</td><td class="${dcls}">${fmtDelta(r.delta)}</td></tr>`;
+      }).join("");
+      table.innerHTML = head + `<tbody>${body || `<tr><td colspan="8" class="empty">没有匹配持仓。</td></tr>`}</tbody>`;
+    }
+
+    function renderBars(date) {
+      const stats = date ? PORTFOLIO.monthStats[date] : null;
+      const ids = ["topCurrentTable","topChangeTable","topIncreaseTable","topDecreaseTable"];
+      if (!stats) {
+        ids.forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = `<div class="empty">没有数据</div>`; });
+        return;
+      }
+      renderSimpleBarList("topCurrentTable", stats.top_current || [], "current");
+      renderSimpleBarList("topChangeTable", stats.top_current || [], "change");
+      renderSimpleBarList("topIncreaseTable", stats.top_increases || [], "increase");
+      renderSimpleBarList("topDecreaseTable", stats.top_decreases || [], "decrease");
+    }
+
+    function renderSimpleBarList(id, rows, mode) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const shown = (rows || []).slice(0, 20);
+      if (!shown.length) {
+        el.innerHTML = `<div class="empty">没有数据。</div>`;
+        return;
+      }
+      const values = shown.map(r => mode === "current" ? Math.abs(r.weight || 0) : Math.abs(r.delta || 0));
+      const maxVal = Math.max(...values, 1e-9);
+      el.innerHTML = shown.map((r, i) => {
+        const raw = mode === "current" ? (r.weight || 0) : (r.delta || 0);
+        const mag = Math.abs(raw);
+        const pct = Math.max(2, Math.min(100, mag / maxVal * 100));
+        const neg = mode !== "current" && raw < 0;
+        const label = mode === "current" ? fmtWeight(r.weight) : fmtDelta(r.delta);
+        const title = `${r.ticker || ""} ${r.issuer_group || ""} | ${statusText[r.status] || r.status || ""} | ${actionText[r.action] || r.action || ""} | weight ${fmtWeight(r.weight)} | prev ${fmtWeight(r.prev_weight)} | Δ ${fmtDelta(r.delta)}`;
+        return `<div class="simple-bar-row" title="${escapeHtml(title)}">
+          <div class="simple-bar-name">${escapeHtml(r.ticker || "")}</div>
+          <div class="simple-bar-track"><div class="simple-bar-fill ${neg ? "neg" : ""}" style="width:${pct.toFixed(1)}%"></div></div>
+          <div class="simple-bar-value">${escapeHtml(label)}</div>
+        </div>`;
+      }).join("");
+    }
+
+    function renderRebalanceCards(date) {
+      const s = date ? PORTFOLIO.summaryByDate[date] : null;
+      const root = document.getElementById("rebalanceCards");
+      if (!s) { root.innerHTML = `<div class="empty">没有 rebalance summary。</div>`; return; }
+      const groups = [
+        ["Manager funnel", [["selected",s.selected_managers],["visible",s.visible_managers],["active eligible",s.active_eligible_managers],["zero contributor",s.zero_contributor_managers],["stale dropped",s.stale_managers_dropped]]],
+        ["Portfolio quality", [["target names",s.target_names],["effective names",s.effective_names],["carried names",s.carried_names],["max weight",fmt(s.max_weight,true,1)],["top5 weight",fmt(s.top5_weight,true,1)],["HHI",fmt(s.hhi,false,3)]]],
+        ["Trading", [["turnover one-way",fmt(s.turnover_one_way,true,1)],["cost bps",fmt(s.cost_bps,false,1)],["traded",s.traded_names],["buy",s.buy_names],["sell",s.sell_names],["inc / dec",`${s.increased_names} / ${s.decreased_names}`]]],
+        ["Issuer caps", [["issuer groups",s.issuer_groups],["max issuer",fmt(s.max_issuer_weight,true,1)],["name cap feasible",s.name_cap_feasible],["issuer cap feasible",s.issuer_cap_feasible],["multi-class",s.multi_class_exposures || "n/a"]]]
+      ];
+      root.innerHTML = groups.map(([title, kvs]) => `<div class="diag-card"><h3>${escapeHtml(title)}</h3><div class="kv">${kvs.map(([k,v]) => `<div>${escapeHtml(k)}</div><div>${escapeHtml(v)}</div>`).join("")}</div></div>`).join("");
+    }
+
+    function renderDiagnostics() {
+      const d = META.inputSummary || {};
+      const map = d.mapping || {};
+      const rules = META.rules || {};
+      const summary = META.dashboardParameterSummary || {};
+      const byType = map.by_sec_type || {};
+      const typeRows = Object.entries(byType).map(([k,v]) => `<div>${escapeHtml(k)}</div><div>rows=${fmt(v.rows,false,0)}, value coverage=${fmt(v.value_coverage,true,1)}</div>`).join("");
+      const cards = [
+        ["Run / data", [["config hash", META.configHash || "n/a"],["git sha", META.gitSha || "n/a"],["benchmark", DATA.benchmarkName],["months", d.factor_months],["managers", d.manager_count],["issuer groups", d.issuer_group_count]]],
+        ["Mapping", [["rows mapped", `${fmt(map.rows_mapped,false,0)} / ${fmt(map.rows_total,false,0)}`],["CUSIPs mapped", `${fmt(map.cusips_mapped,false,0)} / ${fmt(map.cusips_total,false,0)}`],["price candidate value coverage", fmt(map.price_candidate_value_coverage,true,1)]]],
+        ["Point-in-time / execution", [["PIT rule", rules.point_in_time_rule || "n/a"],["rebalance", rules.rebalance_rule || "n/a"],["execution", rules.execution_timing || "n/a"],["missing price", rules.missing_price_policy || "n/a"],["cost", rules.transaction_cost ? `${rules.transaction_cost.bps_per_side} bps one-way turnover` : "n/a"]]],
+        ["Dashboard summary", Object.entries(summary).map(([k,v]) => [k,v])],
+        ["Coverage by security type", []]
+      ];
+      document.getElementById("diagnosticsCards").innerHTML = cards.map(([title, kvs], idx) => `<div class="diag-card"><h3>${escapeHtml(title)}</h3>${idx === 4 ? `<div class="kv">${typeRows}</div>` : `<div class="kv">${kvs.map(([k,v]) => `<div>${escapeHtml(k)}</div><div>${escapeHtml(v)}</div>`).join("")}</div>`}</div>`).join("");
+    }
+
+    function initInteractions() {
+      document.getElementById("tickerSearch").addEventListener("input", () => renderHoldingsTable(resolveHoldingsDate(selectedDate).date));
+      document.getElementById("statusFilter").addEventListener("change", () => renderHoldingsTable(resolveHoldingsDate(selectedDate).date));
+      document.getElementById("actionFilter").addEventListener("change", () => renderHoldingsTable(resolveHoldingsDate(selectedDate).date));
+      document.getElementById("exportHoldings").addEventListener("click", exportCurrentHoldings);
+      document.getElementById("latestPoint").addEventListener("click", () => {
+        const row = DATA.records.find(r => r.config_id === selectedId);
+        const s = row ? DATA.series[row.config_id] : null;
+        if (!s || !s.dates.length) return;
+        const d = s.dates[s.dates.length - 1];
+        lockedDate = d;
+        setSelectedDate(d, row, null);
+      });
+      document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+        document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+        tab.classList.add("active");
+        document.getElementById(tab.dataset.tab).classList.add("active");
+      }));
+    }
+
+    function exportCurrentHoldings() {
+      const date = resolveHoldingsDate(selectedDate).date;
+      const rows = holdingRowsForDate(date);
+      if (!rows.length) return;
+      const cols = ["date","rank","ticker","issuer_group","status","action","weight","prev_weight","delta"];
+      const csv = [cols.join(",")].concat(rows.map(r => cols.map(c => `"${String(r[c] ?? "").replaceAll('"','""')}"`).join(","))).join("\n");
+      const blob = new Blob([csv], {type:"text/csv;charset=utf-8"});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `holdings_${date || 'current'}.csv`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }
+
+    function initSplitter() {
+      const splitter = document.getElementById("splitter");
+      const root = document.documentElement;
+      const saved = localStorage.getItem("enhancedSweepLeftPanelWidth");
+      if (saved) root.style.setProperty("--left-panel-width", saved);
+      let dragging = false;
+      splitter.addEventListener("pointerdown", event => {
+        dragging = true; splitter.setPointerCapture(event.pointerId); document.body.classList.add("dragging-splitter");
+      });
+      splitter.addEventListener("pointermove", event => {
+        if (!dragging) return;
+        const maxLeft = Math.max(360, window.innerWidth - 760);
+        const left = Math.max(320, Math.min(maxLeft, event.clientX - 14));
+        const value = `${left}px`;
+        root.style.setProperty("--left-panel-width", value);
+        localStorage.setItem("enhancedSweepLeftPanelWidth", value);
+      });
+      function stop(event) { dragging = false; document.body.classList.remove("dragging-splitter"); try { splitter.releasePointerCapture(event.pointerId); } catch (_) {} }
+      splitter.addEventListener("pointerup", stop); splitter.addEventListener("pointercancel", stop);
+      splitter.addEventListener("dblclick", () => { localStorage.removeItem("enhancedSweepLeftPanelWidth"); root.style.removeProperty("--left-panel-width"); });
+    }
+
+    function render() {
+      const rows = filteredRows(); lastRows = rows;
+      if (!selectedId || !DATA.records.some(r => r.config_id === selectedId)) selectedId = rows[0]?.config_id || DATA.records[0]?.config_id || null;
+      if (rows.length && !rows.some(r => r.config_id === selectedId)) selectedId = rows[0].config_id;
+      renderTable(rows);
+      const row = DATA.records.find(r => r.config_id === selectedId) || rows[0];
+      if (!row) return;
+      renderNotice(row);
+      renderSummary(row);
+      renderChart(row);
+      const s = DATA.series[row.config_id];
+      const d = lockedDate || selectedDate || s?.dates?.[s.dates.length - 1] || PORTFOLIO.availableDates[PORTFOLIO.availableDates.length - 1];
+      selectedDate = d;
+      renderMonthViews(row, d);
+    }
+
+    initMeta();
+    initSplitter();
+    initFilters();
+    initInteractions();
+    renderDiagnostics();
+    render();
+  </script>
+</body>
+</html>

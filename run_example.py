@@ -45,6 +45,7 @@ from manager_classifier import (
     load_manager_overrides,
     override_file_hash as manager_override_file_hash,
 )
+from market_cap import fetch_market_cap_history, load_market_cap_table, market_caps_by_month
 from report import dashboard, interactive_results
 from sweep import active_return_stream, deflated_sharpe, grid_eval, walk_forward
 
@@ -53,6 +54,7 @@ LIVE_CONFIG = {
     "identity": "YourName you@firm.com",
     "openfigi_key": None,
     "sec_history_start": "2013-10-01",
+    "price_history_start": "2014-01-01",
     "start": "2015-01-01",
     "end": "2026-05-31",
     # Broad-market total-return proxy. Use QQQ for a tighter growth-style proxy.
@@ -71,12 +73,20 @@ LIVE_CONFIG = {
     "manager_overrides_path": "data/manager_overrides.csv",
     "manager_classification_cache_dir": "data/processed",
     "refresh_openfigi_metadata": False,
-    "active_benchmark_source": "visible_13f_aggregate",
+    "force_refresh_openfigi": False,
+    "active_benchmark_source": "manager_held_mcap",
     "active_benchmark_weights_path": "data/processed/benchmark_weights_spy.parquet",
     "active_benchmark_max_stale_days": 45,
+    "market_cap_cache_path": "data/processed/market_cap_history.parquet",
+    "market_cap_auto_download": True,
+    "market_cap_max_stale_days": 45,
+    "market_cap_shares_max_stale_days": 550,
+    "market_cap_batch_size": 25,
+    "market_cap_workers": 6,
+    "market_cap_request_timeout": 20,
     "idio_vol_cache_dir": "data/processed",
     "idio_vol_window_months": 24,
-    "idio_vol_min_obs": 24,
+    "idio_vol_min_obs": 12,
     "idio_vol_floor": 0.10,
     "idio_vol_cap": 0.80,
     "idio_vol_winsor_lower": 0.05,
@@ -114,6 +124,34 @@ def _json_default(x: Any) -> Any:
     return str(x)
 
 
+def _process_rss_mb() -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2))
+    except Exception:
+        return None
+
+
+def _frame_shallow_mb(frame: pd.DataFrame | None) -> float:
+    if frame is None:
+        return 0.0
+    return float(frame.memory_usage(index=True, deep=False).sum() / (1024 ** 2))
+
+
+def _progress_printer(stage_started: float, log_path: pathlib.Path | None = None):
+    def emit(message: str) -> None:
+        rss = _process_rss_mb()
+        rss_text = f", rss={rss:,.0f}MB" if rss is not None else ""
+        line = f"{message}; stage_elapsed={time.perf_counter() - stage_started:.1f}s{rss_text}"
+        print(f"      {line}", flush=True)
+        if log_path is not None:
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+
+    return emit
+
+
 def _config_hash(payload: dict) -> str:
     raw = json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
@@ -148,7 +186,7 @@ def load_security_groups(tickers, path: str | pathlib.Path | None = "data/securi
     return groups.astype(str)
 
 
-def build_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+def build_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
     print("[1/6] Building synthetic data (no network)")
     rng = np.random.default_rng(7)
     periods = pd.date_range("2014-03-31", "2023-12-31", freq="QE")
@@ -250,7 +288,7 @@ def build_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd
         f"filings: {holdings.groupby(['manager', 'period_date']).ngroups}, "
         f"months: {len(months)}, tickers: {n_names}"
     )
-    return holdings, prices, factors, value_scores, bench_w, bench_ret
+    return holdings, prices, factors, value_scores, bench_w, bench_ret, prices.copy()
 
 
 def _top_cusips_by_value(holdings: pd.DataFrame, limit: int | None) -> pd.Index:
@@ -264,7 +302,7 @@ def build_live_data(
     *,
     cusip_limit: int | None = None,
     price_ticker_limit: int | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, None, None, pd.Series | None]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, None, None, pd.Series | None, pd.DataFrame]:
     print("[1/6] Building rule-based universe from SEC 13F datasets")
     import build_universe as bu
     import data_adapters as da
@@ -308,6 +346,7 @@ def build_live_data(
         api_key=cfg["openfigi_key"],
         cache_path=cfg.get("openfigi_cache_path"),
         require_metadata=require_openfigi_metadata,
+        force_refresh=bool(cfg.get("force_refresh_openfigi", False)),
     )
     openfigi_metadata = da.load_openfigi_metadata(cfg.get("openfigi_cache_path"))
     if not openfigi_metadata.empty:
@@ -327,25 +366,28 @@ def build_live_data(
         exclude_fund_like=bool(cfg.get("exclude_fund_like_holdings", False)),
         fund_ticker_exclusions_path=cfg.get("fund_ticker_exclusions_path"),
     )
-    holdings.attrs["raw_mapped_holdings"] = raw_mapped_holdings
     print("[1/6] Downloading monthly prices from yfinance")
     price_holdings = holdings
     if price_ticker_limit:
         top_tickers = holdings.groupby("ticker")["value"].sum().nlargest(price_ticker_limit).index
         price_holdings = holdings[holdings["ticker"].isin(top_tickers)].copy()
         print(f"    smoke ticker subset: top {len(top_tickers)} tickers by disclosed value")
-    prices = da.fetch_prices(
+    price_history_start = cfg.get("price_history_start") or cfg["start"]
+    if price_history_start != cfg["start"]:
+        print(f"    price/factor warm-up: {price_history_start} -> {cfg['start']} (not included in backtest returns)")
+    signal_prices = da.fetch_prices(
         price_holdings.ticker.unique(),
-        cfg["start"],
+        price_history_start,
         cfg["end"],
         cache_path=cfg.get("price_cache_path"),
         price_source=cfg.get("price_source", "auto"),
     )
-    holdings = da.align_holdings_to_prices(price_holdings, prices)
+    holdings = da.align_holdings_to_prices(price_holdings, signal_prices)
+    prices = signal_prices.loc[pd.Timestamp(cfg["start"]):pd.Timestamp(cfg["end"])].copy()
     holdings.attrs["raw_mapped_holdings"] = raw_mapped_holdings
     print("[1/6] Downloading Fama-French factors")
     try:
-        factors = da.fetch_factors(cfg["start"], cfg["end"])
+        factors = da.fetch_factors(price_history_start, cfg["end"])
         print(f"    factors: {len(factors)} monthly rows")
     except Exception as exc:
         if cfg.get("require_factors"):
@@ -369,7 +411,7 @@ def build_live_data(
         print(f"    [warn] benchmark fetch failed; benchmark disabled: {exc}")
         bench_ret = None
     print(f"    managers: {holdings.manager.nunique()}, tickers: {holdings.ticker.nunique()}")
-    return holdings, prices, factors, None, None, bench_ret
+    return holdings, prices, factors, None, None, bench_ret, signal_prices
 
 
 def run_live_smoke(
@@ -380,7 +422,7 @@ def run_live_smoke(
     cfg: dict | None = None,
 ) -> pathlib.Path:
     cfg = dict(LIVE_CONFIG if cfg is None else cfg)
-    holdings, prices, factors, _, _, bench_ret = build_live_data(
+    holdings, prices, factors, _, _, bench_ret, _ = build_live_data(
         cfg,
         cusip_limit=cusip_limit,
         price_ticker_limit=ticker_limit,
@@ -442,12 +484,68 @@ def _load_active_benchmark_weights_by_month(
     *,
     live_config: dict,
     months,
+    tickers,
     cfg: BacktestConfig,
-) -> dict[pd.Timestamp, pd.Series] | None:
+    mode: str,
+) -> tuple[dict[pd.Timestamp, pd.Series] | None, dict[str, Any]]:
     if not _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
-        return None
+        return None, {"required": False}
     if cfg.active_benchmark_source in {"visible_13f_aggregate", "13f_aggregate"}:
-        return None
+        return None, {"required": True, "source": cfg.active_benchmark_source, "external_table": False}
+    if cfg.active_benchmark_source == "manager_held_mcap":
+        if mode == "synthetic":
+            ordered = sorted(map(str, tickers))
+            synthetic_caps = pd.Series(
+                {ticker: float(len(ordered) - i) for i, ticker in enumerate(ordered)},
+                dtype=float,
+            )
+            print("    active benchmark: manager_held_mcap synthetic fixture")
+            weights = {pd.Timestamp(month): synthetic_caps.copy() for month in months}
+            return weights, {
+                "required": True,
+                "source": "manager_held_mcap",
+                "market_cap_source": "synthetic_fixture",
+                "strict_pit_row_fraction": 1.0,
+            }
+        path = pathlib.Path(live_config.get("market_cap_cache_path", "data/processed/market_cap_history.parquet"))
+        if bool(live_config.get("market_cap_auto_download", True)):
+            table = fetch_market_cap_history(
+                tickers,
+                pd.Timestamp(min(months)).to_period("M").start_time.date().isoformat(),
+                pd.Timestamp(max(months)).date().isoformat(),
+                cache_path=path,
+                batch_size=int(live_config.get("market_cap_batch_size", 25)),
+                max_workers=int(live_config.get("market_cap_workers", 6)),
+                request_timeout=int(live_config.get("market_cap_request_timeout", 20)),
+                max_shares_stale_days=int(live_config.get("market_cap_shares_max_stale_days", 550)),
+            )
+        else:
+            table = load_market_cap_table(path)
+        caps = market_caps_by_month(
+            table,
+            months,
+            max_stale_days=int(live_config.get("market_cap_max_stale_days", 45)),
+        )
+        coverage = pd.Series({month: len(values) for month, values in caps.items()}, dtype=float)
+        strict_frac = float(table.get("strict_pit", pd.Series(False, index=table.index)).mean())
+        print(
+            "    active benchmark: manager_held_mcap "
+            f"months={len(caps)}, median_tickers={coverage.median():.0f}, "
+            f"strict_pit_rows={strict_frac:.1%}, source={','.join(sorted(table['source'].astype(str).unique()))}, "
+            f"cache={path}"
+        )
+        return caps, {
+            "required": True,
+            "source": "manager_held_mcap",
+            "market_cap_path": str(path),
+            "market_cap_sources": sorted(table["source"].astype(str).unique().tolist()),
+            "strict_pit_row_fraction": strict_frac,
+            "months": int(len(caps)),
+            "zero_coverage_months": int((coverage == 0).sum()),
+            "min_tickers": int(coverage.min()) if len(coverage) else 0,
+            "median_tickers": float(coverage.median()) if len(coverage) else 0.0,
+            "max_tickers": int(coverage.max()) if len(coverage) else 0,
+        }
     import data_adapters as da
 
     path = pathlib.Path(live_config.get("active_benchmark_weights_path", ""))
@@ -459,7 +557,13 @@ def _load_active_benchmark_weights_by_month(
         f"{len(table['month_end'].drop_duplicates())} snapshots, "
         f"{len(weights)} monthly weights loaded from {path}"
     )
-    return weights
+    return weights, {
+        "required": True,
+        "source": cfg.active_benchmark_source,
+        "weights_path": str(path),
+        "snapshots": int(table["month_end"].nunique()),
+        "months": int(len(weights)),
+    }
 
 
 def _preflight_active_benchmark_inputs(*, mode: str, live_config: dict, cfg: BacktestConfig | None) -> None:
@@ -467,7 +571,7 @@ def _preflight_active_benchmark_inputs(*, mode: str, live_config: dict, cfg: Bac
         return
     if not _needs_active_benchmark_weights(cfg.portfolio.idea_signal):
         return
-    if cfg.active_benchmark_source in {"visible_13f_aggregate", "13f_aggregate"}:
+    if cfg.active_benchmark_source in {"visible_13f_aggregate", "13f_aggregate", "manager_held_mcap"}:
         return
     path = pathlib.Path(live_config.get("active_benchmark_weights_path", ""))
     if path.exists():
@@ -564,13 +668,14 @@ def _dashboard_parameter_summary(
         ),
         "Portfolio": (
             f"idea_signal={p.idea_signal}, top_n_ideas={p.top_n_ideas}, "
+            f"idea_aggregation={p.idea_aggregation or ('score' if p.consensus_weight else 'manager_count')}, "
             f"min_consensus_funds={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
             f"max_portfolio_names={p.max_portfolio_names}, "
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
             f"min_portfolio_names={p.min_portfolio_names}, "
             f"min_active_weight_holdings={p.min_active_weight_holdings}, "
             f"active_benchmark={cfg.active_benchmark_source}, "
-            f"cps_idio_vol=CAPM 24m heuristic floor/cap/winsor"
+            f"cps_idio_vol=CAPM 24m min_obs=12 heuristic floor/cap/winsor"
         ),
         "Execution/cost": (
             f"rebalance=month-end after filing_date visibility, missing_price_policy={cfg.missing_price_policy}, "
@@ -693,6 +798,31 @@ def write_sweep_outputs(
     return outputs
 
 
+def _sweep_config_id_for_cfg(grid: pd.DataFrame, axes: dict, cfg: BacktestConfig) -> str | None:
+    label: dict[str, Any] = {}
+    for (scope, field), values in axes.items():
+        if scope == "universe" and field == "aum_band":
+            match = next(
+                (
+                    value
+                    for value in values
+                    if float(value[1]) == float(cfg.universe.min_aum)
+                    and float(value[2]) == float(cfg.universe.max_aum)
+                ),
+                None,
+            )
+            if match is None:
+                return None
+            label[field] = match[0]
+            continue
+        owner = cfg.universe if scope == "universe" else cfg.portfolio if scope == "portfolio" else cfg
+        label[field] = getattr(owner, field)
+    config_id = "|".join(f"{key}={value}" for key, value in sorted(label.items()))
+    if "config_id" not in grid or not grid["config_id"].astype(str).eq(config_id).any():
+        return None
+    return config_id
+
+
 def _file_hash(path: str | pathlib.Path) -> str | None:
     p = pathlib.Path(path)
     if not p.exists():
@@ -703,22 +833,20 @@ def _file_hash(path: str | pathlib.Path) -> str | None:
 def _hash_frame_for_cache(df: pd.DataFrame, *, columns: list[str] | None = None) -> str:
     if df is None or df.empty:
         return hashlib.sha256(b"empty").hexdigest()[:16]
-    work = df.copy()
     if columns is not None:
-        keep = [c for c in columns if c in work.columns]
-        work = work[keep]
-    for col in work.columns:
-        if pd.api.types.is_datetime64_any_dtype(work[col]):
-            work[col] = pd.to_datetime(work[col]).dt.strftime("%Y-%m-%d")
-        elif work[col].dtype == "object" or str(work[col].dtype).startswith("string"):
-            work[col] = work[col].map(lambda x: "" if pd.isna(x) else str(x))
-    try:
-        work = work.sort_values(list(work.columns)).reset_index(drop=True)
-    except Exception:
-        work = work.reset_index(drop=True)
-    col_payload = "|".join(map(str, work.columns)).encode("utf-8")
-    row_hash = pd.util.hash_pandas_object(work, index=True).values.tobytes()
-    return hashlib.sha256(col_payload + row_hash).hexdigest()[:16]
+        keep = [c for c in columns if c in df.columns]
+        work = df.loc[:, keep]
+    else:
+        work = df
+    schema_payload = json.dumps(
+        [(str(col), str(work[col].dtype)) for col in work.columns],
+        separators=(",", ":"),
+    ).encode("utf-8")
+    # Sorting compact uint64 row hashes is substantially cheaper than sorting a
+    # 500k-row object frame, while keeping the cache key row-order independent.
+    row_hashes = pd.util.hash_pandas_object(work, index=False, categorize=True).to_numpy(dtype="uint64")
+    row_hashes.sort()
+    return hashlib.sha256(schema_payload + row_hashes.tobytes()).hexdigest()[:16]
 
 
 def _hash_matrix_for_cache(df: pd.DataFrame) -> str:
@@ -747,6 +875,7 @@ def _manager_classification_cache_key(
     prices: pd.DataFrame,
     factors: pd.DataFrame,
     cfg: ManagerClassifierConfig,
+    progress=None,
 ) -> tuple[str, dict[str, Any]]:
     holding_cols = [
         "manager",
@@ -760,16 +889,28 @@ def _manager_classification_cache_key(
         "sec_type",
         "is_fund_like",
     ]
+    if progress is not None:
+        progress("classification cache key: hashing raw holdings")
+    raw_holdings_hash = _hash_frame_for_cache(raw_holdings, columns=holding_cols)
+    if progress is not None:
+        progress("classification cache key: hashing filtered holdings")
+    filtered_holdings_hash = _hash_frame_for_cache(holdings, columns=holding_cols)
+    if progress is not None:
+        progress("classification cache key: hashing monthly returns")
+    prices_hash = _hash_matrix_for_cache(prices)
+    if progress is not None:
+        progress("classification cache key: hashing factors")
+    factors_hash = _hash_matrix_for_cache(factors)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "classification_config_hash": manager_classifier_config_hash(cfg),
         "override_file_hash": manager_override_file_hash(cfg.override_path),
         "manager_classifier_py": _file_hash("manager_classifier.py"),
         "engine_py": _file_hash("engine.py"),
-        "raw_holdings_hash": _hash_frame_for_cache(raw_holdings, columns=holding_cols),
-        "filtered_holdings_hash": _hash_frame_for_cache(holdings, columns=holding_cols),
-        "prices_hash": _hash_matrix_for_cache(prices),
-        "factors_hash": _hash_matrix_for_cache(factors),
+        "raw_holdings_hash": raw_holdings_hash,
+        "filtered_holdings_hash": filtered_holdings_hash,
+        "prices_hash": prices_hash,
+        "factors_hash": factors_hash,
     }
     key = hashlib.sha256(json.dumps(payload, sort_keys=True, default=_json_default).encode("utf-8")).hexdigest()[:16]
     return key, payload
@@ -910,10 +1051,13 @@ def _idiosyncratic_vol_artifacts(
     months,
     live_config: dict,
     required: bool,
+    progress=None,
 ) -> tuple[dict[pd.Timestamp, pd.Series] | None, dict[str, Any]]:
     if not required:
         return None, {"required": False, "note": "no CPS-IR signal requested"}
     t0 = time.perf_counter()
+    progress = progress or _progress_printer(t0)
+    progress(f"idio-vol setup: returns={prices.shape[0]}x{prices.shape[1]}, factors={factors.shape}")
     cache_key, cache_key_payload = _idio_vol_cache_key(
         prices=prices,
         factors=factors,
@@ -940,7 +1084,9 @@ def _idiosyncratic_vol_artifacts(
             cap=float(live_config.get("idio_vol_cap", 0.80)),
             winsor_lower=float(live_config.get("idio_vol_winsor_lower", 0.05)),
             winsor_upper=float(live_config.get("idio_vol_winsor_upper", 0.95)),
+            progress=progress,
         )
+        progress("idio-vol serializing cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
         _idio_vol_cache_to_frame(cache).to_parquet(cache_path, index=False)
         meta_path.write_text(
@@ -977,18 +1123,25 @@ def _manager_filter_artifacts(
     factors: pd.DataFrame,
     visible_versions_cache: dict[pd.Timestamp, pd.DataFrame],
     live_config: dict,
+    progress=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     cfg = ManagerClassifierConfig(
         override_path=str(live_config.get("manager_overrides_path", "data/manager_overrides.csv"))
     )
     overrides = load_manager_overrides(cfg.override_path)
     t0 = time.perf_counter()
+    progress = progress or _progress_printer(t0)
+    progress(
+        f"classification setup: raw_rows={len(raw_holdings):,}, filtered_rows={len(holdings):,}, "
+        f"chars={len(chars):,}, months={len(prices.index)}"
+    )
     cache_key, cache_key_payload = _manager_classification_cache_key(
         raw_holdings=raw_holdings,
         holdings=holdings,
         prices=prices,
         factors=factors,
         cfg=cfg,
+        progress=progress,
     )
     cache_dir = pathlib.Path(live_config.get("manager_classification_cache_dir", "data/processed"))
     cache_path = cache_dir / f"manager_classification.{cache_key}.parquet"
@@ -1008,7 +1161,9 @@ def _manager_filter_artifacts(
             factors,
             visible_versions_cache=visible_versions_cache,
             config=cfg,
+            progress=progress,
         )
+        progress("manager classification serializing parquet cache")
         _write_manager_classification_cache(
             classification,
             cache_path=cache_path,
@@ -1016,6 +1171,7 @@ def _manager_filter_artifacts(
             cache_key_payload=cache_key_payload,
         )
     path = out_dir / "manager_classification.csv"
+    progress(f"manager classification writing audit CSV: {path}")
     classification.to_csv(path, index=False)
     summary = classification_summary(classification)
     summary.update({
@@ -1262,6 +1418,10 @@ def _rebalance_summary_stats(summary: pd.DataFrame) -> dict[str, Any]:
         "stale_period_managers",
         "active_eligible_managers",
         "zero_contributor_managers",
+        "market_cap_covered_names",
+        "market_cap_eligible_managers",
+        "market_cap_mean_book_coverage",
+        "max_distinct_ideas_upper_bound",
         "raw_idea_rows",
         "raw_idea_names",
         "consensus_idea_names",
@@ -1339,6 +1499,19 @@ def _print_rebalance_summary(stats: dict[str, Any]) -> None:
         print(
             "  zero contributor mgrs  "
             f"{_pct(stats.get('zero_contributor_manager_frac', float('nan')))}"
+        )
+    if "avg_market_cap_mean_book_coverage" in stats:
+        print(
+            "  market-cap book cover  "
+            f"avg={_pct(stats.get('avg_market_cap_mean_book_coverage', float('nan')))} | "
+            f"eligible_mgrs={stats.get('avg_market_cap_eligible_managers', float('nan')):.1f} avg | "
+            f"covered_names={stats.get('avg_market_cap_covered_names', float('nan')):.0f} avg"
+        )
+    if "avg_max_distinct_ideas_upper_bound" in stats:
+        print(
+            "  idea count upper bound "
+            f"avg/max={stats.get('avg_max_distinct_ideas_upper_bound', float('nan')):.1f}/"
+            f"{stats.get('max_max_distinct_ideas_upper_bound', float('nan')):.0f}"
         )
     if "avg_stale_managers_dropped" in stats:
         print(
@@ -1419,9 +1592,10 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             min_history_quarters=4,
         ),
         portfolio=PortfolioConfig(
-            idea_signal="active_weight",
-            top_n_ideas=5,
-            min_consensus_funds=2,
+            idea_signal="cps_ir",
+            top_n_ideas=1,
+            idea_aggregation="equal_name",
+            min_consensus_funds=1,
             min_portfolio_names=10,
             max_portfolio_names=30,
             holding_horizon_q=1,
@@ -1430,6 +1604,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             min_active_weight_holdings=10,
         ),
         manager_filter_mode="dedicated_like",
+        active_benchmark_source="manager_held_mcap",
     )
     cfg_b = BacktestConfig(
         universe=UniverseConfig(
@@ -1443,21 +1618,18 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         manager_filter_mode="all",
     )
     axes = {
-        ("backtest", "manager_filter_mode"): ["all", "exclude_dirty", "dedicated_like"],
+        ("backtest", "manager_filter_mode"): ["dedicated_like"],
         ("universe", "aum_band"): [
             ("0.5-5B", 0.5e9, 5e9),
             ("15-30B", 15e9, 30e9),
         ],
         ("portfolio", "idea_signal"): [
             "active_weight",
-            "active_weight_change",
-            "active_weight_initiation",
             "cps_ir",
-            "cps_ir_change",
-            "cps_ir_initiation",
         ],
-        ("portfolio", "top_n_ideas"): [5, 10],
-        ("portfolio", "min_consensus_funds"): [2, 5],
+        ("portfolio", "top_n_ideas"): [1, 3, 5],
+        ("portfolio", "idea_aggregation"): ["equal_name"],
+        ("portfolio", "min_consensus_funds"): [1],
         ("portfolio", "holding_horizon_q"): [0, 1],
         ("portfolio", "min_portfolio_names"): [10],
         ("portfolio", "max_portfolio_names"): [30],
@@ -1507,7 +1679,11 @@ def _print_startup_parameters(
         print(f"  security overrides    {live_cfg.get('security_overrides_path')}")
         print(f"  exclude fund-like     {live_cfg.get('exclude_fund_like_holdings')}")
         print(f"  active benchmark      {live_cfg.get('active_benchmark_source')}")
-        if live_cfg.get("active_benchmark_source") not in {"visible_13f_aggregate", "13f_aggregate"}:
+        if live_cfg.get("active_benchmark_source") == "manager_held_mcap":
+            print(f"  market-cap cache      {live_cfg.get('market_cap_cache_path')}")
+            print(f"  market-cap stale d    {live_cfg.get('market_cap_max_stale_days')}")
+            print(f"  market-cap auto fetch {live_cfg.get('market_cap_auto_download')}")
+        elif live_cfg.get("active_benchmark_source") not in {"visible_13f_aggregate", "13f_aggregate"}:
             print(f"  active bench weights  {live_cfg.get('active_benchmark_weights_path')}")
             print(f"  active bench stale d  {live_cfg.get('active_benchmark_max_stale_days')}")
         if equity_only:
@@ -1539,6 +1715,7 @@ def _print_startup_parameters(
         print(
             "  thesis portfolio      "
             f"idea_signal={p.idea_signal}, top_n_ideas={p.top_n_ideas}, "
+            f"idea_aggregation={p.idea_aggregation or ('score' if p.consensus_weight else 'manager_count')}, "
             f"min_consensus={p.min_consensus_funds}, holding_horizon_q={p.holding_horizon_q}, "
             f"min_portfolio_names={p.min_portfolio_names}, max_portfolio_names={p.max_portfolio_names}, "
             f"max_name={p.max_name_weight:.1%}, max_issuer={p.max_issuer_weight:.1%}, "
@@ -1609,9 +1786,9 @@ def run(
     cfg_a = replace(
         cfg_a,
         active_benchmark_source=(
-            live_config.get("active_benchmark_source", "visible_13f_aggregate")
+            live_config.get("active_benchmark_source", "manager_held_mcap")
             if mode == "live"
-            else "visible_13f_aggregate"
+            else "manager_held_mcap"
         ),
     )
     _preflight_active_benchmark_inputs(mode=mode, live_config=live_config, cfg=cfg_a)
@@ -1633,7 +1810,7 @@ def run(
         live_config=live_config,
     )
     if mode == "synthetic":
-        holdings, prices, factors, value_scores, bench_w, bench_ret = build_synthetic_data()
+        holdings, prices, factors, value_scores, bench_w, bench_ret, signal_prices = build_synthetic_data()
     elif mode == "live-smoke":
         return run_live_smoke(
             output_root,
@@ -1642,47 +1819,102 @@ def run(
             cfg=live_config,
         )
     else:
-        holdings, prices, factors, value_scores, bench_w, bench_ret = build_live_data(live_config)
+        holdings, prices, factors, value_scores, bench_w, bench_ret, signal_prices = build_live_data(live_config)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = output_root / run_id
     out_dir.mkdir(parents=True, exist_ok=False)
     print(f"[output] Writing incremental reports under {out_dir}")
 
-    print("[2/6] Computing per-manager characteristics")
+    print("[2/6] Building manager research artifacts", flush=True)
+    stage2_started = time.perf_counter()
+    stage2_log_path = out_dir / "stage2_progress.log"
+    progress = _progress_printer(stage2_started, stage2_log_path)
+    progress(f"stage 2 log initialized: {stage2_log_path}")
+    # A DataFrame stored inside attrs may be deep-copied by ordinary pandas
+    # operations. Detach the raw classification book before characteristics to
+    # prevent repeated copies of hundreds of thousands of holding rows.
+    raw_holdings_for_classification = holdings.attrs.pop("raw_mapped_holdings", None)
+    if raw_holdings_for_classification is None:
+        raw_holdings_for_classification = holdings
+        progress("raw mapped holdings not attached; classification will use filtered holdings")
+    else:
+        progress(
+            f"detached raw mapped holdings rows={len(raw_holdings_for_classification):,} "
+            f"from filtered rows={len(holdings):,}"
+        )
+    progress(
+        f"2a/5 characteristics starting: holdings_shallow={_frame_shallow_mb(holdings):,.1f}MB, "
+        f"raw_shallow={_frame_shallow_mb(raw_holdings_for_classification):,.1f}MB"
+    )
     t_step = time.perf_counter()
-    chars = manager_characteristics(holdings, bench_w)
-    print(f"    {len(chars)} manager-filing-version rows in {time.perf_counter() - t_step:.1f}s")
+    try:
+        chars = manager_characteristics(holdings, bench_w, progress=progress)
+    except Exception as exc:
+        progress(f"2a/5 characteristics FAILED: {type(exc).__name__}: {exc}")
+        raise
+    progress(
+        f"2a/5 characteristics done: rows={len(chars):,}, shallow={_frame_shallow_mb(chars):,.1f}MB, "
+        f"step={time.perf_counter() - t_step:.1f}s"
+    )
+    progress("2b/5 visible-version snapshots starting")
     t_step = time.perf_counter()
-    visible_cache = build_visible_versions_cache(chars, prices.index)
-    print(f"    {len(visible_cache)} month-end visible-version snapshots in {time.perf_counter() - t_step:.1f}s")
-    raw_holdings_for_classification = holdings.attrs.get("raw_mapped_holdings", holdings)
+    try:
+        visible_cache = build_visible_versions_cache(chars, prices.index, progress=progress)
+    except Exception as exc:
+        progress(f"2b/5 visible snapshots FAILED: {type(exc).__name__}: {exc}")
+        raise
+    progress(
+        f"2b/5 visible snapshots done: months={len(visible_cache)}, "
+        f"rows={sum(len(x) for x in visible_cache.values()):,}, step={time.perf_counter() - t_step:.1f}s"
+    )
+    progress("2c/5 manager classification/cache starting")
     manager_classification, manager_overrides, manager_classification_summary = _manager_filter_artifacts(
         out_dir=out_dir,
         raw_holdings=raw_holdings_for_classification,
         holdings=holdings,
         chars=chars,
-        prices=prices,
+        prices=signal_prices,
         factors=factors,
         visible_versions_cache=visible_cache,
         live_config=live_config,
+        progress=progress,
     )
+    progress("2c/5 manager classification/cache done")
+    del raw_holdings_for_classification
+    progress("2d/5 security issuer groups starting")
     security_groups = load_security_groups(
         prices.columns,
         live_config.get("security_overrides_path", "data/security_overrides.csv"),
     )
-    active_benchmark_weights_by_month = _load_active_benchmark_weights_by_month(
+    progress(f"2d/5 security issuer groups done: groups={security_groups.nunique():,}")
+    progress("2e/5 active benchmark and idio-vol caches starting")
+    active_benchmark_weights_by_month, active_benchmark_summary = _load_active_benchmark_weights_by_month(
         live_config=live_config,
         months=prices.index,
+        tickers=prices.columns,
         cfg=cfg_a,
+        mode=mode,
     )
+    if active_benchmark_weights_by_month is not None:
+        coverage_path = out_dir / "active_benchmark_coverage_by_month.csv"
+        pd.DataFrame(
+            [
+                {"month_end": month, "covered_tickers": len(values)}
+                for month, values in sorted(active_benchmark_weights_by_month.items())
+            ]
+        ).to_csv(coverage_path, index=False)
+        active_benchmark_summary["coverage_output"] = str(coverage_path)
+        progress(f"active benchmark coverage saved: {coverage_path}")
     idiosyncratic_vol_by_month, idio_vol_summary = _idiosyncratic_vol_artifacts(
-        prices=prices,
+        prices=signal_prices,
         factors=factors,
         months=prices.index,
         live_config=live_config,
         required=_signals_need_idiosyncratic_vol([cfg_a, cfg_b], None if skip_sweep else axes),
+        progress=progress,
     )
+    progress(f"stage 2 complete in {time.perf_counter() - stage2_started:.1f}s")
 
     print("[3/6] Running thesis and placebo backtests")
     t_step = time.perf_counter()
@@ -1752,6 +1984,7 @@ def run(
         "mode": mode,
         "cfg_thesis": asdict(cfg_a),
         "cfg_placebo": asdict(cfg_b),
+        "active_benchmark": active_benchmark_summary,
         "sweep_axes": {f"{scope}.{field}": values for (scope, field), values in axes.items()},
         "metrics": {"thesis": att_a, "placebo": att_b},
         "rebalance_summary_stats": stage3_stats,
@@ -1990,6 +2223,7 @@ def run(
         "live_config": live_config if mode == "live" else None,
         "cfg_thesis": asdict(cfg_a),
         "cfg_placebo": asdict(cfg_b),
+        "active_benchmark": active_benchmark_summary,
         "sweep_axes": {f"{scope}.{field}": values for (scope, field), values in axes.items()},
         "dashboard_parameter_summary": dashboard_params,
         "input_summary": {
@@ -2019,11 +2253,45 @@ def run(
         },
         "metrics": {"thesis": att_a, "placebo": att_b, "dsr": dsr},
         "rebalance_summary_stats": rebalance_outputs.get("summary_stats"),
-        "outputs": {"dashboard": dashboard_path, "rebalance_thesis": rebalance_outputs, "sweep": sweep_outputs},
+        "outputs": {
+            "dashboard": dashboard_path,
+            "rebalance_thesis": rebalance_outputs,
+            "sweep": sweep_outputs,
+            "stage2_progress_log": str(stage2_log_path),
+        },
     }
-    write_manifest(out_dir / "manifest.json", manifest_payload)
+    manifest_path = out_dir / "manifest.json"
+    write_manifest(manifest_path, manifest_payload)
+    if not skip_sweep:
+        manifest_for_html = json.loads(manifest_path.read_text(encoding="utf-8"))
+        input_summary_for_html = dict(manifest_for_html.get("input_summary") or {})
+        input_summary_for_html["mapping"] = input_summary_for_html.get("mapping_diagnostics") or {}
+        rules_for_html = json.loads(pathlib.Path(rebalance_outputs["rules"]).read_text(encoding="utf-8"))
+        portfolio_config_id = _sweep_config_id_for_cfg(grid, axes, cfg_a)
+        interactive_results(
+            grid,
+            grid.attrs.get("returns_by_config_id") or {},
+            benchmark=bench_ret,
+            path=sweep_outputs["interactive_html"],
+            portfolio_holdings=pd.read_csv(rebalance_outputs["holdings"]),
+            rebalance_summary=pd.read_csv(rebalance_outputs["summary"]),
+            portfolio_config_id=portfolio_config_id,
+            meta_payload={
+                "benchmarkName": getattr(bench_ret, "name", None),
+                "thesisConfigId": portfolio_config_id,
+                "configHash": manifest_for_html.get("config_hash"),
+                "gitSha": manifest_for_html.get("git_sha"),
+                "runTimestampUtc": manifest_for_html.get("run_timestamp_utc"),
+                "dashboardParameterSummary": dashboard_params,
+                "metrics": manifest_for_html.get("metrics") or {},
+                "rebalanceSummaryStats": manifest_for_html.get("rebalance_summary_stats") or {},
+                "inputSummary": input_summary_for_html,
+                "rules": rules_for_html,
+            },
+        )
+        print(f"  Enriched interactive HTML with thesis holdings: {sweep_outputs['interactive_html']}")
     print(f"  Saved dashboard: {dashboard_path}")
-    print(f"  Saved manifest:  {out_dir / 'manifest.json'}")
+    print(f"  Saved manifest:  {manifest_path}")
     return out_dir
 
 
@@ -2058,9 +2326,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--active-benchmark-source",
-        choices=["visible_13f_aggregate", "spy_holdings"],
+        choices=["manager_held_mcap", "visible_13f_aggregate", "spy_holdings"],
         default=None,
-        help="Benchmark used for active_weight/CPS-IR signals. visible_13f_aggregate is a diagnostic peer-13F proxy.",
+        help=(
+            "Benchmark used for active_weight/CPS-IR signals. manager_held_mcap is the default; "
+            "visible_13f_aggregate is only a diagnostic peer-13F proxy."
+        ),
     )
     parser.add_argument(
         "--active-benchmark-weights",

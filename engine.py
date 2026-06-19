@@ -53,6 +53,7 @@ class PortfolioConfig:
     top_n_ideas: int = 8
     idea_signal: str = "level"              # "level" | "change" | "initiation" | active-weight variants
     consensus_weight: bool = True
+    idea_aggregation: str | None = None      # "score" | "manager_count" | "equal_name"; None keeps legacy boolean
     min_consensus_funds: int = 1            # drop names held by < this many in-universe funds
     min_portfolio_names: int = 0            # mark a rebalance invalid/cash if fewer target names survive
     max_portfolio_names: int | None = None  # cap final aggregate target before weight caps
@@ -149,6 +150,10 @@ def _uses_visible_13f_active_benchmark(cfg: BacktestConfig | str | None) -> bool
     return _active_benchmark_source(cfg) in {"visible_13f_aggregate", "13f_aggregate"}
 
 
+def _uses_manager_held_mcap_benchmark(cfg: BacktestConfig | str | None) -> bool:
+    return _active_benchmark_source(cfg) == "manager_held_mcap"
+
+
 def _active_benchmark_for_month(
     cfg: BacktestConfig,
     month,
@@ -209,6 +214,25 @@ def _require_idiosyncratic_vol(
     if vol.empty:
         raise ValueError(f"{cfg.idea_signal} requires positive PIT idiosyncratic volatility")
     return vol
+
+
+def _manager_held_mcap_weights(
+    manager_weights: pd.Series,
+    market_caps: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    """Align a manager book to covered names and market-cap weight that subset."""
+    manager = pd.Series(manager_weights, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    caps = pd.Series(market_caps, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    manager = manager[manager > 0]
+    caps = caps[caps > 0]
+    covered = manager.index.intersection(caps.index)
+    if len(covered) == 0:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    manager = manager.reindex(covered)
+    manager = manager / manager.sum()
+    benchmark = caps.reindex(covered)
+    benchmark = benchmark / benchmark.sum()
+    return manager.sort_index(), benchmark.sort_index()
 
 
 def _idiosyncratic_vol_for_month(
@@ -291,6 +315,7 @@ def build_idiosyncratic_vol_cache(
     cap: float = 0.80,
     winsor_lower: float = 0.05,
     winsor_upper: float = 0.95,
+    progress=None,
 ) -> dict[pd.Timestamp, pd.Series]:
     """Build month -> PIT CAPM residual-vol series for CPS-style idea ranking.
 
@@ -311,10 +336,12 @@ def build_idiosyncratic_vol_cache(
     else:
         month_index = pd.Index(pd.to_datetime(months)).to_period("M").to_timestamp("M").sort_values()
     out: dict[pd.Timestamp, pd.Series] = {}
-    for month in month_index:
+    for month_number, month in enumerate(month_index, start=1):
         hist_idx = rets.index[rets.index < pd.Timestamp(month)]
         if len(hist_idx) <= 0:
             out[pd.Timestamp(month)] = pd.Series(dtype=float)
+            if progress is not None and (month_number == 1 or month_number % 12 == 0 or month_number == len(month_index)):
+                progress(f"idio-vol month {month_number}/{len(month_index)} asof={pd.Timestamp(month).date()} covered=0")
             continue
         hist_idx = hist_idx[-int(window_months):]
         vol = _capm_residual_vol_window(
@@ -334,18 +361,27 @@ def build_idiosyncratic_vol_cache(
                 vol = vol.clip(upper=float(cap))
             vol = vol[vol > 0]
         out[pd.Timestamp(month)] = vol.sort_index()
+        if progress is not None and (month_number == 1 or month_number % 12 == 0 or month_number == len(month_index)):
+            progress(
+                f"idio-vol month {month_number}/{len(month_index)} "
+                f"asof={pd.Timestamp(month).date()} covered={len(vol)}"
+            )
     return out
 
 
 def _versioned_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
+    missing_accession = "accession_number" not in holdings.columns
+    missing_submission = "submission_type" not in holdings.columns
+    if not missing_accession and not missing_submission:
+        return holdings
     h = holdings.copy()
-    if "accession_number" not in h.columns:
+    if missing_accession:
         h["accession_number"] = (
             h["manager"].astype("string") + "|" +
             h["period_date"].astype("string") + "|" +
             h["filing_date"].astype("string")
         )
-    if "submission_type" not in h.columns:
+    if missing_submission:
         h["submission_type"] = pd.NA
     return h
 
@@ -403,27 +439,94 @@ def _selection_cache_diagnostics(selected_versions: pd.DataFrame) -> dict:
     }
 
 
-def build_visible_versions_cache(chars: pd.DataFrame, months) -> dict[pd.Timestamp, pd.DataFrame]:
+def build_visible_versions_cache(chars: pd.DataFrame, months, *, progress=None) -> dict[pd.Timestamp, pd.DataFrame]:
     """Cache latest visible manager filing versions for each month/asof."""
-    return {pd.Timestamp(m): _visible_manager_versions(chars, pd.Timestamp(m)) for m in pd.Index(months).sort_values()}
+    ordered_months = pd.Index(months).sort_values()
+    out: dict[pd.Timestamp, pd.DataFrame] = {}
+    for month_number, month in enumerate(ordered_months, start=1):
+        asof = pd.Timestamp(month)
+        out[asof] = _visible_manager_versions(chars, asof)
+        if progress is not None and (month_number == 1 or month_number % 12 == 0 or month_number == len(ordered_months)):
+            progress(
+                f"visible snapshot {month_number}/{len(ordered_months)} "
+                f"asof={asof.date()} managers={len(out[asof])}"
+            )
+    return out
 
 
 def manager_characteristics(holdings: pd.DataFrame,
-                            benchmark_weights: pd.Series | None = None) -> pd.DataFrame:
+                            benchmark_weights: pd.Series | None = None,
+                            *,
+                            progress=None) -> pd.DataFrame:
+    started = time.perf_counter()
     holdings = _versioned_holdings(holdings)
-    rows = []
     group_cols = ["manager", "period_date", "filing_date", "accession_number"]
-    for (mgr, period, filing_date, accession), g in holdings.groupby(group_cols, dropna=False):
-        w = _book_weights(g)
-        sh = g.get("sec_type", pd.Series("SH", index=g.index)).fillna("SH")
-        aum = g.loc[sh == "SH", "value"].sum()
-        tot = g["value"].sum()
-        put_w = g.loc[sh == "PUT", "value"].sum() / tot if tot > 0 else 0.0
+    required = set(group_cols).union({"ticker", "value", "submission_type"})
+    missing = sorted(required.difference(holdings.columns))
+    if missing:
+        raise ValueError(f"manager_characteristics missing columns: {missing}")
+    work_cols = group_cols + ["ticker", "value", "submission_type"]
+    if "sec_type" in holdings:
+        work_cols.append("sec_type")
+    work = holdings.loc[:, work_cols].copy()
+    work["value"] = pd.to_numeric(work["value"], errors="raise")
+    sec_type = work["sec_type"].fillna("SH") if "sec_type" in work else pd.Series("SH", index=work.index)
+    work["_sh_value"] = work["value"].where(sec_type.eq("SH"), 0.0)
+    work["_put_value"] = work["value"].where(sec_type.eq("PUT"), 0.0)
+    stats = (
+        work.groupby(group_cols, dropna=False, sort=False)
+        .agg(
+            submission_type=("submission_type", "first"),
+            aum=("_sh_value", "sum"),
+            total_value=("value", "sum"),
+            put_value=("_put_value", "sum"),
+        )
+        .reset_index()
+    )
+    group_count = len(stats)
+    if progress is not None:
+        progress(
+            f"characteristics input rows={len(holdings):,}, managers={holdings['manager'].nunique():,}, "
+            f"filing_versions={group_count:,}"
+        )
+
+    ticker_values = (
+        work.loc[sec_type.eq("SH")]
+        .groupby(group_cols + ["ticker"], dropna=False, sort=False)["value"]
+        .sum()
+    )
+    if not ticker_values.empty:
+        book_totals = ticker_values.groupby(level=list(range(len(group_cols)))).transform("sum")
+        ticker_weights = ticker_values.where(book_totals.le(0), ticker_values / book_totals)
+    else:
+        ticker_weights = ticker_values.astype(float)
+
+    def normalized_key(values) -> tuple:
+        values = values if isinstance(values, tuple) else (values,)
+        return tuple("<NA>" if pd.isna(value) else value for value in values)
+
+    books: dict[tuple, pd.Series] = {}
+    book_groups = ticker_weights.groupby(level=list(range(len(group_cols))), sort=False)
+    for book_number, (key, weights) in enumerate(book_groups, start=1):
+        ticker_index = weights.index.get_level_values("ticker")
+        books[normalized_key(key)] = pd.Series(weights.to_numpy(dtype=float), index=ticker_index, dtype=float)
+        if progress is not None and (book_number % 2500 == 0 or book_number == book_groups.ngroups):
+            progress(
+                f"characteristics books {book_number:,}/{group_count:,} "
+                f"({time.perf_counter() - started:.1f}s)"
+            )
+
+    rows = []
+    for record in stats.itertuples(index=False):
+        key = tuple(getattr(record, col) for col in group_cols)
+        w = books.get(normalized_key(key), pd.Series(dtype=float))
+        tot = float(record.total_value)
+        put_w = float(record.put_value) / tot if tot > 0 else 0.0
         top10 = w.sort_values(ascending=False).head(10).sum()
-        rows.append(dict(manager=mgr, period_date=period, filing_date=filing_date,
-                         accession_number=accession,
-                         submission_type=g["submission_type"].iloc[0],
-                         aum=aum, n_holdings=int((w > 0).sum()), top10_weight=top10,
+        rows.append(dict(manager=record.manager, period_date=record.period_date, filing_date=record.filing_date,
+                         accession_number=record.accession_number,
+                         submission_type=record.submission_type,
+                         aum=float(record.aum), n_holdings=int((w > 0).sum()), top10_weight=top10,
                          put_weight=put_w, active_share=_active_share(w, benchmark_weights),
                          bw=w))
     cols = [
@@ -443,25 +546,41 @@ def manager_characteristics(holdings: pd.DataFrame,
     # period available in the full dataset. If a prior period is amended after a
     # decision date, this can leak a small amount of post-asof information into
     # the turnover screen. Fix later by computing turnover as-of each rebalance.
-    turn = pd.Series(np.nan, index=chars.index, dtype=float)
-    prev_bw = pd.Series([None] * len(chars), index=chars.index, dtype=object)
-    for _, g in chars.groupby("manager", sort=False):
-        prev_period_bw = None
-        current_period = None
-        current_period_latest_bw = None
-        for idx, r in g.iterrows():
-            if current_period is None or r["period_date"] != current_period:
-                prev_period_bw = current_period_latest_bw
-                current_period = r["period_date"]
-            if prev_period_bw is not None:
-                prev_bw.at[idx] = prev_period_bw
-                alln = r["bw"].index.union(prev_period_bw.index)
-                a = r["bw"].reindex(alln).fillna(0.0)
-                b = prev_period_bw.reindex(alln).fillna(0.0)
-                turn.loc[idx] = 1.0 - np.minimum(a, b).sum()
-            current_period_latest_bw = r["bw"]
-    chars["prev_bw"] = prev_bw
-    chars["turnover"] = turn
+    latest_period = chars.groupby(["manager", "period_date"], sort=False, as_index=False).tail(1).copy()
+    latest_period["prev_bw"] = latest_period.groupby("manager", sort=False)["bw"].shift(1)
+    previous_table = latest_period[["manager", "period_date", "prev_bw"]]
+    chars["_row_order"] = np.arange(len(chars))
+    chars = (
+        chars.merge(previous_table, on=["manager", "period_date"], how="left", sort=False, validate="many_to_one")
+        .sort_values("_row_order")
+        .drop(columns="_row_order")
+        .reset_index(drop=True)
+    )
+    chars["prev_bw"] = pd.Series(
+        [value if isinstance(value, pd.Series) else None for value in chars["prev_bw"]],
+        index=chars.index,
+        dtype=object,
+    )
+
+    def overlap_turnover(current_bw, previous_bw) -> float:
+        if not isinstance(previous_bw, pd.Series):
+            return np.nan
+        all_names = current_bw.index.union(previous_bw.index)
+        current = current_bw.reindex(all_names).fillna(0.0)
+        previous = previous_bw.reindex(all_names).fillna(0.0)
+        return float(1.0 - np.minimum(current, previous).sum())
+
+    chars["turnover"] = [
+        overlap_turnover(current, previous)
+        for current, previous in zip(chars["bw"], chars["prev_bw"])
+    ]
+    if progress is not None:
+        progress(
+            f"characteristics turnover complete managers={chars['manager'].nunique():,} "
+            f"({time.perf_counter() - started:.1f}s)"
+        )
+    if progress is not None:
+        progress(f"characteristics complete rows={len(chars):,} ({time.perf_counter() - started:.1f}s)")
     return chars
 
 
@@ -637,6 +756,7 @@ def _idea_scores(
     active_benchmark_weights: pd.Series | None = None,
     idiosyncratic_vol: pd.Series | None = None,
     eligible_tickers=None,
+    active_benchmark_source: str = "visible_13f_aggregate",
 ) -> pd.Series:
     if eligible_tickers is not None:
         eligible = pd.Index(eligible_tickers).astype(str).str.upper()
@@ -658,7 +778,17 @@ def _idea_scores(
         bench = _require_active_benchmark_weights(cfg, active_benchmark_weights)
         if int((cur > 0).sum()) < cfg.min_active_weight_holdings:
             return pd.Series(dtype=float)
-        active_cur = (cur - bench.reindex(cur.index).fillna(0.0)).clip(lower=0)
+        if _uses_manager_held_mcap_benchmark(active_benchmark_source):
+            # Market-cap data is never zero-filled. A manager's benchmark is
+            # the market-cap-weighted portfolio of the names it actually held.
+            cur, held_bench = _manager_held_mcap_weights(cur, bench)
+            if len(cur) < cfg.min_active_weight_holdings:
+                return pd.Series(dtype=float)
+            if held_bench.empty:
+                return pd.Series(dtype=float)
+            active_cur = (cur - held_bench).clip(lower=0)
+        else:
+            active_cur = (cur - bench.reindex(cur.index).fillna(0.0)).clip(lower=0)
         if cfg.idea_signal == "active_weight":
             s = active_cur
         elif cfg.idea_signal == "active_weight_change":
@@ -701,6 +831,7 @@ def target_weights_from_versions(
     idiosyncratic_vol: pd.Series | None = None,
     eligible_tickers=None,
     return_diagnostics: bool = False,
+    active_benchmark_source: str = "visible_13f_aggregate",
 ) -> pd.Series:
     diagnostics = {
         "selected_managers": int(len(latest_versions)),
@@ -711,6 +842,10 @@ def target_weights_from_versions(
         "consensus_idea_names": 0,
         "target_names_before_caps": 0,
         "idio_vol_covered_names": 0,
+        "market_cap_covered_names": 0,
+        "market_cap_eligible_managers": 0,
+        "market_cap_mean_book_coverage": np.nan,
+        "max_distinct_ideas_upper_bound": int(len(latest_versions) * max(int(cfg.top_n_ideas), 0)),
     }
     if latest_versions.empty:
         empty = pd.Series(dtype=float)
@@ -719,8 +854,12 @@ def target_weights_from_versions(
     idiosyncratic_vol = _require_idiosyncratic_vol(cfg, idiosyncratic_vol)
     if idiosyncratic_vol is not None:
         diagnostics["idio_vol_covered_names"] = int(len(idiosyncratic_vol))
+    if _uses_manager_held_mcap_benchmark(active_benchmark_source) and active_benchmark_weights is not None:
+        diagnostics["market_cap_covered_names"] = int(len(active_benchmark_weights))
     score: dict[str, float] = {}
+    max_score: dict[str, float] = {}
     count: dict[str, int] = {}
+    market_cap_book_coverages: list[float] = []
     for cur_row in latest_versions.itertuples(index=False):
         cur = getattr(cur_row, "bw")
         prev = getattr(cur_row, "prev_bw", None)
@@ -730,14 +869,33 @@ def target_weights_from_versions(
             cur_diag = cur[cur.index.astype(str).str.upper().isin(eligible)]
         if _needs_active_benchmark_weights(cfg.idea_signal) and int((cur_diag > 0).sum()) >= cfg.min_active_weight_holdings:
             diagnostics["active_eligible_managers"] += 1
-        picks = _idea_scores(cur, prev, cfg, active_benchmark_weights, idiosyncratic_vol, eligible_tickers)
+        if _uses_manager_held_mcap_benchmark(active_benchmark_source) and active_benchmark_weights is not None:
+            covered_names = cur_diag.index.intersection(active_benchmark_weights.index)
+            market_cap_book_coverages.append(float(cur_diag.reindex(covered_names).sum()))
+            if len(covered_names) >= cfg.min_active_weight_holdings:
+                diagnostics["market_cap_eligible_managers"] += 1
+        picks = _idea_scores(
+            cur,
+            prev,
+            cfg,
+            active_benchmark_weights,
+            idiosyncratic_vol,
+            eligible_tickers,
+            active_benchmark_source,
+        )
         if picks.empty:
             diagnostics["zero_contributor_managers"] += 1
         diagnostics["raw_idea_rows"] += int(len(picks))
         for tkr, wt in picks.items():
-            score[tkr] = score.get(tkr, 0.0) + (float(wt) if cfg.consensus_weight else 1.0)
+            aggregation = cfg.idea_aggregation or ("score" if cfg.consensus_weight else "manager_count")
+            if aggregation not in {"score", "manager_count", "equal_name"}:
+                raise ValueError(f"unknown idea_aggregation={aggregation!r}")
+            score[tkr] = score.get(tkr, 0.0) + (float(wt) if aggregation == "score" else 1.0)
+            max_score[tkr] = max(max_score.get(tkr, float("-inf")), float(wt))
             count[tkr] = count.get(tkr, 0) + 1
     diagnostics["raw_idea_names"] = int(len(score))
+    if market_cap_book_coverages:
+        diagnostics["market_cap_mean_book_coverage"] = float(np.mean(market_cap_book_coverages))
     s = pd.Series(score)
     if s.empty:
         return (s, diagnostics) if return_diagnostics else s
@@ -747,9 +905,17 @@ def target_weights_from_versions(
     diagnostics["consensus_idea_names"] = int(len(s))
     if s.empty:
         return (s, diagnostics) if return_diagnostics else s
+    aggregation = cfg.idea_aggregation or ("score" if cfg.consensus_weight else "manager_count")
+    if aggregation == "equal_name":
+        # Duplicated manager picks satisfy an optional consensus gate but do
+        # not receive extra portfolio weight. Max conviction is used only to
+        # choose names when max_portfolio_names binds.
+        s = pd.Series(max_score, dtype=float).reindex(s.index)
     if cfg.max_portfolio_names is not None and cfg.max_portfolio_names > 0:
         s = s.sort_values(ascending=False).head(cfg.max_portfolio_names)
     diagnostics["target_names_before_caps"] = int(len(s))
+    if aggregation == "equal_name":
+        s = pd.Series(1.0, index=s.index, dtype=float)
     target = _cap_weights(s, cfg.max_name_weight)
     return (target, diagnostics) if return_diagnostics else target
 
@@ -1005,6 +1171,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
             idiosyncratic_vol,
             eligible_tickers=priced_now,
             return_diagnostics=True,
+            active_benchmark_source=cfg.active_benchmark_source,
         )
         target_names_before_price_filter = int(len(tgt))
         tgt = tgt[tgt.index.isin(priced_now)]
@@ -1030,6 +1197,10 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
                 "target_names_before_price_filter": target_names_before_price_filter,
                 "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
                 "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
+                "market_cap_covered_names": int(idea_diag["market_cap_covered_names"]),
+                "market_cap_eligible_managers": int(idea_diag["market_cap_eligible_managers"]),
+                "market_cap_mean_book_coverage": float(idea_diag["market_cap_mean_book_coverage"]),
+                "max_distinct_ideas_upper_bound": int(idea_diag["max_distinct_ideas_upper_bound"]),
                 "effective_names": int(len(eff)),
                 "carried_names": 0,
                 "valid_rebalance": False,
@@ -1157,6 +1328,7 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                 idiosyncratic_vol,
                 eligible_tickers=priced_now,
                 return_diagnostics=True,
+                active_benchmark_source=cfg.active_benchmark_source,
             )
             target_names_before_price_filter = len(tgt)
             tgt = tgt[tgt.index.isin(priced_now)]
@@ -1194,6 +1366,10 @@ def run_backtest(holdings, prices, cfg: BacktestConfig,
                     "target_names_before_price_filter": int(target_names_before_price_filter),
                     "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
                     "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
+                    "market_cap_covered_names": int(idea_diag["market_cap_covered_names"]),
+                    "market_cap_eligible_managers": int(idea_diag["market_cap_eligible_managers"]),
+                    "market_cap_mean_book_coverage": float(idea_diag["market_cap_mean_book_coverage"]),
+                    "max_distinct_ideas_upper_bound": int(idea_diag["max_distinct_ideas_upper_bound"]),
                     "effective_names": int(len(cur)),
                     "valid_rebalance": not bool(invalid_reason),
                     "turnover_one_way": float(traded),
@@ -1334,6 +1510,7 @@ def run_backtest_from_selection_cache(
                 idiosyncratic_vol,
                 eligible_tickers=priced_now,
                 return_diagnostics=True,
+                active_benchmark_source=cfg.active_benchmark_source,
             )
             target_names_before_price_filter = len(tgt)
             tgt = tgt[tgt.index.isin(priced_now)]
@@ -1371,6 +1548,10 @@ def run_backtest_from_selection_cache(
                     "target_names_before_price_filter": int(target_names_before_price_filter),
                     "target_names_before_caps": int(idea_diag["target_names_before_caps"]),
                     "idio_vol_covered_names": int(idea_diag["idio_vol_covered_names"]),
+                    "market_cap_covered_names": int(idea_diag["market_cap_covered_names"]),
+                    "market_cap_eligible_managers": int(idea_diag["market_cap_eligible_managers"]),
+                    "market_cap_mean_book_coverage": float(idea_diag["market_cap_mean_book_coverage"]),
+                    "max_distinct_ideas_upper_bound": int(idea_diag["max_distinct_ideas_upper_bound"]),
                     "effective_names": int(len(cur)),
                     "valid_rebalance": not bool(invalid_reason),
                     "turnover_one_way": float(traded),
@@ -1413,8 +1594,21 @@ def attribution(port_ret, factors, benchmark=None,
         "n_months": len(df),
         "ann_return": (1 + df["ret"]).prod() ** (12 / len(df)) - 1,
         "ann_vol": df["ret"].std() * np.sqrt(12),
-        "sharpe": (y_basic.mean() / y_basic.std()) * np.sqrt(12) if y_basic.std() else np.nan,
+        "sharpe": (
+            (y_basic.mean() / y_basic.std()) * np.sqrt(12)
+            if pd.notna(y_basic.std()) and y_basic.std() > 1e-12 else np.nan
+        ),
     }
+    if df["ret"].abs().max() <= 1e-12:
+        out["note"] = "all-cash or constant-zero return stream; factor alpha is not meaningful"
+        if benchmark is not None:
+            active = pd.concat([df["ret"], benchmark.reindex(df.index).rename("bench")], axis=1).dropna()
+            active = active["ret"] - active["bench"]
+            out["ir_vs_benchmark"] = (
+                (active.mean() / active.std()) * np.sqrt(12)
+                if pd.notna(active.std()) and active.std() > 1e-12 else np.nan
+            )
+        return out
     missing_factor_cols = [c for c in factor_cols if c not in df.columns]
     if "RF" not in df.columns or missing_factor_cols:
         out["note"] = "factor regression unavailable"

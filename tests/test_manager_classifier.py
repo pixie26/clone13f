@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 import run_example as rex
+import manager_classifier as mc
 from engine import BacktestConfig, PortfolioConfig, UniverseConfig, manager_characteristics, run_backtest
 from manager_classifier import (
     ManagerClassifierConfig,
@@ -165,6 +166,32 @@ def test_factor_r2_renormalizes_partial_price_history():
 
     assert status == "ok"
     assert r2 > 0.99
+
+
+def test_factor_r2_is_computed_once_per_visible_filing_version(monkeypatch):
+    months = pd.date_range("2020-05-31", periods=8, freq="ME")
+    holdings = pd.DataFrame(
+        [
+            _row("1", "Stable Filing Manager", "2020-03-31", "2020-05-15", "a1", "AAPL", 60),
+            _row("1", "Stable Filing Manager", "2020-03-31", "2020-05-15", "a1", "MSFT", 40),
+        ]
+    )
+    chars = manager_characteristics(holdings)
+    prices = pd.DataFrame({"AAPL": 0.01, "MSFT": 0.02}, index=months)
+    calls = []
+
+    def fake_factor_r2(book, prices, factors, asof, cfg):
+        calls.append(pd.Timestamp(asof))
+        return 0.95, "ok"
+
+    monkeypatch.setattr(mc, "_factor_r2", fake_factor_r2)
+
+    result = build_manager_classification(holdings, holdings, chars, months, prices, _factors(months))
+
+    assert len(result) == len(months)
+    assert len(calls) == 1
+    assert result.attrs["factor_r2_regressions_computed"] == 1
+    assert not result["manager_style"].eq("quant_like").any()
 
 
 def test_persistence_counts_calendar_quarters_not_rebalance_events():

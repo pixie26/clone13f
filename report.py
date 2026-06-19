@@ -7,6 +7,8 @@ alpha, marginal-IR ablation, parameter plateau heatmap, and OOS/DSR scorecard.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
 import matplotlib
 import numpy as np
 import pandas as pd
@@ -20,6 +22,12 @@ A_C = "#0b6e4f"
 B_C = "#b0413e"
 BM_C = "#9aa0a6"
 ACC = "#c79a3a"
+INTERACTIVE_TEMPLATE = Path(__file__).with_name("interactive_results_template.html")
+_INTERACTIVE_TOKENS = {
+    "data": "__DATA_PAYLOAD__",
+    "portfolio": "__PORTFOLIO_PAYLOAD__",
+    "meta": "__META_PAYLOAD__",
+}
 
 
 def _format_param_lines(parameter_summary) -> list[str]:
@@ -241,13 +249,200 @@ def _drawdown(returns: pd.Series) -> pd.Series:
     return growth / growth.cummax() - 1
 
 
+def _json_sanitize(value):
+    if isinstance(value, dict):
+        return {str(key): _json_sanitize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(item) for item in value]
+    if isinstance(value, (np.integer, np.floating)):
+        value = value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if value is None or (isinstance(value, (float, np.floating)) and not np.isfinite(value)):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _json_for_html(value) -> str:
+    return (
+        json.dumps(_json_sanitize(value), default=str, allow_nan=False, separators=(",", ":"))
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _frame_records(frame: pd.DataFrame | None) -> list[dict]:
+    if frame is None or frame.empty:
+        return []
+    return [
+        {key: _json_clean(value) for key, value in row.items()}
+        for row in frame.replace([np.inf, -np.inf], np.nan).to_dict(orient="records")
+    ]
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value) if pd.notna(value) else False
+
+
+def _portfolio_payload(
+    holdings: pd.DataFrame | None,
+    summary: pd.DataFrame | None,
+    config_id: str | None,
+) -> dict:
+    empty = {
+        "configId": config_id,
+        "availableDates": [],
+        "holdingsByDate": {},
+        "eventsByDate": {},
+        "summaryByDate": {},
+        "monthStats": {},
+    }
+    if holdings is None or holdings.empty:
+        return empty
+
+    work = holdings.copy()
+    required = {"rebalance_month", "ticker", "weight"}
+    missing = sorted(required.difference(work.columns))
+    if missing:
+        raise ValueError(f"interactive holdings missing columns: {missing}")
+    work["rebalance_month"] = pd.to_datetime(work["rebalance_month"]).dt.date.astype(str)
+    work["ticker"] = work["ticker"].astype(str)
+    if "issuer_group" not in work:
+        work["issuer_group"] = work["ticker"]
+    if "rank" not in work:
+        work["rank"] = work.groupby("rebalance_month")["weight"].rank(method="first", ascending=False)
+    if "is_carried" not in work:
+        work["is_carried"] = False
+    work = work.sort_values(["rebalance_month", "rank", "ticker"], kind="stable")
+
+    holdings_by_date: dict[str, list[dict]] = {}
+    events_by_date: dict[str, list[dict]] = {}
+    month_stats: dict[str, dict] = {}
+    previous: dict[str, dict] = {}
+    tolerance = 1e-10
+    for date, month in work.groupby("rebalance_month", sort=True):
+        current: dict[str, dict] = {}
+        current_rows: list[dict] = []
+        for row in month.to_dict(orient="records"):
+            ticker = str(row["ticker"])
+            weight = float(row["weight"])
+            prev = previous.get(ticker)
+            prev_weight = float(prev["weight"]) if prev is not None else None
+            delta = weight - (prev_weight or 0.0)
+            carried = _as_bool(row.get("is_carried", False))
+            status = "new" if prev is None else ("carry" if carried else "keep")
+            if prev is None:
+                action = "new"
+            elif carried:
+                action = "carry"
+            elif delta > tolerance:
+                action = "increase"
+            elif delta < -tolerance:
+                action = "decrease"
+            else:
+                action = "flat"
+            item = {
+                "date": date,
+                "rank": int(row["rank"]) if pd.notna(row.get("rank")) else None,
+                "ticker": ticker,
+                "issuer_group": str(row.get("issuer_group") or ticker),
+                "weight": weight,
+                "prev_weight": prev_weight,
+                "delta": delta,
+                "status": status,
+                "action": action,
+                "is_carried": carried,
+            }
+            current[ticker] = item
+            current_rows.append(item)
+
+        events = list(current_rows)
+        for ticker in sorted(set(previous).difference(current)):
+            prev = previous[ticker]
+            events.append({
+                "date": date,
+                "rank": None,
+                "ticker": ticker,
+                "issuer_group": prev["issuer_group"],
+                "weight": 0.0,
+                "prev_weight": float(prev["weight"]),
+                "delta": -float(prev["weight"]),
+                "status": "exit",
+                "action": "sell",
+                "is_carried": False,
+            })
+        events.sort(key=lambda x: (x["status"] == "exit", x["rank"] or 10**9, x["ticker"]))
+        holdings_by_date[date] = current_rows
+        events_by_date[date] = events
+
+        status_counts = {name: sum(e["status"] == name for e in events) for name in ("new", "keep", "carry", "exit")}
+        status_weights = {
+            name: float(sum((e["prev_weight"] or 0.0) if name == "exit" else e["weight"] for e in events if e["status"] == name))
+            for name in ("new", "keep", "carry", "exit")
+        }
+        action_counts = {name: sum(e["action"] == name for e in events) for name in ("new", "increase", "decrease", "flat", "carry", "sell")}
+        action_abs_delta = {name: float(sum(abs(e["delta"]) for e in events if e["action"] == name)) for name in action_counts}
+        month_stats[date] = {
+            "current_names": len(current_rows),
+            "current_weight": float(sum(e["weight"] for e in current_rows)),
+            "status_counts": status_counts,
+            "status_weights": status_weights,
+            "action_counts": action_counts,
+            "action_abs_delta": action_abs_delta,
+            "top_current": sorted(current_rows, key=lambda x: (-x["weight"], x["ticker"]))[:20],
+            "top_changes": sorted(events, key=lambda x: (-abs(x["delta"]), x["ticker"]))[:20],
+            "top_increases": sorted((e for e in events if e["delta"] > tolerance), key=lambda x: (-x["delta"], x["ticker"]))[:20],
+            "top_decreases": sorted((e for e in events if e["delta"] < -tolerance), key=lambda x: (x["delta"], x["ticker"]))[:20],
+        }
+        previous = current
+
+    summary_by_date = {}
+    for row in _frame_records(summary):
+        raw_date = row.get("rebalance_month")
+        if raw_date is not None:
+            summary_by_date[pd.Timestamp(raw_date).date().isoformat()] = row
+
+    return {
+        "configId": config_id,
+        "availableDates": sorted(holdings_by_date),
+        "holdingsByDate": holdings_by_date,
+        "eventsByDate": events_by_date,
+        "summaryByDate": summary_by_date,
+        "monthStats": month_stats,
+    }
+
+
+def _render_interactive_template(data: dict, portfolio: dict, meta: dict) -> str:
+    template = INTERACTIVE_TEMPLATE.read_text(encoding="utf-8")
+    payloads = {"data": data, "portfolio": portfolio, "meta": meta}
+    for name, token in _INTERACTIVE_TOKENS.items():
+        count = template.count(token)
+        if count != 1:
+            raise ValueError(f"interactive template must contain one {token}; found {count}")
+        template = template.replace(token, _json_for_html(payloads[name]))
+    return template
+
+
 def interactive_results(
     grid_df: pd.DataFrame,
     returns_by_config_id: dict[str, pd.Series],
     benchmark: pd.Series | None = None,
     path: str = "interactive_results.html",
+    *,
+    portfolio_holdings: pd.DataFrame | None = None,
+    rebalance_summary: pd.DataFrame | None = None,
+    portfolio_config_id: str | None = None,
+    meta_payload: dict | None = None,
 ) -> str:
-    """Write a self-contained HTML viewer for parameter-sweep results."""
+    """Write the self-contained sweep viewer using the repository HTML template."""
     table_cols = [
         "config_id",
         "manager_filter_mode",
@@ -306,258 +501,9 @@ def interactive_results(
         "series": series_payload,
         "benchmarkName": getattr(benchmark, "name", None) if benchmark is not None else None,
     }
-    payload_json = json.dumps(payload, default=str, allow_nan=False)
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>13F Parameter Sweep Results</title>
-  <style>
-    :root {{
-      --ink: #1b1b1f;
-      --muted: #61636b;
-      --line: #d8dbe2;
-      --bg: #f6f7f9;
-      --panel: #ffffff;
-      --accent: #0b6e4f;
-      --bench: #7b8494;
-      --bad: #b0413e;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; font-family: Segoe UI, Arial, sans-serif; color: var(--ink); background: var(--bg); }}
-    header {{ padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }}
-    h1 {{ margin: 0 0 6px; font-size: 20px; font-weight: 650; }}
-    .sub {{ color: var(--muted); font-size: 13px; }}
-    main {{
-      display: grid;
-      grid-template-columns: minmax(300px, var(--left-panel-width, 420px)) 8px minmax(0, 1fr);
-      gap: 8px;
-      padding: 16px 20px 24px;
-      align-items: start;
-      overflow-x: auto;
-    }}
-    aside, section {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }}
-    aside {{ padding: 14px; max-height: calc(100vh - 105px); overflow: auto; min-width: 0; }}
-    section {{ padding: 14px; min-width: 0; }}
-    #splitter {{
-      align-self: stretch;
-      min-height: calc(100vh - 105px);
-      border-radius: 8px;
-      cursor: col-resize;
-      background: linear-gradient(to right, transparent 0 2px, var(--line) 2px 6px, transparent 6px 8px);
-      opacity: 0.85;
-      touch-action: none;
-    }}
-    #splitter:hover, body.dragging-splitter #splitter {{ background: linear-gradient(to right, transparent 0 2px, var(--accent) 2px 6px, transparent 6px 8px); opacity: 1; }}
-    body.dragging-splitter {{ cursor: col-resize; user-select: none; }}
-    .filters {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }}
-    label {{ display: grid; gap: 4px; font-size: 12px; color: var(--muted); }}
-    select {{ width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--ink); }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-    #results {{ min-width: 1120px; }}
-    th, td {{ padding: 7px 6px; border-bottom: 1px solid #eceef3; text-align: right; white-space: nowrap; }}
-    th {{ position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 600; cursor: pointer; }}
-    td:first-child, th:first-child {{ text-align: left; }}
-    tr {{ cursor: pointer; }}
-    tr.active {{ background: #eaf4ef; }}
-    tr.invalid {{ color: #8b3b34; background: #fff7f5; }}
-    .summary {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; margin-bottom: 14px; }}
-    .metric {{ border: 1px solid #eceef3; border-radius: 8px; padding: 10px; }}
-    .metric span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }}
-    .metric strong {{ font-size: 18px; }}
-    .chart-wrap {{ border: 1px solid #eceef3; border-radius: 8px; padding: 10px; }}
-    svg {{ width: 100%; height: 390px; display: block; }}
-    .legend {{ display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin: 8px 0 0; }}
-    .key {{ display: inline-flex; align-items: center; gap: 6px; }}
-    .swatch {{ width: 18px; height: 3px; display: inline-block; }}
-    @media (max-width: 760px) {{
-      main {{ grid-template-columns: 1fr; }}
-      #splitter {{ display: none; }}
-      aside {{ max-height: none; }}
-    }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>13F Parameter Sweep Results</h1>
-    <div class="sub">Filter configurations, inspect historical growth of 1, and compare active-weight variants.</div>
-  </header>
-  <main>
-    <aside>
-      <div class="filters" id="filters"></div>
-      <table id="results"></table>
-    </aside>
-    <div id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize left and right panels" title="Drag to resize panels; double-click to reset"></div>
-    <section>
-      <div class="summary" id="summary"></div>
-      <div class="chart-wrap">
-        <svg id="chart" viewBox="0 0 900 390" role="img" aria-label="Historical return chart"></svg>
-        <div class="legend">
-          <span class="key"><span class="swatch" style="background: var(--accent)"></span>Strategy growth</span>
-          <span class="key"><span class="swatch" style="background: var(--bench)"></span>Benchmark growth</span>
-          <span class="key"><span class="swatch" style="background: var(--bad)"></span>Drawdown</span>
-        </div>
-      </div>
-    </section>
-  </main>
-  <script>
-    const DATA = {payload_json};
-    const filterFields = ["valid_config", "manager_filter_mode", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "use_concentration", "use_low_turnover", "use_value_tilt"];
-    const tableFields = ["valid_config", "manager_filter_mode", "aum_band", "idea_signal", "top_n_ideas", "min_consensus_funds", "holding_horizon_q", "min_portfolio_names", "max_portfolio_names", "ann_return", "active_sharpe", "invested_month_frac", "avg_effective_names", "avg_max_weight", "name_cap_feasible_ratio", "max_drawdown"];
-    let sortField = "active_sharpe";
-    let sortDir = -1;
-    let selectedId = null;
-
-    function fmt(v, pct=false) {{
-      if (v === null || v === undefined || Number.isNaN(v)) return "n/a";
-      if (pct) return (v * 100).toFixed(1) + "%";
-      if (typeof v === "number") return v.toFixed(2);
-      return String(v);
-    }}
-
-    function isPctField(field) {{
-      return ["ann_return", "ann_vol", "max_drawdown", "total_return", "invested_month_frac", "valid_rebalance_frac", "invalid_rebalance_frac", "avg_max_weight", "avg_max_issuer_weight", "name_cap_feasible_ratio", "issuer_cap_feasible_ratio", "zero_contributor_manager_frac"].includes(field);
-    }}
-
-    function initFilters() {{
-      const root = document.getElementById("filters");
-      root.innerHTML = "";
-      for (const field of filterFields) {{
-        if (!DATA.records.some(r => Object.prototype.hasOwnProperty.call(r, field))) continue;
-        const values = [...new Set(DATA.records.map(r => r[field]).filter(v => v !== null && v !== undefined))];
-        const label = document.createElement("label");
-        label.textContent = field;
-        const select = document.createElement("select");
-        select.dataset.field = field;
-        select.innerHTML = `<option value="">All</option>` + values.map(v => `<option value="${{v}}">${{v}}</option>`).join("");
-        if (field === "valid_config" && values.includes(true)) select.value = "true";
-        select.addEventListener("change", render);
-        label.appendChild(select);
-        root.appendChild(label);
-      }}
-    }}
-
-    function filteredRows() {{
-      const selects = [...document.querySelectorAll("#filters select")];
-      return DATA.records.filter(row => selects.every(sel => !sel.value || String(row[sel.dataset.field]) === sel.value))
-        .sort((a, b) => {{
-          const av = a[sortField], bv = b[sortField];
-          if (av === bv) return 0;
-          if (av === null || av === undefined) return 1;
-          if (bv === null || bv === undefined) return -1;
-          return av > bv ? sortDir : -sortDir;
-        }});
-    }}
-
-    function renderTable(rows) {{
-      const table = document.getElementById("results");
-      const head = `<thead><tr>${{tableFields.map(f => `<th data-field="${{f}}">${{f}}</th>`).join("")}}</tr></thead>`;
-      const body = rows.map(row => `<tr data-id="${{row.config_id}}" class="${{row.config_id === selectedId ? "active" : ""}} ${{row.valid_config === false ? "invalid" : ""}}">
-        ${{tableFields.map(f => `<td>${{fmt(row[f], isPctField(f))}}</td>`).join("")}}
-      </tr>`).join("");
-      table.innerHTML = head + `<tbody>${{body}}</tbody>`;
-      table.querySelectorAll("th").forEach(th => th.addEventListener("click", () => {{
-        const field = th.dataset.field;
-        if (sortField === field) sortDir *= -1; else {{ sortField = field; sortDir = -1; }}
-        render();
-      }}));
-      table.querySelectorAll("tr[data-id]").forEach(tr => tr.addEventListener("click", () => {{
-        selectedId = tr.dataset.id;
-        render();
-      }}));
-    }}
-
-    function scale(vals, minPx, maxPx) {{
-      const finite = vals.filter(v => Number.isFinite(v));
-      const min = Math.min(...finite), max = Math.max(...finite);
-      const span = Math.max(1e-9, max - min);
-      return v => maxPx - (v - min) / span * (maxPx - minPx);
-    }}
-
-    function pathFor(values, yScale) {{
-      const n = values.length;
-      return values.map((v, i) => `${{i === 0 ? "M" : "L"}} ${{50 + i * (820 / Math.max(1, n - 1))}} ${{yScale(v)}}`).join(" ");
-    }}
-
-    function renderChart(row) {{
-      const svg = document.getElementById("chart");
-      const s = DATA.series[row.config_id];
-      if (!s) {{ svg.innerHTML = `<text x="450" y="195" text-anchor="middle" fill="#61636b">No return series</text>`; return; }}
-      const combined = [...s.growth, ...(s.benchmark || [])];
-      const y = scale(combined, 28, 260);
-      const yDD = v => 350 - (v / Math.min(-0.01, ...s.drawdown)) * 70;
-      const benchPath = s.benchmark && s.benchmark.length ? `<path d="${{pathFor(s.benchmark, y)}}" fill="none" stroke="#7b8494" stroke-width="2"/>` : "";
-      svg.innerHTML = `
-        <line x1="50" y1="260" x2="870" y2="260" stroke="#d8dbe2"/>
-        <line x1="50" y1="350" x2="870" y2="350" stroke="#d8dbe2"/>
-        <path d="${{pathFor(s.growth, y)}}" fill="none" stroke="#0b6e4f" stroke-width="3"/>
-        ${{benchPath}}
-        <path d="${{pathFor(s.drawdown, yDD)}}" fill="none" stroke="#b0413e" stroke-width="2"/>
-        <text x="50" y="18" fill="#1b1b1f" font-size="14">${{row.config_id}}</text>
-        <text x="50" y="382" fill="#61636b" font-size="12">${{s.dates[0]}}</text>
-        <text x="870" y="382" fill="#61636b" font-size="12" text-anchor="end">${{s.dates[s.dates.length - 1]}}</text>`;
-    }}
-
-    function renderSummary(row) {{
-      const items = [
-        ["Valid config", fmt(row.valid_config)],
-        ["Total return", fmt(row.total_return, true)],
-        ["Ann. return", fmt(row.ann_return, true)],
-        ["Invested months", fmt(row.invested_month_frac, true)],
-        ["Avg names", fmt(row.avg_effective_names)],
-        ["Name cap OK", fmt(row.name_cap_feasible_ratio, true)],
-        ["Active Sharpe", fmt(row.active_sharpe)],
-      ];
-      document.getElementById("summary").innerHTML = items.map(([k, v]) => `<div class="metric"><span>${{k}}</span><strong>${{v}}</strong></div>`).join("");
-    }}
-
-    function initSplitter() {{
-      const splitter = document.getElementById("splitter");
-      const root = document.documentElement;
-      if (!splitter) return;
-      const saved = localStorage.getItem("sweepLeftPanelWidth");
-      if (saved) root.style.setProperty("--left-panel-width", saved);
-      let dragging = false;
-      splitter.addEventListener("pointerdown", event => {{
-        dragging = true;
-        splitter.setPointerCapture(event.pointerId);
-        document.body.classList.add("dragging-splitter");
-      }});
-      splitter.addEventListener("pointermove", event => {{
-        if (!dragging) return;
-        const left = Math.max(300, Math.min(760, event.clientX - 20));
-        const value = `${{left}}px`;
-        root.style.setProperty("--left-panel-width", value);
-        localStorage.setItem("sweepLeftPanelWidth", value);
-      }});
-      function stopDrag(event) {{
-        dragging = false;
-        document.body.classList.remove("dragging-splitter");
-        try {{ splitter.releasePointerCapture(event.pointerId); }} catch (_) {{}}
-      }}
-      splitter.addEventListener("pointerup", stopDrag);
-      splitter.addEventListener("pointercancel", stopDrag);
-      splitter.addEventListener("dblclick", () => {{
-        localStorage.removeItem("sweepLeftPanelWidth");
-        root.style.removeProperty("--left-panel-width");
-      }});
-    }}
-
-    function render() {{
-      const rows = filteredRows();
-      if (!selectedId || !rows.some(r => r.config_id === selectedId)) selectedId = rows[0]?.config_id || null;
-      renderTable(rows);
-      const row = rows.find(r => r.config_id === selectedId);
-      if (row) {{ renderSummary(row); renderChart(row); }}
-    }}
-
-    initSplitter();
-    initFilters();
-    render();
-  </script>
-</body>
-</html>"""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html)
-    return path
+    portfolio = _portfolio_payload(portfolio_holdings, rebalance_summary, portfolio_config_id)
+    html = _render_interactive_template(payload, portfolio, meta_payload or {})
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html, encoding="utf-8")
+    return str(output_path)

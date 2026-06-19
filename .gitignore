@@ -9,6 +9,9 @@ data/processed/manager_classification.*.parquet
 data/processed/manager_classification.*.meta.json
 data/processed/idiosyncratic_vol.*.parquet
 data/processed/idiosyncratic_vol.*.meta.json
+data/processed/market_cap_history.parquet
+data/processed/market_cap_history_coverage.parquet
+data/yfinance_internal_cache/
 openfigi_cache.parquet
 yfinance_close_cache.parquet
 yfinance_close_cache_coverage.parquet

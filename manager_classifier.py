@@ -43,6 +43,7 @@ class ManagerClassifierConfig:
     factor_r2_max: float = 0.90
     factor_r2_min_months: int = 12
     factor_r2_min_names: int = 3
+    use_factor_r2_style: bool = False
     factor_cols: tuple[str, ...] = ("MKT", "SMB", "HML", "RMW", "CMA", "MOM")
     quasi_max_top10_weight: float = 0.35
     quasi_min_breadth: int = 100
@@ -272,6 +273,7 @@ def build_manager_classification(
     *,
     visible_versions_cache: dict[pd.Timestamp, pd.DataFrame] | None = None,
     config: ManagerClassifierConfig | None = None,
+    progress=None,
 ) -> pd.DataFrame:
     cfg = config or ManagerClassifierConfig()
     if chars is None or chars.empty:
@@ -284,12 +286,17 @@ def build_manager_classification(
     ch["period_date"] = pd.to_datetime(ch["period_date"])
     ch["filing_date"] = pd.to_datetime(ch["filing_date"])
     rows: list[dict[str, Any]] = []
-    r2_cache: dict[tuple[str, str, str], tuple[float, str]] = {}
+    r2_cache: dict[tuple[str, str], tuple[float, str]] = {}
     r2_versions_seen: set[tuple[str, str]] = set()
     etf_hits = 0
     etf_fallback_hits = 0
     etf_lookups = 0
-    for month in months:
+    if progress is not None:
+        progress(
+            f"classifier input months={len(months)}, chars={len(ch):,}, "
+            f"raw_rows={len(raw_holdings):,}, filtered_rows={len(filtered_holdings):,}"
+        )
+    for month_number, month in enumerate(months, start=1):
         asof = pd.Timestamp(month)
         latest = None if visible_versions_cache is None else visible_versions_cache.get(asof)
         if latest is None:
@@ -334,7 +341,11 @@ def build_manager_classification(
             top10 = float(getattr(r, "top10_weight", np.nan))
             put = float(getattr(r, "put_weight", 0.0) or 0.0)
             static_reason = _static_dirty_reason(manager_name)
-            r2_key = (manager, accession_key, asof.strftime("%Y-%m-%d"))
+            # Compute once when a filing version first becomes visible, then
+            # carry that PIT-known diagnostic forward until a new filing takes
+            # over. Including asof_month here caused the same unchanged filing
+            # to be regressed every month.
+            r2_key = (manager, accession_key)
             r2_versions_seen.add((manager, accession_key))
             if r2_key in r2_cache:
                 r2, r2_status = r2_cache[r2_key]
@@ -355,7 +366,7 @@ def build_manager_classification(
             if put > cfg.max_put_weight:
                 reasons.append("high_put_weight")
                 source = "behavior" if source == "unclassified" else source
-            if r2_status == "ok" and r2 >= cfg.factor_r2_max:
+            if cfg.use_factor_r2_style and r2_status == "ok" and r2 >= cfg.factor_r2_max:
                 manager_style = "quant_like"
             elif pd.notna(turn) and pd.notna(high_turnover) and turn >= high_turnover:
                 manager_style = "transient"
@@ -402,9 +413,16 @@ def build_manager_classification(
                     "raw_dedicated": manager_style == "dedicated" and not bool(reasons),
                 }
             )
+        if progress is not None and (month_number == 1 or month_number % 12 == 0 or month_number == len(months)):
+            progress(
+                f"classifier month {month_number}/{len(months)} asof={asof.date()} "
+                f"visible={len(latest):,} output_rows={len(rows):,} r2_runs={len(r2_cache):,}"
+            )
     out = pd.DataFrame(rows)
     if out.empty:
         return out
+    if progress is not None:
+        progress(f"classifier materializing {len(out):,} rows and applying quarterly persistence")
     out = out.sort_values(["manager", "asof_month"]).reset_index(drop=True)
     out["dedicated_persistent"] = _apply_dedicated_persistence(out, cfg)
     out.loc[out["dedicated_persistent"], "manager_style"] = "dedicated"
@@ -425,6 +443,11 @@ def build_manager_classification(
     out.attrs["etf_key_match_rate"] = float(etf_match_rate)
     out.attrs["factor_r2_versions_computed"] = int(len(r2_versions_seen))
     out.attrs["factor_r2_regressions_computed"] = int(len(r2_cache))
+    if progress is not None:
+        progress(
+            f"classifier complete rows={len(out):,}, r2_versions={len(r2_versions_seen):,}, "
+            f"r2_runs={len(r2_cache):,}, etf_key_match={etf_match_rate:.1%}"
+        )
     return out
 
 
