@@ -32,6 +32,7 @@ from engine import (
     build_visible_versions_cache,
     manager_characteristics,
     marginal_ir,
+    raw_filing_put_weights,
     rebalance_trace,
     run_backtest,
 )
@@ -75,9 +76,10 @@ LIVE_CONFIG = {
     "end": "2026-05-31",
     # Broad-market total-return proxy. Use QQQ for a tighter growth-style proxy.
     "benchmark_ticker": "SPY",
-    "min_aum": 0.5e9,
+    # Raw SEC ingest must cover the thesis band plus the 15-30B comparison band.
+    "min_aum": 0.1e9,
     "max_aum": 30e9,
-    "max_holdings": 60,
+    "max_holdings": 40,
     "max_put_weight": 0.10,
     "require_factors": False,
     "openfigi_cache_path": "openfigi_cache.parquet",
@@ -224,6 +226,7 @@ def build_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd
         + sum([make_manager(f"BAD{i:02d}", False) for i in range(8)], [])
     )
     holdings.attrs["raw_mapped_holdings"] = holdings.copy()
+    holdings.attrs["raw_filing_put_weights"] = raw_filing_put_weights(holdings)
 
     good_top = (
         holdings[holdings.manager.str.startswith("GOOD")]
@@ -279,6 +282,7 @@ def build_live_data(
         max_holdings=cfg["max_holdings"],
         max_put_weight=cfg["max_put_weight"],
     )
+    filing_put_weights = raw_filing_put_weights(h_cusip)
     print(
         f"    rule-based pool: {h_cusip['cik'].nunique()} filers, "
         f"{h_cusip.groupby(['cik', 'period_date']).ngroups} filer-periods"
@@ -338,6 +342,7 @@ def build_live_data(
     holdings = da.align_holdings_to_prices(price_holdings, signal_prices)
     prices = signal_prices.loc[pd.Timestamp(cfg["start"]):pd.Timestamp(cfg["end"])].copy()
     holdings.attrs["raw_mapped_holdings"] = raw_mapped_holdings
+    holdings.attrs["raw_filing_put_weights"] = filing_put_weights
     print("[1/6] Downloading Fama-French factors")
     try:
         factors = da.fetch_factors(price_history_start, cfg["end"])
@@ -544,6 +549,19 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
         "universe": asdict(cfg.universe),
         "manager_filter_mode": cfg.manager_filter_mode,
         "portfolio": asdict(cfg.portfolio),
+        "portfolio_construction": {
+            "idea_selection": "rank within each manager; signal magnitude is not an allocation weight",
+            "manager_equal": (
+                "equal budget per contributing manager; allocate each manager budget across selected "
+                "Top-K names in proportion to reported book weights"
+            ),
+            "max_portfolio_names_note": (
+                "The thesis Top-30 aggregate cutoff is an operational convenience and a documented "
+                "deviation from strict paper-style replication."
+                if cfg.portfolio.max_portfolio_names == 30
+                else None
+            ),
+        },
         "security_grouping": {
             "enabled": security_groups is not None,
             "max_issuer_weight": cfg.portfolio.max_issuer_weight,
@@ -557,6 +575,8 @@ def _strategy_rule_summary(cfg: BacktestConfig, *, value_scores, benchmark_weigh
             "value_tilt_active": bool(cfg.universe.use_value_tilt and value_scores is not None),
             "active_share_configured": bool(cfg.universe.use_active_share),
             "active_share_active": bool(cfg.universe.use_active_share and benchmark_weights is not None),
+            "hedge_filter_configured": bool(cfg.universe.use_hedge_filter),
+            "hedge_put_weight_source": "raw SEC filing before CUSIP mapping and equity filtering",
             "active_weight_signal": _needs_active_benchmark_weights(cfg.portfolio.idea_signal),
             "active_weight_benchmark": (
                 cfg.active_benchmark_source
@@ -1169,11 +1189,11 @@ def _manager_filter_artifacts(
 def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, int]:
     cfg_a = BacktestConfig(
         universe=UniverseConfig(
-            min_aum=0.5e9,
-            max_aum=5e9,
+            min_aum=0.1e9,
+            max_aum=10e9,
             use_concentration=True,
             min_top_n_weight=0.50,
-            max_holdings=40,
+            max_holdings=LIVE_CONFIG["max_holdings"],
             turnover_quantile=0.34,
             hedge_put_max_weight=0.05,
             value_tilt_min_pctl=0.50,
@@ -1181,12 +1201,12 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         ),
         portfolio=PortfolioConfig(
             idea_signal="cps_ir",
-            top_n_ideas=1,
-            idea_aggregation="score",
+            top_n_ideas=3,
+            idea_aggregation="manager_equal",
             min_consensus_funds=1,
             min_portfolio_names=10,
             max_portfolio_names=30,
-            holding_horizon_q=1,
+            holding_horizon_q=0,
             max_name_weight=0.10,
             max_issuer_weight=0.15,
             min_active_weight_holdings=10,
@@ -1208,21 +1228,22 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
     axes = {
         ("backtest", "manager_filter_mode"): ["dedicated_like"],
         ("universe", "aum_band"): [
-            ("0.5-5B", 0.5e9, 5e9),
+            ("0.1-10B", 0.1e9, 10e9),
             ("15-30B", 15e9, 30e9),
         ],
         ("portfolio", "idea_signal"): [
-            "active_weight",
             "cps_ir",
+            "cps_ir_change",
+            "cps_ir_initiation",
         ],
         ("portfolio", "top_n_ideas"): [1, 3, 5],
-        ("portfolio", "idea_aggregation"): ["equal_name", "score"],
-        ("portfolio", "min_consensus_funds"): [1],
+        ("portfolio", "idea_aggregation"): ["manager_equal", "score"],
+        ("portfolio", "min_consensus_funds"): [1, 2],
         ("portfolio", "holding_horizon_q"): [0, 1],
         ("portfolio", "min_portfolio_names"): [10],
         ("portfolio", "max_portfolio_names"): [30],
         ("portfolio", "min_active_weight_holdings"): [10],
-        ("universe", "use_concentration"): [False, True],
+        ("universe", "use_concentration"): [True],
         # Keep these fixed in the default Cartesian sweep to avoid exploding
         # runtime; marginal-IR still evaluates their isolated impact.
         ("universe", "use_low_turnover"): [True],
@@ -1423,6 +1444,12 @@ def run(
     # A DataFrame stored inside attrs may be deep-copied by ordinary pandas
     # operations. Detach the raw classification book before characteristics to
     # prevent repeated copies of hundreds of thousands of holding rows.
+    filing_put_weights = holdings.attrs.pop("raw_filing_put_weights", None)
+    if mode == "live" and filing_put_weights is None:
+        raise ValueError(
+            "live run is missing raw SEC filing PUT weights; refusing to use the equity-only "
+            "book for the hedge filter"
+        )
     raw_holdings_for_classification = holdings.attrs.pop("raw_mapped_holdings", None)
     if raw_holdings_for_classification is None:
         raw_holdings_for_classification = holdings
@@ -1438,7 +1465,12 @@ def run(
     )
     t_step = time.perf_counter()
     try:
-        chars = manager_characteristics(holdings, bench_w, progress=progress)
+        chars = manager_characteristics(
+            holdings,
+            bench_w,
+            filing_put_weights=filing_put_weights,
+            progress=progress,
+        )
     except Exception as exc:
         progress(f"2a/5 characteristics FAILED: {type(exc).__name__}: {exc}")
         raise
@@ -1447,7 +1479,12 @@ def run(
         f"step={time.perf_counter() - t_step:.1f}s"
     )
     progress("2a/5 raw-book characteristics audit starting")
-    raw_chars = manager_characteristics(raw_holdings_for_classification, bench_w, progress=progress)
+    raw_chars = manager_characteristics(
+        raw_holdings_for_classification,
+        bench_w,
+        filing_put_weights=filing_put_weights,
+        progress=progress,
+    )
     characteristics_audit = manager_characteristics_audit(raw_chars, chars)
     characteristics_audit_path = out_dir / "manager_characteristics_raw_investable.csv"
     characteristics_audit.to_csv(characteristics_audit_path, index=False)

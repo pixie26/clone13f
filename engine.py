@@ -31,7 +31,7 @@ class UniverseConfig:
     max_aum: float = 30e9
     top_n_concentration: int = 10
     min_top_n_weight: float = 0.50
-    max_holdings: int = 40
+    max_holdings: int = 40  # hard cap; does not become optional when Top-N concentration passes
     turnover_quantile: float = 0.34
     min_history_quarters: int = 4
     max_stale_filing_months: int | None = 6
@@ -53,7 +53,7 @@ class PortfolioConfig:
     top_n_ideas: int = 8
     idea_signal: str = "level"              # "level" | "change" | "initiation" | active-weight variants
     consensus_weight: bool = True
-    idea_aggregation: str | None = None      # "score" | "manager_count" | "equal_name"; None keeps legacy boolean
+    idea_aggregation: str | None = None      # "manager_equal" | "score" | "manager_count" | "equal_name"
     min_consensus_funds: int = 1            # drop names held by < this many in-universe funds
     min_portfolio_names: int = 0            # mark a rebalance invalid/cash if fewer target names survive
     max_portfolio_names: int | None = None  # cap final aggregate target before weight caps
@@ -386,6 +386,34 @@ def _versioned_holdings(holdings: pd.DataFrame) -> pd.DataFrame:
     return h
 
 
+def raw_filing_put_weights(holdings: pd.DataFrame) -> pd.DataFrame:
+    """Compute exact-version PUT exposure before mapping or equity filtering."""
+    holdings = _versioned_holdings(holdings)
+    keys = ["manager", "period_date", "filing_date", "accession_number"]
+    required = set(keys).union({"value", "sec_type"})
+    missing = sorted(required.difference(holdings.columns))
+    if missing:
+        raise ValueError(f"raw_filing_put_weights missing columns: {missing}")
+    if holdings.empty:
+        return pd.DataFrame(columns=keys + ["filing_put_weight"])
+
+    work = holdings.loc[:, keys + ["value", "sec_type"]].copy()
+    work["value"] = pd.to_numeric(work["value"], errors="raise")
+    work["_put_value"] = work["value"].where(
+        work["sec_type"].fillna("SH").astype(str).str.upper().eq("PUT"),
+        0.0,
+    )
+    metrics = (
+        work.groupby(keys, dropna=False, sort=False)
+        .agg(total_value=("value", "sum"), put_value=("_put_value", "sum"))
+        .reset_index()
+    )
+    metrics["filing_put_weight"] = (
+        metrics["put_value"] / metrics["total_value"].replace(0.0, np.nan)
+    )
+    return metrics[keys + ["filing_put_weight"]]
+
+
 def _visible_manager_versions(chars: pd.DataFrame, asof, managers=None) -> pd.DataFrame:
     known = chars[chars["filing_date"] <= asof]
     if managers is not None:
@@ -429,6 +457,38 @@ def _filter_fresh_versions(latest_versions: pd.DataFrame, asof, cfg: UniverseCon
     return fresh, diag
 
 
+def _add_freshness_audit_columns(
+    frame: pd.DataFrame,
+    asof,
+    cfg: UniverseConfig,
+) -> pd.DataFrame:
+    """Attach the exact stale cutoffs and decisions used for version auditing."""
+    audit = frame.copy()
+    asof_ts = pd.Timestamp(asof).normalize()
+    filing_cutoff = (
+        asof_ts - pd.DateOffset(months=int(cfg.max_stale_filing_months))
+        if cfg.max_stale_filing_months is not None else pd.NaT
+    )
+    period_cutoff = (
+        asof_ts - pd.DateOffset(months=int(cfg.max_stale_period_months))
+        if cfg.max_stale_period_months is not None else pd.NaT
+    )
+    audit["filing_date_cutoff"] = filing_cutoff
+    audit["period_date_cutoff"] = period_cutoff
+    audit["pass_filing_fresh"] = (
+        True
+        if pd.isna(filing_cutoff)
+        else pd.to_datetime(audit["filing_date"]).ge(filing_cutoff)
+    )
+    audit["pass_period_fresh"] = (
+        True
+        if pd.isna(period_cutoff)
+        else pd.to_datetime(audit["period_date"]).ge(period_cutoff)
+    )
+    audit["pass_freshness"] = audit["pass_filing_fresh"] & audit["pass_period_fresh"]
+    return audit
+
+
 def _selection_cache_diagnostics(selected_versions: pd.DataFrame) -> dict:
     visible = selected_versions.attrs.get("visible_managers")
     return {
@@ -457,6 +517,7 @@ def build_visible_versions_cache(chars: pd.DataFrame, months, *, progress=None) 
 def manager_characteristics(holdings: pd.DataFrame,
                             benchmark_weights: pd.Series | None = None,
                             *,
+                            filing_put_weights: pd.DataFrame | None = None,
                             progress=None) -> pd.DataFrame:
     started = time.perf_counter()
     holdings = _versioned_holdings(holdings)
@@ -535,11 +596,27 @@ def manager_characteristics(holdings: pd.DataFrame,
         "active_share", "bw",
     ]
     if not rows:
-        return pd.DataFrame(columns=cols + ["prev_bw", "turnover", "hist_q"])
+        extra = ["filing_put_weight"] if filing_put_weights is not None else []
+        return pd.DataFrame(columns=cols + extra + ["prev_bw", "turnover", "hist_q"])
 
     chars = (pd.DataFrame(rows)
              .sort_values(["manager", "period_date", "filing_date", "accession_number"])
              .reset_index(drop=True))
+    if filing_put_weights is not None:
+        metric_keys = ["manager", "period_date", "filing_date", "accession_number"]
+        required_metrics = set(metric_keys).union({"filing_put_weight"})
+        missing_metrics = sorted(required_metrics.difference(filing_put_weights.columns))
+        if missing_metrics:
+            raise ValueError(f"filing_put_weights missing columns: {missing_metrics}")
+        metrics = filing_put_weights.loc[:, metric_keys + ["filing_put_weight"]].copy()
+        chars = chars.merge(metrics, on=metric_keys, how="left", validate="one_to_one")
+        missing_versions = chars["filing_put_weight"].isna()
+        if missing_versions.any():
+            sample = chars.loc[missing_versions, metric_keys].head(5).to_dict(orient="records")
+            raise ValueError(
+                "missing raw filing PUT weights for manager versions; "
+                f"count={int(missing_versions.sum())}, sample={sample}"
+            )
     chars["hist_q"] = chars.groupby("manager")["period_date"].rank(method="dense").astype(int)
 
     # Known issue: prior-period turnover uses the latest version of that prior
@@ -683,9 +760,10 @@ def filter_universe_versions(latest_versions: pd.DataFrame, cfg: UniverseConfig,
     if cfg.use_size_band:
         keep &= latest["aum"].between(cfg.min_aum, cfg.max_aum)
     if cfg.use_concentration:
-        keep &= (latest["top10_weight"] >= cfg.min_top_n_weight) | (latest["n_holdings"] <= cfg.max_holdings)
+        keep &= (latest["top10_weight"] >= cfg.min_top_n_weight) & (latest["n_holdings"] <= cfg.max_holdings)
     if cfg.use_hedge_filter:
-        keep &= latest["put_weight"] <= cfg.hedge_put_max_weight
+        put_weight = latest["filing_put_weight"] if "filing_put_weight" in latest else latest["put_weight"]
+        keep &= put_weight.notna() & put_weight.le(cfg.hedge_put_max_weight)
     if cfg.use_active_share and latest["active_share"].notna().any():
         keep &= latest["active_share"].ge(cfg.min_active_share).reindex(keep.index).fillna(False)
     if cfg.use_low_turnover:
@@ -766,19 +844,8 @@ def _manager_candidates_audit(
     audit["manager"] = audit["manager"].astype(str).str.zfill(10)
     asof = pd.Timestamp(month).normalize()
     u = cfg.universe
-    filing_cutoff = (
-        asof - pd.DateOffset(months=int(u.max_stale_filing_months))
-        if u.max_stale_filing_months is not None else pd.NaT
-    )
-    period_cutoff = (
-        asof - pd.DateOffset(months=int(u.max_stale_period_months))
-        if u.max_stale_period_months is not None else pd.NaT
-    )
+    audit = _add_freshness_audit_columns(audit, asof, u)
     audit["rebalance_month"] = asof.date().isoformat()
-    audit["filing_date_cutoff"] = filing_cutoff
-    audit["period_date_cutoff"] = period_cutoff
-    audit["pass_filing_fresh"] = True if pd.isna(filing_cutoff) else pd.to_datetime(audit["filing_date"]).ge(filing_cutoff)
-    audit["pass_period_fresh"] = True if pd.isna(period_cutoff) else pd.to_datetime(audit["period_date"]).ge(period_cutoff)
     audit["min_history_quarters_cutoff"] = int(u.min_history_quarters)
     audit["pass_min_history"] = audit["hist_q"].ge(u.min_history_quarters)
     audit["size_band_active"] = bool(u.use_size_band)
@@ -788,11 +855,22 @@ def _manager_candidates_audit(
     audit["concentration_active"] = bool(u.use_concentration)
     audit["min_top_n_weight_cutoff"] = float(u.min_top_n_weight)
     audit["max_holdings_cutoff"] = int(u.max_holdings)
-    concentration_pass = audit["top10_weight"].ge(u.min_top_n_weight) | audit["n_holdings"].le(u.max_holdings)
+    concentration_pass = audit["top10_weight"].ge(u.min_top_n_weight) & audit["n_holdings"].le(u.max_holdings)
     audit["pass_concentration"] = (not u.use_concentration) | concentration_pass
     audit["hedge_filter_active"] = bool(u.use_hedge_filter)
     audit["hedge_put_max_weight_cutoff"] = float(u.hedge_put_max_weight)
-    audit["pass_hedge_filter"] = (not u.use_hedge_filter) | audit["put_weight"].le(u.hedge_put_max_weight)
+    audit["investable_put_weight"] = audit["put_weight"]
+    if "filing_put_weight" in audit:
+        audit["hedge_put_weight_source"] = "raw_sec_filing_before_mapping"
+        hedge_put_weight = audit["filing_put_weight"]
+    else:
+        audit["filing_put_weight"] = pd.NA
+        audit["hedge_put_weight_source"] = "available_book_fallback"
+        hedge_put_weight = audit["put_weight"]
+    audit["hedge_put_weight"] = hedge_put_weight
+    audit["pass_hedge_filter"] = (
+        not u.use_hedge_filter
+    ) | (hedge_put_weight.notna() & hedge_put_weight.le(u.hedge_put_max_weight))
     audit["active_share_filter_active"] = bool(u.use_active_share and audit["active_share"].notna().any())
     audit["min_active_share_cutoff"] = float(u.min_active_share)
     audit["pass_active_share"] = (~audit["active_share_filter_active"]) | audit["active_share"].ge(u.min_active_share)
@@ -842,10 +920,8 @@ def _manager_candidates_audit(
         else:
             audit["pass_manager_type"] = True
 
-    fresh_ids = set(fresh_versions["manager"].astype(str).str.zfill(10))
     universe_ids = set(universe_selected["manager"].astype(str).str.zfill(10))
     final_ids = set(final_selected["manager"].astype(str).str.zfill(10))
-    audit["pass_freshness"] = audit["manager"].isin(fresh_ids)
     audit["pass_universe_filters"] = audit["manager"].isin(universe_ids)
     audit["pass_final"] = audit["manager"].isin(final_ids)
     columns = [
@@ -855,7 +931,8 @@ def _manager_candidates_audit(
         "min_history_quarters_cutoff", "pass_min_history",
         "size_band_active", "min_aum_cutoff", "max_aum_cutoff", "pass_size_band",
         "concentration_active", "min_top_n_weight_cutoff", "max_holdings_cutoff", "pass_concentration",
-        "hedge_filter_active", "hedge_put_max_weight_cutoff", "pass_hedge_filter",
+        "hedge_filter_active", "hedge_put_max_weight_cutoff", "filing_put_weight",
+        "investable_put_weight", "hedge_put_weight", "hedge_put_weight_source", "pass_hedge_filter",
         "active_share_filter_active", "min_active_share_cutoff", "pass_active_share",
         "low_turnover_filter_active", "turnover_quantile_cutoff", "turnover_value_cutoff", "pass_low_turnover",
         "value_tilt_filter_active", "book_value_pctl", "value_tilt_min_pctl_cutoff", "pass_value_tilt",
@@ -944,8 +1021,19 @@ def _idea_scores(
     return s[s > 0].sort_values(ascending=False).head(cfg.top_n_ideas)
 
 
+def _manager_idea_weights(cur: pd.Series, picks: pd.Series) -> pd.Series:
+    """Allocate one manager budget across selected ideas by reported book weight."""
+    if picks.empty:
+        return pd.Series(dtype=float)
+    selected = cur.reindex(picks.index).fillna(0.0).clip(lower=0.0)
+    total = float(selected.sum())
+    if total > 0:
+        return selected / total
+    return pd.Series(1.0 / len(picks), index=picks.index, dtype=float)
+
+
 def _idea_component_rows(
-    manager,
+    manager_version,
     cur: pd.Series,
     picks: pd.Series,
     cfg: PortfolioConfig,
@@ -971,12 +1059,20 @@ def _idea_component_rows(
             benchmark = benchmark_input.reindex(current.index).fillna(0.0)
         active = (current - benchmark.reindex(current.index).fillna(0.0)).clip(lower=0.0)
     rows = []
+    manager = str(getattr(manager_version, "manager", ""))
+    period_date = getattr(manager_version, "period_date", pd.NaT)
+    filing_date = getattr(manager_version, "filing_date", pd.NaT)
+    accession_number = getattr(manager_version, "accession_number", pd.NA)
+    manager_idea_weights = _manager_idea_weights(current, picks)
     for rank, (ticker, signal_score) in enumerate(picks.items(), start=1):
         active_weight = float(active.get(ticker, np.nan)) if not active.empty else np.nan
         idio = float(idiosyncratic_vol.get(ticker, np.nan)) if idiosyncratic_vol is not None else np.nan
         cps = active_weight * idio if pd.notna(active_weight) and pd.notna(idio) else np.nan
         rows.append({
-            "manager": str(manager),
+            "manager": manager,
+            "period_date": period_date,
+            "filing_date": filing_date,
+            "accession_number": accession_number,
             "ticker": str(ticker),
             "manager_book_weight": float(current.get(ticker, np.nan)),
             "benchmark_weight": float(benchmark.get(ticker, np.nan)) if not benchmark.empty else np.nan,
@@ -984,6 +1080,7 @@ def _idea_component_rows(
             "idio_vol": idio,
             "cps_score": cps,
             "signal_score": float(signal_score),
+            "manager_idea_weight": float(manager_idea_weights.get(ticker, np.nan)),
             "manager_idea_rank": int(rank),
         })
     return rows
@@ -1054,7 +1151,7 @@ def target_weights_from_versions(
             active_benchmark_source,
         )
         idea_rows.extend(_idea_component_rows(
-            getattr(cur_row, "manager", ""),
+            cur_row,
             cur,
             picks,
             cfg,
@@ -1066,11 +1163,18 @@ def target_weights_from_versions(
         if picks.empty:
             diagnostics["zero_contributor_managers"] += 1
         diagnostics["raw_idea_rows"] += int(len(picks))
+        manager_idea_weights = _manager_idea_weights(cur, picks)
         for tkr, wt in picks.items():
             aggregation = cfg.idea_aggregation or ("score" if cfg.consensus_weight else "manager_count")
-            if aggregation not in {"score", "manager_count", "equal_name"}:
+            if aggregation not in {"manager_equal", "score", "manager_count", "equal_name"}:
                 raise ValueError(f"unknown idea_aggregation={aggregation!r}")
-            score[tkr] = score.get(tkr, 0.0) + (float(wt) if aggregation == "score" else 1.0)
+            if aggregation == "manager_equal":
+                contribution = float(manager_idea_weights.loc[tkr])
+            elif aggregation == "score":
+                contribution = float(wt)
+            else:
+                contribution = 1.0
+            score[tkr] = score.get(tkr, 0.0) + contribution
             max_score[tkr] = max(max_score.get(tkr, float("-inf")), float(wt))
             count[tkr] = count.get(tkr, 0) + 1
             source_managers.setdefault(str(tkr), []).append(str(getattr(cur_row, "manager", "")))
@@ -1393,7 +1497,7 @@ def rebalance_trace(holdings, prices, cfg: BacktestConfig,
         )
         idea_audit = idea_diag.get("_idea_audit", pd.DataFrame())
         if isinstance(idea_audit, pd.DataFrame) and not idea_audit.empty:
-            idea_audit = idea_audit.copy()
+            idea_audit = _add_freshness_audit_columns(idea_audit, m, cfg.universe)
             idea_audit.insert(0, "rebalance_month", m.date().isoformat())
             idea_rows.extend(idea_audit.to_dict(orient="records"))
         target_names_before_price_filter = int(len(tgt))

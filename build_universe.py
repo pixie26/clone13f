@@ -397,7 +397,7 @@ def parse_quarter(zip_bytes: bytes) -> pd.DataFrame:
 
 # --------------------------------------------------------------------------- #
 def coarse_prefilter(holdings: pd.DataFrame,
-                     min_aum=1e9, max_aum=30e9, max_holdings=60,
+                     min_aum=1e9, max_aum=30e9, max_holdings=40,
                      max_put_weight=0.10) -> pd.DataFrame:
     """Coarse, point-in-time filing-level screen before the engine's final screen."""
     h = holdings.copy()

@@ -35,6 +35,13 @@ def manager_characteristics_audit(
         pd.to_numeric(out.get("investable_n_holdings"), errors="coerce")
         / pd.to_numeric(out.get("raw_n_holdings"), errors="coerce").replace(0.0, np.nan)
     )
+    filing_source = None
+    if "filing_put_weight" in raw_chars:
+        filing_source = raw_chars[keys + ["filing_put_weight"]].copy()
+    elif "filing_put_weight" in investable_chars:
+        filing_source = investable_chars[keys + ["filing_put_weight"]].copy()
+    if filing_source is not None:
+        out = out.merge(filing_source, on=keys, how="left", validate="one_to_one")
     return out.sort_values(["manager", "period_date", "filing_date", "accession_number"]).reset_index(drop=True)
 
 

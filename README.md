@@ -163,11 +163,20 @@ Future v2 data/research items:
 - Evaluate FF5+MOM residual volatility with longer windows.
 - Add ADV/Bushee enrichment for manager-type classification.
 
-The thesis portfolio takes one CPS-IR best idea per manager, deduplicates names,
-and equal-weights the resulting names (`idea_aggregation="equal_name"`). It does
-not require manager overlap (`min_consensus_funds=1`). The default formal sweep
-contains 48 predeclared variants: two AUM bands, raw active-weight vs CPS-IR,
-top 1/3/5 ideas, 0/1-quarter carry, and concentration-filter off/on.
+The thesis portfolio uses CPS-IR only to rank ideas within each manager. Managers
+receive equal portfolio budgets; for Top 3/5, each manager's budget is allocated
+across the selected names in proportion to that manager's reported book weights
+(`idea_aggregation="manager_equal"`). Repeated selections therefore contribute
+multiple manager-budget shares. It does not require manager overlap
+(`min_consensus_funds=1`). Score-weighted aggregation remains available only as
+an experimental variant and is not the paper-style allocation.
+
+For operational convenience, the thesis currently retains
+`max_portfolio_names=30`. This aggregate name limit is a documented replication
+deviation rather than part of the paper-style manager-equal construction. The
+default formal sweep contains 144 predeclared variants across AUM band, CPS-IR
+signal form, Top 1/3/5 ideas, manager-equal vs score-weighted aggregation,
+consensus threshold, and 0/1-quarter carry.
 
 The live default uses `--price-source chart` through `LIVE_CONFIG` to avoid
 `yfinance` hangs on restricted networks. To compare against yfinance manually:

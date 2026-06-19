@@ -31,6 +31,13 @@ walk-forward, or current-strategy behavior.
 - OpenFIGI/CUSIP mapping remains incomplete and may be systematic around stale
   IDs, corporate actions, foreign issuers, and non-common instruments.
 
+## Known research deviations
+
+- The thesis uses paper-style manager-equal idea aggregation but retains
+  `max_portfolio_names=30` for operational convenience. The aggregate Top-30
+  cutoff is not part of the strict CPS portfolio replication; report it as a
+  deliberate implementation constraint and preserve pre-cutoff diagnostics.
+
 ## Performance order of operations
 
 1. Time SEC/cache reads, OpenFIGI, prices, `manager_characteristics`, backtest,

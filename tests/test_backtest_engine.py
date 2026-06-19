@@ -32,32 +32,132 @@ from engine import (
     attribution,
     filter_universe_versions,
     rebalance_trace,
+    raw_filing_put_weights,
     run_backtest,
     target_weights_from_versions,
 )
 from run_example import (
+    LIVE_CONFIG,
     _default_run_configs,
     _complete_idio_vol_cache_months,
     _rebalance_summary_stats,
     load_security_groups,
     run as run_example_run,
     value_unit_continuity_diagnostics,
+    write_rebalance_outputs,
 )
 from run_diagnostics import manager_characteristics_audit
 from sweep import deflated_sharpe
 
 
-def test_default_thesis_uses_manager_held_mcap_cps_best_idea_and_96_trial_sweep():
+def test_default_thesis_and_144_trial_sweep_contract():
     thesis, _, axes, _, _ = _default_run_configs()
 
     assert thesis.portfolio.idea_signal == "cps_ir"
     assert thesis.active_benchmark_source == "manager_held_mcap"
-    assert thesis.portfolio.top_n_ideas == 1
-    assert thesis.portfolio.idea_aggregation == "score"
+    assert thesis.portfolio.top_n_ideas == 3
+    assert thesis.portfolio.idea_aggregation == "manager_equal"
     assert thesis.universe.use_concentration is True
+    assert LIVE_CONFIG["max_holdings"] == thesis.universe.max_holdings == 40
     assert thesis.portfolio.min_consensus_funds == 1
-    assert axes[("portfolio", "idea_aggregation")] == ["equal_name", "score"]
-    assert int(np.prod([len(values) for values in axes.values()])) == 96
+    assert thesis.portfolio.max_portfolio_names == 30
+    assert axes[("portfolio", "idea_signal")] == [
+        "cps_ir",
+        "cps_ir_change",
+        "cps_ir_initiation",
+    ]
+    assert axes[("portfolio", "idea_aggregation")] == ["manager_equal", "score"]
+    assert axes[("portfolio", "min_consensus_funds")] == [1, 2]
+    assert axes[("universe", "use_concentration")] == [True]
+    assert int(np.prod([len(values) for values in axes.values()])) == 144
+
+
+def test_concentration_requires_top10_threshold_and_max_holdings_cap():
+    common = {
+        "hist_q": 4,
+        "aum": 10.0,
+        "put_weight": 0.0,
+        "active_share": np.nan,
+        "turnover": 0.1,
+        "period_date": pd.Timestamp("2020-03-31"),
+        "filing_date": pd.Timestamp("2020-05-15"),
+        "accession_number": "a1",
+        "submission_type": "13F-HR",
+        "bw": pd.Series({"A": 1.0}),
+    }
+    latest = pd.DataFrame([
+        {**common, "manager": "0000000001", "top10_weight": 0.50, "n_holdings": 40},
+        {**common, "manager": "0000000002", "top10_weight": 0.80, "n_holdings": 41},
+        {**common, "manager": "0000000003", "top10_weight": 0.49, "n_holdings": 40},
+    ])
+    universe = UniverseConfig(
+        min_history_quarters=1,
+        use_size_band=False,
+        use_concentration=True,
+        min_top_n_weight=0.50,
+        max_holdings=40,
+        use_low_turnover=False,
+        use_hedge_filter=False,
+        use_value_tilt=False,
+    )
+
+    selected = filter_universe_versions(latest, universe)
+
+    assert selected["manager"].tolist() == ["0000000001"]
+    audit = en._manager_candidates_audit(
+        latest,
+        latest,
+        selected,
+        selected,
+        pd.Timestamp("2020-05-31"),
+        BacktestConfig(universe=universe),
+    ).set_index("manager")
+    assert bool(audit.loc["0000000001", "pass_concentration"]) is True
+    assert bool(audit.loc["0000000002", "pass_concentration"]) is False
+    assert bool(audit.loc["0000000003", "pass_concentration"]) is False
+
+
+def test_hedge_filter_uses_raw_filing_put_weight_before_equity_filter():
+    keys = {
+        "manager": "0000000001",
+        "period_date": pd.Timestamp("2020-03-31"),
+        "filing_date": pd.Timestamp("2020-05-15"),
+        "accession_number": "a1",
+        "submission_type": "13F-HR",
+    }
+    raw = pd.DataFrame([
+        {**keys, "ticker": "A", "value": 90.0, "sec_type": "SH"},
+        {**keys, "ticker": "A-PUT", "value": 10.0, "sec_type": "PUT"},
+    ])
+    equity_only = raw[raw["sec_type"].eq("SH")].copy()
+    filing_put = raw_filing_put_weights(raw)
+    chars = en.manager_characteristics(equity_only, filing_put_weights=filing_put)
+    cfg = UniverseConfig(
+        min_history_quarters=1,
+        use_size_band=False,
+        use_concentration=False,
+        use_low_turnover=False,
+        use_hedge_filter=True,
+        hedge_put_max_weight=0.05,
+        use_value_tilt=False,
+    )
+
+    assert chars.loc[0, "put_weight"] == 0.0
+    assert chars.loc[0, "filing_put_weight"] == pytest.approx(0.10)
+    assert filter_universe_versions(chars, cfg).empty
+
+    audit = en._manager_candidates_audit(
+        chars,
+        chars.iloc[0:0],
+        chars.iloc[0:0],
+        chars.iloc[0:0],
+        pd.Timestamp("2020-05-31"),
+        BacktestConfig(universe=cfg),
+    ).iloc[0]
+    assert audit["hedge_put_weight_source"] == "raw_sec_filing_before_mapping"
+    assert audit["investable_put_weight"] == 0.0
+    assert audit["hedge_put_weight"] == pytest.approx(0.10)
+    assert bool(audit["pass_hedge_filter"]) is False
 
 
 def test_idio_cache_restores_requested_empty_months_after_parquet_roundtrip():
@@ -592,6 +692,93 @@ def test_equal_name_aggregation_deduplicates_manager_picks_without_extra_weight(
     target = target_weights_from_versions(latest_versions, cfg)
 
     assert target.to_dict() == pytest.approx({"A": 0.5, "D": 0.5})
+
+
+def test_manager_equal_aggregation_equal_weights_managers_and_uses_book_weights_within_manager():
+    latest_versions = pd.DataFrame(
+        [
+            {"manager": "m1", "bw": pd.Series({"A": 0.60, "B": 0.30, "X": 0.10}), "prev_bw": None},
+            {"manager": "m2", "bw": pd.Series({"A": 0.20, "C": 0.60, "Y": 0.20}), "prev_bw": None},
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="level",
+        top_n_ideas=2,
+        idea_aggregation="manager_equal",
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+    )
+
+    target, diagnostics = target_weights_from_versions(
+        latest_versions,
+        cfg,
+        return_diagnostics=True,
+    )
+
+    assert target.to_dict() == pytest.approx({"A": 11.0 / 24.0, "B": 1.0 / 6.0, "C": 3.0 / 8.0})
+    idea_audit = diagnostics["_idea_audit"].set_index(["manager", "ticker"])
+    assert idea_audit.loc[("m1", "A"), "manager_idea_weight"] == pytest.approx(2.0 / 3.0)
+    assert idea_audit.loc[("m1", "B"), "manager_idea_weight"] == pytest.approx(1.0 / 3.0)
+    assert idea_audit.loc[("m2", "A"), "manager_idea_weight"] == pytest.approx(0.25)
+    assert idea_audit.loc[("m2", "C"), "manager_idea_weight"] == pytest.approx(0.75)
+
+
+def test_manager_equal_top_one_counts_repeated_manager_votes():
+    latest_versions = pd.DataFrame(
+        [
+            {"manager": "m1", "bw": pd.Series({"A": 0.8, "B": 0.2}), "prev_bw": None},
+            {"manager": "m2", "bw": pd.Series({"A": 0.7, "C": 0.3}), "prev_bw": None},
+            {"manager": "m3", "bw": pd.Series({"D": 0.9, "E": 0.1}), "prev_bw": None},
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="level",
+        top_n_ideas=1,
+        idea_aggregation="manager_equal",
+        min_consensus_funds=1,
+        max_name_weight=1.0,
+    )
+
+    target = target_weights_from_versions(latest_versions, cfg)
+
+    assert target.to_dict() == pytest.approx({"A": 2.0 / 3.0, "D": 1.0 / 3.0})
+
+
+def test_manager_equal_uses_cps_only_for_ranking_not_final_allocation():
+    latest_versions = pd.DataFrame(
+        [
+            {
+                "manager": "m1",
+                "bw": pd.Series({"A": 0.60, "B": 0.30, "C": 0.10}),
+                "prev_bw": None,
+            }
+        ]
+    )
+    cfg = PortfolioConfig(
+        idea_signal="cps_ir",
+        top_n_ideas=2,
+        idea_aggregation="manager_equal",
+        min_consensus_funds=1,
+        min_active_weight_holdings=3,
+        max_name_weight=1.0,
+    )
+    benchmark = pd.Series({"A": 0.50, "B": 0.10, "C": 0.40})
+    idio_vol = pd.Series({"A": 0.20, "B": 0.80, "C": 0.40})
+
+    target, diagnostics = target_weights_from_versions(
+        latest_versions,
+        cfg,
+        benchmark,
+        idio_vol,
+        return_diagnostics=True,
+        active_benchmark_source="visible_13f_aggregate",
+    )
+
+    ideas = diagnostics["_idea_audit"].sort_values("manager_idea_rank")
+    assert ideas["ticker"].tolist() == ["B", "A"]
+    idea_scores = ideas.set_index("ticker")["signal_score"]
+    assert idea_scores.loc["B"] > idea_scores.loc["A"]
+    assert target.to_dict() == pytest.approx({"A": 2.0 / 3.0, "B": 1.0 / 3.0})
 
 
 def test_manager_held_mcap_cps_ir_uses_each_manager_held_subset():
@@ -1588,6 +1775,69 @@ def test_stale_manager_versions_are_excluded_at_later_rebalances():
     assert last_summary["stale_period_managers"] == 1
     assert last_summary["selected_managers"] == 1
     assert last_holdings["ticker"].tolist() == ["NEW"]
+
+
+def test_recent_amendment_of_old_period_is_stale_and_idea_csv_has_exact_provenance(tmp_path):
+    month = pd.Timestamp("2021-02-28")
+    holdings = pd.DataFrame(
+        [
+            {
+                "manager": "stale_amendment",
+                "period_date": pd.Timestamp("2019-12-31"),
+                "filing_date": pd.Timestamp("2021-02-15"),
+                "accession_number": "old-period-recent-amendment",
+                "submission_type": "13F-HR/A",
+                "ticker": "OLD",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+            {
+                "manager": "fresh_manager",
+                "period_date": pd.Timestamp("2020-12-31"),
+                "filing_date": pd.Timestamp("2021-02-10"),
+                "accession_number": "fresh-filing",
+                "submission_type": "13F-HR",
+                "ticker": "NEW",
+                "value": 100.0,
+                "sec_type": "SH",
+            },
+        ]
+    )
+    prices = pd.DataFrame({"OLD": [0.0], "NEW": [0.0]}, index=[month])
+    cfg = BacktestConfig(
+        universe=UniverseConfig(
+            min_history_quarters=1,
+            max_stale_filing_months=6,
+            max_stale_period_months=6,
+            use_size_band=False,
+            use_concentration=False,
+            use_low_turnover=False,
+            use_hedge_filter=False,
+            use_value_tilt=False,
+        ),
+        portfolio=PortfolioConfig(top_n_ideas=1, min_consensus_funds=1, max_name_weight=1.0),
+    )
+
+    outputs = write_rebalance_outputs(tmp_path, "thesis", holdings, prices, cfg)
+    ideas = pd.read_csv(outputs["ideas"])
+    candidates = pd.read_csv(outputs["manager_candidates_audit"])
+
+    stale = candidates[candidates["accession_number"].eq("old-period-recent-amendment")].iloc[0]
+    assert bool(stale["pass_filing_fresh"]) is True
+    assert bool(stale["pass_period_fresh"]) is False
+    assert bool(stale["pass_freshness"]) is False
+    assert stale["period_date_cutoff"] == "2020-08-28"
+
+    assert ideas["ticker"].tolist() == ["NEW"]
+    idea = ideas.iloc[0]
+    assert idea["period_date"] == "2020-12-31"
+    assert idea["filing_date"] == "2021-02-10"
+    assert idea["accession_number"] == "fresh-filing"
+    assert idea["filing_date_cutoff"] == "2020-08-28"
+    assert idea["period_date_cutoff"] == "2020-08-28"
+    assert bool(idea["pass_filing_fresh"]) is True
+    assert bool(idea["pass_period_fresh"]) is True
+    assert bool(idea["pass_freshness"]) is True
 
 
 def test_active_benchmark_cache_excludes_stale_manager_versions():
