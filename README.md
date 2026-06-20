@@ -370,6 +370,158 @@ Outputs are written to timestamped folders under `reports/`, including:
 - `manager_classification.csv`
 - `manager_filter_acceptance.csv`
 
+## Parameters
+
+There are two distinct kinds of defaults. The dataclass defaults in `engine.py`
+are generic API defaults; the normal research run created by
+`run_example.py::_default_run_configs()` overrides many of them. The tables below
+use the **thesis run** values unless explicitly labelled otherwise.
+
+### Thesis strategy defaults
+
+| Layer | Parameter | Thesis default | Allowed / meaningful values | Meaning |
+|---|---|---:|---|---|
+| Manager universe | `manager_filter_mode` | `dedicated_like` | `all`, `exclude_dirty`, `dedicated_like` | `dedicated_like` keeps managers classified as concentrated stock pickers; `exclude_dirty` only removes clearly unsuitable managers; `all` is the untouched baseline. |
+| Manager universe | `min_aum`, `max_aum` | `$0.1B`, `$10B` | non-negative dollar bounds | Point-in-time manager AUM band. The raw live ingest covers `$0.1B`–`$30B` so alternative bands remain available. |
+| Manager universe | `min_history_quarters` | `4` | integer `>= 1` | Minimum filing history before a manager can qualify. |
+| Manager universe | `max_stale_filing_months` | `6` | positive integer or `None` | Rejects a filing version that was published too long before the decision month. |
+| Manager universe | `max_stale_period_months` | `6` | positive integer or `None` | Rejects holdings whose report period is too old at the decision month. |
+| Concentration | `use_concentration` | `True` | `True`, `False` | Enables the concentration screen. |
+| Concentration | `top_n_concentration` | `10` | positive integer | Number of largest positions used in the concentration calculation. |
+| Concentration | `min_top_n_weight` | `50%` | `0`–`1` | Required combined book weight of the largest `top_n_concentration` holdings. |
+| Concentration | `max_holdings` | `40` | positive integer | Hard maximum number of long-equity holdings; passing the Top-N test does not bypass it. |
+| Turnover | `use_low_turnover` | `True` | `True`, `False` | Enables the cross-sectional low-turnover screen. |
+| Turnover | `turnover_quantile` | `0.34` | `0`–`1` | Keeps the lower-turnover portion of eligible managers using the configured quantile threshold. |
+| Hedging | `use_hedge_filter` | `True` | `True`, `False` | Enables the filing-version PUT exposure screen. |
+| Hedging | `hedge_put_max_weight` | `5%` | `0`–`1` | Maximum PUT value relative to the filing book. Missing exact-version evidence is handled fail-closed. |
+| Value tilt | `use_value_tilt` | `True` | `True`, `False` | Enables the manager value-tilt screen. |
+| Value tilt | `value_tilt_min_pctl` | `50%` | `0`–`1` | Minimum cross-sectional percentile of the manager value score. |
+| Active share | `use_active_share` | `False` | `True`, `False` | Optional manager active-share screen; disabled in the thesis default. |
+| Active share | `min_active_share` | `60%` | `0`–`1` | Minimum true active share when that screen is enabled and benchmark weights exist. |
+| Idea ranking | `idea_signal` | `cps_ir` | see signal table below | Ranks securities inside each manager book; it is not the final portfolio weight. |
+| Idea selection | `top_n_ideas` | `3` | positive integer | Selects each qualifying manager's top three ranked ideas. |
+| Idea allocation | `idea_aggregation` | `manager_equal` | `manager_equal`, `score`, `manager_count`, `equal_name` | Determines how selected manager ideas become aggregate portfolio weights. |
+| Consensus | `min_consensus_funds` | `2` | positive integer | A stock must be selected by at least two qualifying managers. Repeated selections count as independent manager votes. |
+| Breadth | `min_portfolio_names` | `10` | non-negative integer | If fewer names survive, that rebalance is invalid and held as cash. |
+| Breadth | `max_portfolio_names` | `30` | positive integer or `None` | Caps the aggregate target before weight caps. This Top-30 limit is a thesis convenience and an explicit paper-replication deviation. |
+| Risk cap | `max_name_weight` | `10%` | `0`–`1` | Maximum final weight in one ticker. |
+| Risk cap | `max_issuer_weight` | `15%` | `0`–`1` | Maximum combined weight for tickers mapped to the same issuer group. |
+| Holding | `holding_horizon_q` | `0` | integer `>= 0` | `0` fully rebalances; `N` carries a dropped target for up to `N` additional quarters. |
+| Signal validity | `min_active_weight_holdings` | `10` | positive integer | Minimum manager-book breadth required before active-weight/CPS signals are considered meaningful. |
+| Trading cost | `bps_per_side` | `15` bps | non-negative number | Cost charged separately on purchases and sales. |
+| Missing returns | `missing_price_policy` | `exit` | `exit`, `zero`, `raise` | `exit` liquidates an unpriced holding and reallocates to priced survivors; `zero` assumes zero return; `raise` stops the run. |
+| Active benchmark | `active_benchmark_source` | `manager_held_mcap` | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` | Benchmark weights used to calculate active-weight and CPS signals. `manager_held_mcap` is a public-data research proxy, not strict vendor PIT data. |
+
+`consensus_weight` is a legacy compatibility switch. When
+`idea_aggregation` is explicitly set—as it is in the thesis run—it has no
+effect. If aggregation is `None`, `consensus_weight=True` falls back to `score`
+and `False` falls back to `manager_count`.
+
+### Idea signals and allocation rules
+
+| `idea_signal` option | Ranking quantity |
+|---|---|
+| `level` | Current manager book weight. |
+| `change` | Quarter-over-quarter change in book weight. |
+| `initiation` | Newly initiated positions, ranked by current book weight. |
+| `active_weight` | Current book weight minus point-in-time benchmark weight. |
+| `active_weight_change` | Quarter-over-quarter change in active weight. |
+| `active_weight_initiation` | Newly initiated positions ranked by active weight. |
+| `cps_ir` | Current active weight multiplied by CAPM residual volatility. This is the implemented CPS implied-IR ranking proxy. |
+| `cps_ir_change` | Quarter-over-quarter change in the CPS implied-IR proxy. |
+| `cps_ir_initiation` | Newly initiated positions ranked by the CPS implied-IR proxy. |
+
+Allocation is separate from ranking:
+
+- `manager_equal` gives every contributing manager one equal budget. Within a
+  manager's Top-N selections, that budget follows the manager's reported book
+  weights. If several managers select the same stock, it receives several
+  manager shares.
+- `score` sums ranking scores across managers and normalizes them. This is an
+  experimental score-weighted construction, not the paper-style default.
+- `manager_count` weights by the number of managers selecting each stock.
+- `equal_name` gives every surviving selected stock equal weight.
+
+### CPS residual-volatility inputs
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `idio_vol_window_months` | `24` | Trailing monthly window for the CAPM residual-volatility estimate. |
+| `idio_vol_min_obs` | `12` | Minimum valid monthly observations. |
+| `idio_vol_floor` | `10%` | Lower annualized residual-volatility guardrail. |
+| `idio_vol_cap` | `80%` | Upper annualized residual-volatility guardrail. |
+| `idio_vol_winsor_lower`, `idio_vol_winsor_upper` | `5%`, `95%` | Cross-sectional winsorization percentiles. |
+
+These volatility controls stabilize the implied-IR ranking input. High
+idiosyncratic volatility is not treated as an independent positive-alpha
+factor, and the raw CPS score is not the thesis portfolio weight.
+
+### Default robustness sweep
+
+The default Cartesian sweep contains 72 configurations:
+
+- `idea_signal`: `cps_ir`, `cps_ir_change`, `cps_ir_initiation`
+- `top_n_ideas`: `1`, `3`, `5`
+- `idea_aggregation`: `manager_equal`, `score`
+- `min_consensus_funds`: `1`, `2`
+- `holding_horizon_q`: `0`, `1`
+
+The sweep fixes `manager_filter_mode=dedicated_like`, AUM at `$0.1B`–`$10B`,
+`min_portfolio_names=10`, `max_portfolio_names=30`,
+`min_active_weight_holdings=10`, and keeps concentration, low-turnover, and
+value-tilt screens enabled. Walk-forward selection uses 48 training months and
+12 test months, selecting on active Sharpe. Marginal-IR analysis separately
+tests isolated screen contributions.
+
+### Live data and runtime defaults
+
+| Parameter | Default / options | Purpose |
+|---|---|---|
+| `identity` | placeholder string | SEC-compliant caller identity; replace with a real name and email. |
+| `openfigi_key` | `None` | Optional OpenFIGI API key; local environment loading can supply it. |
+| `sec_history_start` | `2013-10-01` | Earliest SEC filing-history request date. |
+| `price_history_start` | `2014-01-01` | Earliest price-history request date. |
+| `start`, `end` | `2015-01-01`, `2026-05-31` | Default backtest window. |
+| `benchmark_ticker` | `SPY` | Broad-market return benchmark. |
+| ingest `min_aum`, `max_aum` | `$0.1B`, `$30B` | Broad ingestion bounds, distinct from the thesis filter band. |
+| ingest `max_holdings` | `40` | Ingestion/universe holding-count ceiling. |
+| ingest `max_put_weight` | `10%` | Broad ingestion PUT bound; thesis filtering later uses `5%`. |
+| `require_factors` | `False` | Whether missing factor data must abort rather than degrade optional analysis. |
+| `price_source` | `chart`; options `chart`, `auto`, `yfinance` | Price downloader selection. |
+| `exclude_fund_like_holdings` | `True` | Excludes ETF/ETN/fund-like rows in the configured live pipeline. |
+| `refresh_openfigi_metadata`, `force_refresh_openfigi` | `False`, `False` | Control normal metadata refresh and explicit full remapping. |
+| benchmark staleness | `45` days | Maximum age for active-benchmark snapshots. |
+| market-cap download | auto `True`, stale `45` days, shares stale `550` days | Controls the manager-held market-cap proxy cache. |
+| market-cap requests | batch `25`, workers `6`, timeout `20s` | External request batching and concurrency. |
+| cache/override paths | values in `LIVE_CONFIG` | Paths for OpenFIGI, prices, benchmark weights, market cap, security groups, manager overrides, classification, and idio-vol caches. |
+
+### Command-line parameters
+
+| Option | Default | Allowed values / effect |
+|---|---|---|
+| `--mode` | `synthetic` | `synthetic`, `live`, `live-smoke` |
+| `--output-root` | `reports` | Output directory. |
+| `--smoke-cusips` | `300` | CUSIPs mapped in smoke mode. |
+| `--smoke-tickers` | `200` | Tickers priced in smoke mode. |
+| `--skip-marginal` | off | Skip marginal-IR ablation. |
+| `--skip-sweep` | off | Skip grid and walk-forward sweep. |
+| `--equity-only` | off | Explicitly request exclusion of fund-like rows; the current live config already defaults to exclusion. |
+| `--refresh-openfigi-metadata` | off | Refresh cached mappings missing classification metadata. |
+| `--price-source` | live-config default | `chart`, `auto`, `yfinance` |
+| `--active-benchmark-source` | thesis/live-config default | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` |
+| `--active-benchmark-weights` | none | CSV/Parquet/XLSX table containing `month_end,ticker,weight`. |
+| `--active-benchmark-max-stale-days` | live-config default | Override benchmark snapshot age limit. |
+| `--sweep-checkpoint-every` | `5` | Write partial sweep output every N configurations; `0` disables it. |
+| `--manager-filter-mode` | thesis default | `all`, `exclude_dirty`, `dedicated_like` |
+
+For direct library use, the untouched dataclass defaults are
+`UniverseConfig(min_aum=$1B, max_aum=$30B, ...)`,
+`PortfolioConfig(top_n_ideas=8, idea_signal="level", max_name_weight=5%,
+max_issuer_weight=7.5%, ...)`, and
+`BacktestConfig(manager_filter_mode="all",
+active_benchmark_source="visible_13f_aggregate",
+missing_price_policy="exit")`. They are API baselines, not the thesis recipe.
+
 ## Testing
 
 ```powershell
@@ -397,3 +549,13 @@ The repository intentionally ignores local data and generated artifacts:
 - `yfinance_close_cache_coverage.parquet`
 
 Regenerate these locally as needed.
+
+To rebuild only an existing run's interactive HTML after report-template changes,
+without rerunning data ingestion, backtests, or the parameter sweep:
+
+```powershell
+python -B report.py refresh reports/<run-directory>
+```
+
+This reads `sweep_grid.csv` and `sweep_returns.csv` from the run directory and
+overwrites its `interactive_results.html`. Use `--output <path>` to write elsewhere.

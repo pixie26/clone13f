@@ -1,74 +1,84 @@
-# AGENTS.md
+# Project
 
-## Mission and role
+Point-in-time SEC 13F manager-selection, portfolio construction, backtesting,
+risk, and reporting infrastructure.
 
-Build reusable systematic-quant research infrastructure for SEC 13F universes,
-signals, portfolio construction, point-in-time backtesting, risk, and reporting.
-Act as a senior quantitative research infrastructure engineer. Do not fabricate
-credentials, data, or performance.
+## Core invariants
 
-## Rules that apply to every task
+- Use only information publicly available at the decision timestamp.
+- Distinguish report, filing, rebalance, and execution dates.
+- Preserve point-in-time universe membership and exact filing-version provenance.
+- Model long equity holdings only unless the task explicitly changes that scope.
+- Never fabricate identifiers, prices, tradability, holdings, or performance.
+- Report missing, unmapped, unparseable, stale, and dropped records.
+- Avoid look-ahead bias, survivorship bias, future joins, and silent coercion.
+- Do not silently change strategy, benchmark, costs, timing, or output schemas.
+- Keep saved research reproducible through explicit config and run manifests.
+- Preserve user changes and unrelated dirty-worktree edits.
 
-1. Preserve point-in-time correctness. Use the version available at the decision
-   timestamp and distinguish report, filing, rebalance, and execution dates.
-2. Do not introduce look-ahead, survivorship bias, future joins, silent parse
-   coercion, or silent changes to strategy, benchmark, costs, or timing.
-3. Keep data loading, signals, portfolio construction, backtesting, and reporting
-   separate. Prefer small, reviewable changes over rewrites.
-4. Make results reproducible. Saved research needs explicit configuration and a
-   manifest containing git SHA, config/input hashes, timestamp, and key versions.
-5. Count and report missing, unmapped, unparseable, stale, or dropped records.
-   Missing data must never become fabricated zeroes or fake tradability.
-6. Preserve `interactive_results_template.html` as the canonical interactive UI.
-   `report.py` injects payloads into its placeholders; do not duplicate the HTML.
-7. Preserve user changes and unrelated dirty-worktree edits.
+## Important paths
 
-## Coding and testing
+- `build_universe.py`: SEC filing ingestion and point-in-time universe building.
+- `data_adapters.py`: external data access, mappings, prices, and caches.
+- `engine.py`: signals, portfolio construction, execution, and backtesting.
+- `run_example.py`: live and synthetic research orchestration and configuration.
+- `report.py`: report payload generation.
+- `interactive_results_template.html`: canonical interactive report UI.
+- `runtime_support.py`: environment, progress, config hash, and manifest helpers.
+- `run_diagnostics.py`: run diagnostics and trace summaries.
+- `tests/`: regression and point-in-time tests.
+- `docs/agent/`: detailed task-specific agent guidance.
 
-- Use Python 3.11+, `pathlib.Path`, public-function type hints, pure functions where
-  practical, deterministic seeds, and explicit date formats.
-- Avoid chained pandas assignment; sort indexes before rolling operations.
-- Parse SEC dates through a tested helper. If coercion is unavoidable, assert a
-  low `NaT` rate and report counts and samples.
-- Keep compatibility shims when extracting modules; remove them only in a
-  separately requested cleanup.
-- Run the narrowest relevant tests, then broader tests in proportion to risk.
+## Working rules
 
-Preferred checks:
+- Inspect the relevant code and tests before editing.
+- Make minimal, scoped, reviewable changes; do not rewrite unrelated modules.
+- Keep data loading, signals, portfolio construction, backtesting, and reporting
+  separated by responsibility.
+- Preserve public imports, CLI behavior, and exported schemas unless requested.
+- Keep compatibility shims during module extraction; remove them separately.
+- Use deterministic seeds and explicit date handling where results depend on them.
+- Do not install dependencies, change external data, or regenerate large outputs
+  unless the task requires it.
 
-```text
-python -B -m pytest tests
-python -B -m pytest tests/test_point_in_time.py
-python -B -m pytest tests/test_dates.py
-python -B run_example.py --mode synthetic
-```
+## Context and large-file discipline
 
-Run configured `ruff`, `black --check`, or `mypy` checks when present. Do not
-install missing packages unless requested.
+- Search first and read only the relevant functions, tests, and local context.
+- Do not inspect `outputs/`, reports, caches, raw SEC data, or large datasets unless
+  required by the task.
+- For CSV, Parquet, or JSON data, inspect schema, dimensions, selected rows, and
+  aggregates instead of printing entire files.
+- Do not load every routed guidance document for a narrow task.
 
-## Data and security
+## Verification
 
-Never commit secrets, credentials, personal/client data, unclear-licence paid
-data, or large generated data not intended for version control. Prefer
-configurable paths and `.env` templates.
+- Run the narrowest relevant tests first.
+- Broaden testing for point-in-time logic, strategy behavior, data contracts,
+  timing, portfolio construction, reporting schemas, or cross-module changes.
+- Use `python -B run_example.py --mode synthetic` for pipeline-level validation.
+- Run configured lint, format, or type checks when relevant and available.
+- Do not treat missing optional tooling as permission to install it.
 
-## Response contract
+## Security and generated data
 
-For code changes, report: what changed, why, how it was tested, and limitations.
-For bugs, report: root cause, minimal fix, historical-result impact, and whether
-old outputs need regeneration.
+- Never commit secrets, credentials, personal/client data, or restricted data.
+- Keep paths configurable and provide `.env` templates rather than real secrets.
+- Do not commit large generated artifacts unless they are intentionally versioned.
 
-## Task-specific guidance routing
+## Task-specific guidance
 
 Read only the documents relevant to the current task:
 
-- `docs/agent/quant-research.md`: backtests, signals, costs, robustness, and
+- `docs/agent/quant-research.md`: signals, backtests, costs, robustness, and
   research acceptance.
-- `docs/agent/point-in-time-13f.md`: SEC/13F parsing, amendments, mapping,
+- `docs/agent/point-in-time-13f.md`: SEC parsing, amendments, mappings,
   availability, and universe construction.
-- `docs/agent/repository-notes.md`: current naming contracts, data-source limits,
-  known issues, and performance backlog.
-- `docs/agent/architecture.md`: module boundaries, refactors, and repository
-  structure changes.
+- `docs/agent/repository-notes.md`: naming contracts, source limitations, known
+  issues, and current performance backlog.
+- `docs/agent/architecture.md`: module boundaries and structural refactors.
 
-Do not load every routed document for unrelated or narrowly scoped work.
+## Handoff
+
+- Report changed files, rationale, tests run, and remaining risks.
+- For bug fixes, state root cause, historical-output impact, and whether prior
+  outputs need regeneration.

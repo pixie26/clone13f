@@ -209,10 +209,10 @@
     const PORTFOLIO = __PORTFOLIO_PAYLOAD__;
     const META = __META_PAYLOAD__;
 
-    const filterFields = ["valid_config","aum_band","idea_signal","top_n_ideas","min_consensus_funds","holding_horizon_q","min_portfolio_names","max_portfolio_names","use_concentration","use_low_turnover","use_value_tilt"];
-    const tableFields = ["valid_config","aum_band","idea_signal","top_n_ideas","min_consensus_funds","holding_horizon_q","ann_return","ann_vol","max_drawdown","sharpe","active_sharpe","ir","invested_month_frac","avg_effective_names","avg_selected_managers","avg_max_weight"];
+    const filterFields = ["valid_config","aum_band","idea_signal","idea_aggregation","top_n_ideas","min_consensus_funds","holding_horizon_q","min_portfolio_names","max_portfolio_names","use_concentration","use_low_turnover","use_value_tilt"];
+    const tableFields = ["valid_config","aum_band","idea_signal","idea_aggregation","top_n_ideas","min_consensus_funds","holding_horizon_q","ann_return","ann_vol","max_drawdown","sharpe","active_sharpe","ir","invested_month_frac","avg_effective_names","avg_selected_managers","avg_max_weight"];
     const labels = {
-      valid_config:"valid", aum_band:"AUM", idea_signal:"signal", top_n_ideas:"topN", min_consensus_funds:"min consensus", holding_horizon_q:"horizonQ",
+      valid_config:"valid", aum_band:"AUM", idea_signal:"signal", idea_aggregation:"aggregation", top_n_ideas:"topN", min_consensus_funds:"min consensus", holding_horizon_q:"horizonQ",
       min_portfolio_names:"min names", max_portfolio_names:"max names", use_concentration:"concentration", use_low_turnover:"low turnover", use_value_tilt:"value tilt",
       ann_return:"ann ret", ann_vol:"ann vol", max_drawdown:"max DD", sharpe:"Sharpe", active_sharpe:"active Sharpe", ir:"IR", invested_month_frac:"invested", avg_effective_names:"avg names", avg_selected_managers:"avg mgrs", avg_max_weight:"avg max wt"
     };

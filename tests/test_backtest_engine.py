@@ -50,7 +50,7 @@ from run_diagnostics import manager_characteristics_audit
 from sweep import deflated_sharpe
 
 
-def test_default_thesis_and_144_trial_sweep_contract():
+def test_default_thesis_and_72_trial_sweep_contract():
     thesis, _, axes, _, _ = _default_run_configs()
 
     assert thesis.portfolio.idea_signal == "cps_ir"
@@ -59,8 +59,9 @@ def test_default_thesis_and_144_trial_sweep_contract():
     assert thesis.portfolio.idea_aggregation == "manager_equal"
     assert thesis.universe.use_concentration is True
     assert LIVE_CONFIG["max_holdings"] == thesis.universe.max_holdings == 40
-    assert thesis.portfolio.min_consensus_funds == 1
+    assert thesis.portfolio.min_consensus_funds == 2
     assert thesis.portfolio.max_portfolio_names == 30
+    assert axes[("universe", "aum_band")] == [("0.1-10B", 0.1e9, 10e9)]
     assert axes[("portfolio", "idea_signal")] == [
         "cps_ir",
         "cps_ir_change",
@@ -69,7 +70,7 @@ def test_default_thesis_and_144_trial_sweep_contract():
     assert axes[("portfolio", "idea_aggregation")] == ["manager_equal", "score"]
     assert axes[("portfolio", "min_consensus_funds")] == [1, 2]
     assert axes[("universe", "use_concentration")] == [True]
-    assert int(np.prod([len(values) for values in axes.values()])) == 144
+    assert int(np.prod([len(values) for values in axes.values()])) == 72
 
 
 def test_concentration_requires_top10_threshold_and_max_holdings_cap():
@@ -3361,6 +3362,7 @@ def test_interactive_results_writes_self_contained_html(tmp_path):
                 "config_id": "aum_band=0.5-5B|idea_signal=active_weight",
                 "aum_band": "0.5-5B",
                 "idea_signal": "active_weight",
+                "idea_aggregation": "manager_equal",
                 "top_n_ideas": 3,
                 "min_consensus_funds": 2,
                 "holding_horizon_q": 0,
@@ -3388,6 +3390,8 @@ def test_interactive_results_writes_self_contained_html(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "13F Parameter Sweep Results" in text
     assert "active_weight" in text
+    assert '"idea_aggregation":"manager_equal"' in text
+    assert 'idea_aggregation:"aggregation"' in text
     assert "growth" in text
     assert "splitter" in text
     assert "valid_config" in text
@@ -3397,6 +3401,32 @@ def test_interactive_results_writes_self_contained_html(tmp_path):
     assert "__DATA_PAYLOAD__" not in text
     assert "__PORTFOLIO_PAYLOAD__" not in text
     assert "__META_PAYLOAD__" not in text
+
+
+def test_refresh_interactive_results_rebuilds_html_from_saved_sweep(tmp_path):
+    config_id = "idea_aggregation=manager_equal|idea_signal=cps_ir"
+    pd.DataFrame(
+        [{
+            "config_id": config_id,
+            "idea_signal": "cps_ir",
+            "idea_aggregation": "manager_equal",
+            "active_sharpe": 0.8,
+        }]
+    ).to_csv(tmp_path / "sweep_grid.csv", index=False)
+    pd.DataFrame(
+        [
+            {"config_id": config_id, "date": "2024-01-31", "return": 0.01, "benchmark_return": 0.005},
+            {"config_id": config_id, "date": "2024-02-29", "return": 0.02, "benchmark_return": 0.010},
+        ]
+    ).to_csv(tmp_path / "sweep_returns.csv", index=False)
+
+    output = rp.refresh_interactive_results(tmp_path)
+
+    assert output == str(tmp_path / "interactive_results.html")
+    text = (tmp_path / "interactive_results.html").read_text(encoding="utf-8")
+    assert '"idea_aggregation":"manager_equal"' in text
+    assert config_id in text
+    assert '"benchmark":[1.005,1.01505]' in text
 
 
 def test_single_config_result_grid_supports_skip_sweep_report():

@@ -6,7 +6,9 @@ alpha, marginal-IR ablation, parameter plateau heatmap, and OOS/DSR scorecard.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import re
 from pathlib import Path
 
 import matplotlib
@@ -486,6 +488,7 @@ def interactive_results(
         "use_low_turnover",
         "use_value_tilt",
         "idea_signal",
+        "idea_aggregation",
         "top_n_ideas",
         "min_consensus_funds",
         "holding_horizon_q",
@@ -542,3 +545,97 @@ def interactive_results(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
     return str(output_path)
+
+
+def refresh_interactive_results(run_dir: str | Path, output: str | Path | None = None) -> str:
+    """Rebuild interactive_results.html from an existing run without rerunning research."""
+    run_dir = Path(run_dir)
+    grid_path = run_dir / "sweep_grid.csv"
+    returns_path = run_dir / "sweep_returns.csv"
+    missing = [str(path) for path in (grid_path, returns_path) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"missing required sweep output(s): {', '.join(missing)}")
+
+    grid = pd.read_csv(grid_path)
+    returns_frame = pd.read_csv(returns_path)
+    required = {"config_id", "date", "return"}
+    absent = sorted(required.difference(returns_frame.columns))
+    if absent:
+        raise ValueError(f"{returns_path} is missing required column(s): {', '.join(absent)}")
+    returns_frame["date"] = pd.to_datetime(returns_frame["date"], errors="raise")
+    returns_by_config_id = {
+        str(config_id): group.set_index("date")["return"].sort_index()
+        for config_id, group in returns_frame.groupby("config_id", sort=False)
+    }
+
+    benchmark = None
+    if "benchmark_return" in returns_frame:
+        benchmark = (
+            returns_frame.loc[:, ["date", "benchmark_return"]]
+            .dropna(subset=["benchmark_return"])
+            .drop_duplicates("date")
+            .set_index("date")["benchmark_return"]
+            .sort_index()
+        )
+
+    def read_csv_if_present(filename: str) -> pd.DataFrame | None:
+        path = run_dir / filename
+        return pd.read_csv(path) if path.is_file() else None
+
+    meta_payload: dict = {}
+    existing_html = run_dir / "interactive_results.html"
+    if existing_html.is_file():
+        match = re.search(
+            r"^\s*const META = (.*);\s*$",
+            existing_html.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+        if match:
+            meta_payload = json.loads(match.group(1))
+
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    input_summary = dict(manifest.get("input_summary") or {})
+    input_summary["mapping"] = input_summary.get("mapping_diagnostics") or {}
+    meta_payload.update({
+        "configHash": manifest.get("config_hash", meta_payload.get("configHash")),
+        "gitSha": manifest.get("git_sha", meta_payload.get("gitSha")),
+        "runTimestampUtc": manifest.get("run_timestamp_utc", meta_payload.get("runTimestampUtc")),
+        "metrics": manifest.get("metrics") or meta_payload.get("metrics") or {},
+        "rebalanceSummaryStats": manifest.get("rebalance_summary_stats") or meta_payload.get("rebalanceSummaryStats") or {},
+        "inputSummary": input_summary or meta_payload.get("inputSummary") or {},
+    })
+    rules_path = run_dir / "rebalance_rules_thesis.json"
+    if rules_path.is_file():
+        meta_payload["rules"] = json.loads(rules_path.read_text(encoding="utf-8"))
+
+    output_path = Path(output) if output is not None else existing_html
+    return interactive_results(
+        grid,
+        returns_by_config_id,
+        benchmark=benchmark,
+        path=str(output_path),
+        portfolio_holdings=read_csv_if_present("rebalance_holdings_thesis.csv"),
+        rebalance_summary=read_csv_if_present("rebalance_summary_thesis.csv"),
+        portfolio_config_id=meta_payload.get("thesisConfigId"),
+        meta_payload=meta_payload,
+    )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build 13F research reports from saved run outputs.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    refresh = subparsers.add_parser("refresh", help="Rebuild interactive HTML without rerunning the sweep.")
+    refresh.add_argument("run_dir", help="Directory containing sweep_grid.csv and sweep_returns.csv.")
+    refresh.add_argument("--output", help="Output HTML path; defaults to RUN_DIR/interactive_results.html.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    if args.command == "refresh":
+        print(f"Saved interactive HTML: {refresh_interactive_results(args.run_dir, args.output)}")
+
+
+if __name__ == "__main__":
+    main()

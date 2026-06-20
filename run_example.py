@@ -1203,7 +1203,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
             idea_signal="cps_ir",
             top_n_ideas=3,
             idea_aggregation="manager_equal",
-            min_consensus_funds=1,
+            min_consensus_funds=2,
             min_portfolio_names=10,
             max_portfolio_names=30,
             holding_horizon_q=0,
@@ -1229,7 +1229,6 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         ("backtest", "manager_filter_mode"): ["dedicated_like"],
         ("universe", "aum_band"): [
             ("0.1-10B", 0.1e9, 10e9),
-            ("15-30B", 15e9, 30e9),
         ],
         ("portfolio", "idea_signal"): [
             "cps_ir",
