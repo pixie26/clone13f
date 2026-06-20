@@ -370,7 +370,148 @@ Outputs are written to timestamped folders under `reports/`, including:
 - `manager_classification.csv`
 - `manager_filter_acceptance.csv`
 
-## Parameters
+## 参数（中文） / Parameters (English)
+
+以下先给出完整中文说明，后面保留对应英文版本。参数名、枚举值和代码中的
+配置键不翻译，以便直接搜索源码和运行清单。
+
+### 中文：Thesis 策略默认参数
+
+这里必须区分两类默认值：`engine.py` 中 dataclass 的值是通用 API 默认值；
+`run_example.py::_default_run_configs()` 会覆盖其中多项，形成实际 thesis
+研究组合。下表默认指 thesis 配置。
+
+| 层级 | 参数 | Thesis 默认值 | 可选值 / 范围 | 重要解释 |
+|---|---|---:|---|---|
+| 管理人池 | `manager_filter_mode` | `dedicated_like` | `all`, `exclude_dirty`, `dedicated_like` | 保留分类为集中选股型的管理人；`exclude_dirty` 只排除明显不合格者，`all` 是不筛选基线。 |
+| 管理人池 | `min_aum`, `max_aum` | `$0.1B`, `$10B` | 非负美元边界 | 决策时点的管理人 AUM 区间；live 原始抓取覆盖 `$0.1B`–`$30B`。 |
+| 管理人池 | `min_history_quarters` | `4` | 整数 `>=1` | 管理人进入候选池前至少需要的申报历史。 |
+| 时效性 | `max_stale_filing_months` | `6` | 正整数或 `None` | 申报版本在决策月过旧时剔除。 |
+| 时效性 | `max_stale_period_months` | `6` | 正整数或 `None` | 持仓报告期在决策月过旧时剔除。 |
+| 集中度 | `use_concentration` | `True` | `True`, `False` | 是否启用集中度筛选。 |
+| 集中度 | `top_n_concentration` | `10` | 正整数 | 计算集中度时使用的最大持仓数量。 |
+| 集中度 | `min_top_n_weight` | `50%` | `0`–`1` | 前 N 大持仓合计权重的最低要求。 |
+| 集中度 | `max_holdings` | `40` | 正整数 | 长股票持仓数量硬上限；通过 Top-N 集中度测试也不能绕过。 |
+| 换手率 | `use_low_turnover` | `True` | `True`, `False` | 是否启用低换手管理人筛选。 |
+| 换手率 | `turnover_quantile` | `0.34` | `0`–`1` | 使用横截面分位数保留较低换手的管理人。 |
+| 对冲 | `use_hedge_filter` | `True` | `True`, `False` | 是否启用精确申报版本的 PUT 暴露筛选。 |
+| 对冲 | `hedge_put_max_weight` | `5%` | `0`–`1` | PUT value 相对申报组合的最大比例；缺少精确版本证据时采用 fail-closed。 |
+| 价值倾向 | `use_value_tilt` | `True` | `True`, `False` | 是否启用管理人价值倾向筛选。 |
+| 价值倾向 | `value_tilt_min_pctl` | `50%` | `0`–`1` | 管理人价值分数的最低横截面百分位。 |
+| Active share | `use_active_share` | `False` | `True`, `False` | 可选的管理人 active-share 筛选；thesis 默认关闭。 |
+| Active share | `min_active_share` | `60%` | `0`–`1` | 启用筛选且存在基准权重时的最低 active share。 |
+| Idea 排名 | `idea_signal` | `cps_ir` | 见下方信号表 | 只负责每位管理人内部的股票排名，不直接成为最终组合权重。 |
+| Idea 选择 | `top_n_ideas` | `3` | 正整数 | 每位合格管理人选择排名最高的 3 个 idea。 |
+| Idea 分配 | `idea_aggregation` | `manager_equal` | `manager_equal`, `score`, `manager_count`, `equal_name` | 决定被选 idea 如何聚合成股票目标权重。 |
+| 共识 | `min_consensus_funds` | `2` | 正整数 | 股票至少被两位合格管理人选中；重复选择代表独立的管理人票数。 |
+| 组合宽度 | `min_portfolio_names` | `10` | 非负整数 | 存活股票少于该值时，该次再平衡无效并持有现金。 |
+| 组合宽度 | `max_portfolio_names` | `30` | 正整数或 `None` | 权重上限处理前最多保留 30 只股票；这是 thesis 的便利性约束，也是明确记录的论文复现偏差。 |
+| 风险上限 | `max_name_weight` | `10%` | `0`–`1` | 单一 ticker 的最终权重上限。 |
+| 风险上限 | `max_issuer_weight` | `15%` | `0`–`1` | 映射到同一发行人的多个 ticker 合计权重上限。 |
+| 持有期 | `holding_horizon_q` | `0` | 整数 `>=0` | `0` 表示完全再平衡；`N` 表示目标退出后最多继续持有 N 个季度。 |
+| 信号有效性 | `min_active_weight_holdings` | `10` | 正整数 | 使用 active-weight/CPS 信号前要求管理人组合达到的最低宽度。 |
+| 交易成本 | `bps_per_side` | `15` bps | 非负数 | 买入和卖出分别计费。 |
+| 缺失收益 | `missing_price_policy` | `exit` | `exit`, `zero`, `raise` | `exit` 卖出缺失价格的持仓并分配给其余股票；`zero` 假设收益为零；`raise` 中止运行。 |
+| 主动基准 | `active_benchmark_source` | `manager_held_mcap` | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` | 用于 active-weight/CPS 的基准权重；默认方案是公开数据研究代理，不是严格 vendor PIT 数据。 |
+
+`consensus_weight` 是兼容旧接口的开关。显式设置 `idea_aggregation` 后它
+不生效；当 aggregation 为 `None` 时，`True` 回退到 `score`，`False`
+回退到 `manager_count`。
+
+### 中文：Idea 信号与权重聚合
+
+| `idea_signal` | 排名含义 |
+|---|---|
+| `level` | 当前管理人组合权重。 |
+| `change` | 组合权重的季度变化。 |
+| `initiation` | 新建仓股票，按当前组合权重排名。 |
+| `active_weight` | 当前组合权重减去 PIT 基准权重。 |
+| `active_weight_change` | Active weight 的季度变化。 |
+| `active_weight_initiation` | 新建仓股票，按 active weight 排名。 |
+| `cps_ir` | Active weight × CAPM 残差波动率，即当前实现的 CPS implied-IR 排名代理。 |
+| `cps_ir_change` | CPS implied-IR 代理的季度变化。 |
+| `cps_ir_initiation` | 新建仓股票，按 CPS implied-IR 代理排名。 |
+
+- `manager_equal`：每位参与管理人只有一份相同预算；其 Top-N idea 内部按
+  申报持仓权重分配。同一股票被多人选中会累积多份管理人预算。
+- `score`：跨管理人加总排名分数后归一化。这是实验性 score-weighting，
+  不是论文式默认构造。
+- `manager_count`：按选择该股票的管理人数加权。
+- `equal_name`：所有最终存活股票等权。
+
+### 中文：CPS 残差波动率参数
+
+| 参数 | 默认值 | 解释 |
+|---|---:|---|
+| `idio_vol_window_months` | `24` | CAPM 残差波动率的滚动月度窗口。 |
+| `idio_vol_min_obs` | `12` | 最少有效月度观测数。 |
+| `idio_vol_floor` | `10%` | 年化残差波动率下限。 |
+| `idio_vol_cap` | `80%` | 年化残差波动率上限。 |
+| `idio_vol_winsor_lower`, `idio_vol_winsor_upper` | `5%`, `95%` | 横截面缩尾分位数。 |
+
+这些参数只是稳定 implied-IR 排名输入。高 idiosyncratic volatility 本身
+不被视为正向 alpha，原始 CPS 分数也不是 thesis 最终股票权重。
+
+### 中文：默认稳健性 sweep
+
+默认笛卡尔网格共有 72 组：`idea_signal` 取 `cps_ir`、
+`cps_ir_change`、`cps_ir_initiation`；`top_n_ideas` 取 `1/3/5`；
+`idea_aggregation` 取 `manager_equal/score`；`min_consensus_funds` 取
+`1/2`；`holding_horizon_q` 取 `0/1`。
+
+固定项为：`manager_filter_mode=dedicated_like`、AUM `$0.1B`–`$10B`、
+`min_portfolio_names=10`、`max_portfolio_names=30`、
+`min_active_weight_holdings=10`，并启用集中度、低换手和价值倾向筛选。
+Walk-forward 使用 48 个月训练、12 个月测试，以 active Sharpe 选参；
+marginal-IR 另行评估单项筛选贡献。
+
+### 中文：Live 数据与运行参数
+
+| 参数 | 默认值 / 可选项 | 用途 |
+|---|---|---|
+| `identity` | 占位字符串 | SEC 请求身份，live 使用前必须替换为真实姓名和邮箱。 |
+| `openfigi_key` | `None` | 可由本地环境变量提供的 OpenFIGI API key。 |
+| `sec_history_start` | `2013-10-01` | SEC 申报历史起始日。 |
+| `price_history_start` | `2014-01-01` | 价格历史起始日。 |
+| `start`, `end` | `2015-01-01`, `2026-05-31` | 默认回测区间。 |
+| `benchmark_ticker` | `SPY` | 市场收益基准。 |
+| ingest `min_aum`, `max_aum` | `$0.1B`, `$30B` | 原始抓取范围，不等于 thesis 筛选范围。 |
+| ingest `max_holdings`, `max_put_weight` | `40`, `10%` | 抓取阶段的宽度和 PUT 边界；thesis 后续使用更严格的 `5%`。 |
+| `require_factors` | `False` | 因子缺失是否必须中止运行。 |
+| `price_source` | `chart` | 可选 `chart`, `auto`, `yfinance`。 |
+| `exclude_fund_like_holdings` | `True` | 排除 ETF/ETN/基金类持仓。 |
+| `refresh_openfigi_metadata`, `force_refresh_openfigi` | `False`, `False` | 控制缺失元数据刷新和强制全量重映射。 |
+| 基准时效上限 | `45` 天 | Active benchmark 快照最大年龄。 |
+| 市值缓存 | 自动下载 `True`，市值过期 `45` 天，股数过期 `550` 天 | 控制 manager-held market-cap 代理数据。 |
+| 市值请求 | batch `25`，workers `6`，timeout `20s` | 外部请求批量、并发和超时。 |
+| 缓存与 override 路径 | 见 `LIVE_CONFIG` | OpenFIGI、价格、基准、市值、证券组、管理人分类及 idio-vol 文件路径。 |
+
+### 中文：命令行参数
+
+| 选项 | 默认值 | 可选值 / 作用 |
+|---|---|---|
+| `--mode` | `synthetic` | `synthetic`, `live`, `live-smoke` |
+| `--output-root` | `reports` | 输出目录。 |
+| `--smoke-cusips`, `--smoke-tickers` | `300`, `200` | Smoke 模式映射和取价数量。 |
+| `--skip-marginal`, `--skip-sweep` | 关闭 | 分别跳过 marginal-IR 和参数网格。 |
+| `--equity-only` | 关闭 | 显式排除基金类行；当前 live 配置本身已默认排除。 |
+| `--refresh-openfigi-metadata` | 关闭 | 刷新缺少分类元数据的缓存映射。 |
+| `--price-source` | live 配置默认 | `chart`, `auto`, `yfinance` |
+| `--active-benchmark-source` | thesis/live 默认 | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` |
+| `--active-benchmark-weights` | 无 | 含 `month_end,ticker,weight` 的 CSV/Parquet/XLSX。 |
+| `--active-benchmark-max-stale-days` | live 配置默认 | 覆盖基准快照时效上限。 |
+| `--sweep-checkpoint-every` | `5` | 每 N 组保存部分网格结果；`0` 关闭。 |
+| `--manager-filter-mode` | thesis 默认 | `all`, `exclude_dirty`, `dedicated_like` |
+
+直接调用库时，未覆盖的 API 基线为
+`UniverseConfig(min_aum=$1B, max_aum=$30B, ...)`、
+`PortfolioConfig(top_n_ideas=8, idea_signal="level", max_name_weight=5%,
+max_issuer_weight=7.5%, ...)` 和
+`BacktestConfig(manager_filter_mode="all",
+active_benchmark_source="visible_13f_aggregate",
+missing_price_policy="exit")`。这些不是 thesis recipe。
+
+### English: parameter reference
 
 There are two distinct kinds of defaults. The dataclass defaults in `engine.py`
 are generic API defaults; the normal research run created by

@@ -56,7 +56,7 @@ def test_default_thesis_and_72_trial_sweep_contract():
     assert thesis.portfolio.idea_signal == "cps_ir"
     assert thesis.active_benchmark_source == "manager_held_mcap"
     assert thesis.portfolio.top_n_ideas == 3
-    assert thesis.portfolio.idea_aggregation == "manager_equal"
+    assert thesis.portfolio.idea_aggregation == "score"
     assert thesis.universe.use_concentration is True
     assert LIVE_CONFIG["max_holdings"] == thesis.universe.max_holdings == 40
     assert thesis.portfolio.min_consensus_funds == 2

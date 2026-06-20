@@ -1202,7 +1202,7 @@ def _default_run_configs() -> tuple[BacktestConfig, BacktestConfig, dict, int, i
         portfolio=PortfolioConfig(
             idea_signal="cps_ir",
             top_n_ideas=3,
-            idea_aggregation="manager_equal",
+            idea_aggregation="score",
             min_consensus_funds=2,
             min_portfolio_names=10,
             max_portfolio_names=30,
