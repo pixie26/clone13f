@@ -150,39 +150,39 @@ AUM、历史长度、持仓数、集中度、换手、PUT 暴露等属于通用 
 
 ### 3.1 Book weight 与 `manager_held_mcap`
 
-对经理 \(m\)、股票 \(i\) 和决策月 \(t\)，申报组合权重为：
+对经理 $m$、股票 $i$ 和决策月 $t$，申报组合权重为：
 
-\[
+$$
 w^{book}_{i,m,t}
 =
 \frac{\text{reported value}_{i,m,t}}
 {\sum_{j \in S_{m,t}}\text{reported value}_{j,m,t}},
-\]
+$$
 
-其中 \(S_{m,t}\) 是该经理在当月可用于研究的长股票持仓集合。
+其中 $S_{m,t}$ 是该经理在当月可用于研究的长股票持仓集合。
 
 `manager_held_mcap` 是一个**经理特定的 held-universe benchmark**：
 
-1. 取该经理当期持有、通过证券过滤且存在当月市值的股票集合 \(C_{m,t}\)；
-2. 对每只股票取得当月市场价值 \(MC_{i,t}\)；
+1. 取该经理当期持有、通过证券过滤且存在当月市值的股票集合 $C_{m,t}$；
+2. 对每只股票取得当月市场价值 $MC_{i,t}$；
 3. 只在该经理自己的 covered holdings 内归一化：
 
-\[
+$$
 w^{mcap}_{i,m,t}
 =
 \frac{MC_{i,t}}
 {\sum_{j \in C_{m,t}}MC_{j,t}}.
-\]
+$$
 
 随后：
 
-\[
+$$
 \text{ActiveWeight}_{i,m,t}
 =
 w^{book}_{i,m,t}
 -
 w^{mcap}_{i,m,t}.
-\]
+$$
 
 因此，`manager_held_mcap`：
 
@@ -217,15 +217,15 @@ w^{mcap}_{i,m,t}.
 
 当前 CPS 风格代理为：
 
-\[
+$$
 \text{CPS}_{i,m,t}
 =
 \max(\text{ActiveWeight}_{i,m,t},0)
 \times
 \widehat{\sigma}^{idio}_{i,t}.
-\]
+$$
 
-\(\widehat{\sigma}^{idio}_{i,t}\) 仅使用 \(t\) 之前的月度收益估计。该公式并非论文参数的机械复刻；24 个月窗口、最少观测、floor/cap 和 winsorization 都属于工程假设。
+$\widehat{\sigma}^{idio}_{i,t}$ 仅使用 $t$ 之前的月度收益估计。该公式并非论文参数的机械复刻；24 个月窗口、最少观测、floor/cap 和 winsorization 都属于工程假设。
 
 ### 3.3 Idea 选择与聚合
 
@@ -233,29 +233,29 @@ w^{mcap}_{i,m,t}.
 
 #### `manager_equal`：每个经理人一票
 
-设当月有 \(M_t\) 位实际贡献经理。每位经理获得相同总预算：
+设当月有 $M_t$ 位实际贡献经理。每位经理获得相同总预算：
 
-\[
+$$
 B_{m,t}=\frac{1}{M_t}.
-\]
+$$
 
-经理 \(m\) 的 Top-K idea 集合为 \(I_{m,t}\)。其经理内部预算按这些股票的申报 book weight 归一化：
+经理 $m$ 的 Top-K idea 集合为 $I_{m,t}$。其经理内部预算按这些股票的申报 book weight 归一化：
 
-\[
+$$
 q_{i,m,t}
 =
 \frac{w^{book}_{i,m,t}}
 {\sum_{j \in I_{m,t}}w^{book}_{j,m,t}}.
-\]
+$$
 
-股票 \(i\) 的 cap 前聚合权重为：
+股票 $i$ 的 cap 前聚合权重为：
 
-\[
+$$
 W^{precap}_{i,t}
 =
 \sum_{m:i\in I_{m,t}}
 \frac{1}{M_t}q_{i,m,t}.
-\]
+$$
 
 直观上：
 
