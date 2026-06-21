@@ -1,262 +1,778 @@
 # clone13f
 
-Research infrastructure for building and testing SEC 13F clone-style equity strategies.
+**用于构建、复现与检验 SEC 13F 跟投策略的点时（point-in-time, PIT）研究框架。**
 
-This repository is intended as a reproducible systematic research sandbox, not a discretionary stock-picking notebook. The pipeline builds a rule-based 13F manager universe, maps CUSIPs to tradable tickers, downloads public market data, runs point-in-time backtests, and writes auditable reports.
+> **研究状态｜Research status**
+>
+> 本项目是持续迭代的论文复现与稳健性研究，不是可直接交易的产品，也不代表稳定 alpha 已得到确认。  
+> 当前最可信的成果是研究基础设施和审计链路；任何策略结果都必须结合数据可得时间、参数搜索、交易成本和样本外检验解释。
 
-## Research Wiki / 研究概览
+## 摘要
 
-> Status: research infrastructure and an evolving replication study, not an
-> investable product or a claim of proven alpha. / 当前状态：研究基础设施与持续迭代的复现研究，
-> 不是可直接交易的产品，也不代表超额收益已经得到确认。
+本项目研究一个明确的问题：
 
-### 中文摘要
+> 公开披露且存在时滞的 SEC Form 13F，能否在信息实际可得之后识别机构投资者的高确信度股票，并构造扣除交易成本后仍具有稳定超额收益的组合？
 
-本项目研究一个可检验的问题：公开披露的 SEC Form 13F 能否在信息实际可得之后，
-用于识别机构投资者的高确信度股票，并构造扣除交易成本后仍有解释力的组合？研究动机来自
-Cohen、Polk 与 Silli 的 *Best Ideas*：基金持仓中相对基准更大的主动超配，可能比普通持仓
-包含更多经理人特有信息。本项目没有把论文结论当成既定事实，而是把它工程化为可审计的
-点时（point-in-time, PIT）数据、信号、组合、回测、稳健性检验和报告流水线。
+研究动机来自 Cohen、Polk 与 Silli 的 *Best Ideas*：经理人相对基准的高主动超配，可能比普通持仓包含更多经理人特有信息。本项目不把论文结论视为既定事实，而是将其拆解为可审计的研究假设，并工程化为：
 
-当前实现可以从 SEC 13F 数据建立经理与持仓历史，按 `filing_date` 控制可见性和修订版本，
-经 OpenFIGI 映射证券，接入公开价格、因子和市值代理，生成主动权重及 CPS 风格的隐含信息率
-信号，再进行 thesis/placebo 对照、边际贡献消融、参数网格、48/12 月滚动样本外选择和
-Deflated Sharpe 检查。现阶段可以确认的是“研究链路已具备可复核性”；尚不能确认的是
-“策略存在可发表或可交易的稳定 alpha”。
+- SEC filing/amendment 的点时版本管理；
+- CUSIP 映射、公司行动和证券类型过滤；
+- 经理人样本筛选与分类；
+- book weight、active weight 与 CPS 风格信号；
+- manager-level idea 选择与股票级聚合；
+- 交易成本、风险约束和月度回测；
+- placebo、消融、parameter sweep、walk-forward 与 Deflated Sharpe；
+- 逐月持仓、来源经理、筛选结果和运行 manifest。
 
-### 背景与论文基线
-
-13F 每季度披露美国机构经理人的多头证券持仓，但不提供完整空头、现金、衍生品经济敞口，
-也不能揭示季度内交易路径。披露通常滞后报告期末，因此严谨复现必须区分
-`period_date`、`filing_date`、组合再平衡日和执行收益期，不能按季度末持仓回填未来才公开的信息。
-
-本项目主要检验 [Cohen, Polk and Silli, *Best Ideas*](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=1364827)
-所代表的假设：经理人相对其投资机会集的高确信度主动持仓，平均而言可能优于其余持仓。
-论文结果在这里仅作为待复现的经济假设；数据时期、基金样本、基准、成本和可交易性不同，
-因此不能把原论文的统计结果直接外推到本项目。
-
-### 数据与点时设计
-
-| 层次 | 当前数据/实现 | 关键约束 |
-| --- | --- | --- |
-| 13F | SEC filings/datasets；保留报告期、披露日、修订和 accession | 决策时只使用当时已公开的版本 |
-| 标识映射 | CUSIP → OpenFIGI → ticker，带缓存和覆盖率诊断 | 映射缺失或公司行动可能造成系统性样本偏差 |
-| 收益 | Yahoo/yfinance 月收益与缓存 | 适合基础设施验证，不替代含退市收益的 CRSP/WRDS |
-| 主动基准 | 经理持仓子集的市值权重；亦支持历史 SPY 权重或可见 13F 聚合 | Yahoo 历史 shares 可能被修订，当前并非严格 vendor PIT |
-| 风险模型 | Fama-French 因子；默认用过去 24 个月 CAPM 残差波动率 | 只使用信号月之前的数据；窗口和截尾为工程假设 |
-| 审计 | 映射、覆盖、剔除、再平衡、持仓、成本、配置和 manifest | 缺失数据不填成零，不把无价格证券伪装为可交易 |
-
-ETF/ETN/基金类持仓在当前 live 默认中被排除；若研究经理人的 beta allocation，可显式纳入并
-单独报告。公开数据下的 `missing_price_policy="exit"` 只是缓解完整历史样本的幸存者偏差，
-不是退市收益模型。
-
-### 工程实现与研究流程
-
-1. 建立并缓存 SEC 持仓版本，记录解析与覆盖诊断。
-2. 在每个再平衡月选择当时可见且未过期的 filing/amendment。
-3. 过滤经理、证券和数据质量，计算集中度、换手、规模、PUT 权重等特征。
-4. 计算 book weight、主动超配和 CPS 风格信号；默认分数为
-   `positive_active_overweight × trailing_CAPM_residual_vol`。
-5. 每位经理选择 Top 1/3/5 ideas；当前论文式默认使用经理等预算，经理内部按申报 book weight
-   分配，再施加单名、issuer 和总名称数约束。
-6. 以月收益模拟披露后再平衡，扣除默认单边 15 bps 成本，并输出逐月交易审计。
-7. 与宽松 placebo、SPY 和因子模型比较，执行消融、预声明网格、walk-forward 与多重检验修正。
-8. 输出图表、交互报告、CSV 审计文件和包含 git SHA/config/input hash 的 manifest。
-
-### 可选参数
-
-主要研究轴包括：
-
-- 经理集合：AUM 区间、持仓数、Top-10 集中度、低换手、PUT 权重、价值倾向、历史长度，
-  以及 `all` / `exclude_dirty` / `dedicated_like` 分类模式。
-- 信号：`level`、`change`、`initiation`、主动权重系列和 `cps_ir` 系列。
-- 组合：每位经理 Top 1/3/5、`manager_equal` 或实验性 score 聚合、最低共识经理数、
-  持有/延续季度、最少/最多股票数、单名和同 issuer 上限。
-- 数据与基准：价格源、ETF 是否剔除、`manager_held_mcap`、历史 SPY holdings 或
-  `visible_13f_aggregate`，以及允许的快照陈旧天数。
-- 验证：回测区间、交易成本、48 个月训练/12 个月测试、网格轴与 checkpoint 频率。
-
-CLI 只暴露常用运行开关；完整研究参数由 `BacktestConfig`、`LIVE_CONFIG` 和预声明 sweep axes
-控制，并写入每次运行的 manifest，避免只保存“最好的结果”。
-
-### 当前证据与结论（截至 2026-06-20）
-
-一份本地探索性 live 快照（git `ab06d0b9`，2015-01 至 2026-05，137 个月）报告：thesis
-年化收益 17.0%、年化波动 23.8%、Sharpe 0.69、相对 SPY 的 IR 0.23，六因子年化 alpha
-约 6.3%，但 alpha t 值仅 1.14。该运行有 135 个再平衡月，其中 9 个月因最低持仓数约束无效，
-平均单边换手约 21.1%；采用 15 bps 单边成本。
-
-这些数字**不是项目的最终结果**：该快照跳过参数 sweep/DSR，使用旧版 `score` 聚合而非当前
-`manager_equal` 默认，且主动基准依赖 `strict_pit_row_fraction=0` 的 Yahoo shares proxy。
-因此当前最稳健的结论是：信号在某些设定下有正向点估计，但统计证据不足、对实现版本敏感，
-尚不能拒绝“结果来自噪声、数据偏差或参数选择”的解释。代码与审计链路已经达到进一步严谨
-复现的基础，但策略有效性仍是开放问题。
-
-### 已知问题与后续研究
-
-- 用 CRSP/WRDS 或等价数据替换 Yahoo，纳入真实退市收益、证券历史和可审计 PIT 市值。
-- 修复前期换手可能引用后来 amendment 的问题：按每个再平衡日重新构造前期可见版本。
-- 提升 CUSIP 映射和公司行动覆盖，并量化未映射市值是否集中于特定证券类型或时期。
-- 引入真实历史 SPY/SPX 成分权重；当前快照不能回填历史。
-- 对经理分类加入 Form ADV/外部标签验证；当前 `dedicated_like` 主要是本地行为分类。
-- 比较 CAPM 与 FF5+MOM 残差波动率、不同窗口、成本和流动性冲击模型。
-- 预留真正未触碰的 holdout，报告子时期、危机期、个股集中度和参数稳定性。
-- 重新运行当前 `manager_equal` 默认的完整 live sweep/DSR；在此之前不升级研究结论。
+当前结果支持的是**工程结论**，不是**投资结论**。部分探索性设定产生了较强的收益和 alpha 点估计，但统计显著性、严格 PIT 数据、经理实体清洗、现实流动性成本和 untouched holdout 尚未共同通过。
 
 ### English abstract
 
-This project asks whether public SEC Form 13F disclosures can identify managers'
-high-conviction equity ideas *after the disclosures become available*, and whether
-those ideas support a cost-aware, reproducible portfolio. Inspired by Cohen,
-Polk and Silli's *Best Ideas*, it treats relative active overweight as a hypothesis
-about manager-specific information—not as an established source of alpha.
+This project tests whether public SEC Form 13F disclosures can identify managers' high-conviction equity ideas **after the disclosures become available**, and whether those ideas can support a reproducible, cost-aware portfolio.
 
-The repository implements a point-in-time pipeline for SEC filing versions,
-CUSIP mapping, public returns and factor data, manager classification, active
-weights, CPS-style implied-information-ratio signals, portfolio construction,
-backtesting, ablation, parameter sweeps, walk-forward selection, deflated Sharpe
-checks, and auditable reporting. Report dates, filing dates, rebalance dates, and
-return realization are kept distinct; missing observations are counted rather
-than converted into fabricated zero returns.
+Inspired by Cohen, Polk and Silli's *Best Ideas*, the repository converts the economic hypotheses into an auditable point-in-time pipeline for filing versions, security mapping, manager selection, active-weight signals, portfolio formation, backtesting and robustness analysis. The current evidence supports a reproducible research process, but does not yet establish statistically reliable or investable alpha.
 
-The current evidence supports an engineering conclusion, not an investment
-conclusion: the research chain is reproducible and inspectable, while stable
-alpha is not yet established. One exploratory 2015-2026 live snapshot produced
-positive return, IR, and factor-alpha point estimates, but its alpha t-statistic
-was only 1.14; it skipped the full sweep/DSR, used an older score-weighted
-aggregation, and relied on a revisable Yahoo shares proxy. The next acceptance
-bar is a full run of the current manager-equal specification with audited PIT
-market-cap and delisting-aware return data, a true untouched holdout, realistic
-liquidity costs, and robustness across subperiods and parameter neighborhoods.
+---
 
-**Research summary.**
+## 1. 文献、研究问题与假设
 
-- **Prior research:** *Best Ideas* motivates the hypothesis that a manager's
-  largest active overweights contain more information than ordinary holdings.
-  This repository tests that hypothesis under its own sample and constraints;
-  it does not import the paper's result as an assumption.
-- **Data:** SEC filing versions and availability dates, OpenFIGI mappings,
-  Yahoo/yfinance monthly returns, Fama-French factors, and either manager-held
-  market-cap weights, historical SPY weights, or a visible-13F diagnostic proxy.
-- **Implementation:** PIT universe selection, manager classification, CPS-style
-  ranking, manager-equal portfolio construction, cost-aware monthly simulation,
-  thesis/placebo comparison, ablation, walk-forward evaluation, and manifests.
-- **Configurable axes:** manager/AUM filters, signal family, Top 1/3/5 ideas,
-  aggregation, consensus, carry horizon, portfolio caps, benchmark source,
-  data source, costs, date windows, and sweep design.
-- **Current conclusion:** positive exploratory point estimates exist, but they
-  are not statistically decisive or yet robust to the current specification,
-  strict PIT data, full multiple-testing control, and an untouched holdout.
-- **Research agenda:** amendment-safe turnover, delisting-aware returns, audited
-  PIT market caps, historical benchmark constituents, validated manager labels,
-  liquidity impact, richer residual-risk models, and subperiod stability.
+### 1.1 研究背景
 
-The Chinese sections above are the canonical detailed research summary; the
-operational reference below documents files, setup, commands, outputs, and
-implementation-specific caveats.
+Form 13F 每季度披露符合条件的美国机构投资经理人的部分多头证券持仓，但不完整披露：
 
-## What It Does
+- 空头、现金及完整衍生品经济敞口；
+- 季度内交易路径和实际建仓价格；
+- 报告期末至披露日之间的仓位变化；
+- 经理人的完整投资机会集；
+- 披露时经理是否仍然持有该证券。
 
-- Builds a rule-based universe from SEC 13F datasets.
-- Handles filing-date visibility and amendment versions in the backtest path.
-- Maps CUSIPs through OpenFIGI, with cache support and coverage diagnostics.
-- Downloads monthly returns from yfinance, with cache support and Yahoo Chart API fallback.
-- Supports idea signals such as `level`, `change`, `initiation`, `active_weight`, `active_weight_change`, `active_weight_initiation`, `cps_ir`, `cps_ir_change`, and `cps_ir_initiation`.
-- Supports PIT manager-type filtering with `all`, `exclude_dirty`, and `dedicated_like` modes.
-- Runs thesis vs placebo backtests, marginal-IR ablations, grid sweeps, walk-forward selection, and deflated Sharpe checks.
-- Writes dashboard PNGs, interactive sweep HTML, sweep CSVs, rebalance audit CSVs, rule summaries, and run manifests under `reports/`.
+因此，研究必须严格区分：
 
-## Main Files
+1. `period_date`：持仓报告期末；
+2. `filing_date`：申报公开日期；
+3. rebalance date：策略实际形成目标仓位的日期；
+4. return period：目标仓位开始获得收益的区间。
 
-- `build_universe.py` - SEC 13F dataset discovery, parsing, caching, and rule-based universe construction.
-- `data_adapters.py` - network-facing adapters for OpenFIGI, yfinance/Yahoo Chart, Fama-French factors, and mapping/price diagnostics.
-- `engine.py` - pure-pandas portfolio construction, point-in-time backtest, attribution, rebalance trace, and risk/cost logic.
-- `sweep.py` - parameter grid evaluation, walk-forward selection, active-return scoring, and deflated Sharpe.
-- `manager_classifier.py` - PIT manager behavior/type classifier for cleaning the idea-generation universe.
-- `report.py` - dashboard chart rendering.
-- `run_example.py` - runnable synthetic/live research pipeline.
-- `data/security_overrides.csv` - issuer-group overrides for multi-class securities such as `GOOG`/`GOOGL`.
-- `data/fund_ticker_exclusions.csv` - supplemental ETF/ETN/fund ticker exclusions for equity-only research runs.
-- `data/manager_overrides.csv` - optional manager allow/deny overrides for filter-active manager modes.
+本项目禁止将尚未公开的持仓信息回填至历史决策时点。
 
-## Setup
+### 1.2 文献基线
 
-Python 3.11+ is recommended.
+核心参考为 Cohen、Polk 与 Silli 的 *Best Ideas*。其经济直觉是：经理人相对投资机会集的高主动超配，可能反映更强的私人信息或投资确信度。
+
+本项目研究的是**披露后可交易版本**。这与论文中使用报告期末持仓研究经理选股能力并不完全相同。即使经理在持仓形成时具有 alpha，45 天左右的申报时滞及额外执行等待也可能消耗大部分可复制收益。
+
+### 1.3 研究问题
+
+公开且滞后的 13F 持仓，能否在以下约束下提供显著、稳定且可复现的超额收益：
+
+- 仅使用当时已经公开的信息；
+- 考虑映射、价格和市值覆盖；
+- 扣除交易成本；
+- 控制因子暴露；
+- 通过样本外和多重检验；
+- 对参数扰动和子时期保持稳健？
+
+### 1.4 可检验假设及工程实现
+
+| 假设 | 工程实现 | 主要比较 | 核心假设与局限 |
+|---|---|---|---|
+| **H1｜Best-idea effect**：经理人的最高确信度持仓在披露后优于普通持仓。 | 在每个 rebalance month，选择经理当时最新可见且未过期的 filing；按 `idea_signal` 在经理内部排名，选取 Top 1/3/5。严格 H1 对应 Top 1；Top 3/5 属于稳健性或可投资性扩展。 | Top 1 vs Top 3/5；高排名 idea vs 更宽松持仓/placebo；披露后收益 vs SPY 和因子调整收益。 | 申报权重或主动超配能够代理“确信度”；报告期末持仓在披露日仍有信息；披露时滞尚未完全耗尽 alpha。13F 无法观察完整空头、现金、对冲和季度内交易。 |
+| **H2｜Active-weight effect**：正主动超配比单纯持仓权重包含更多增量信息。 | 计算 `BookWeight - BenchmarkWeight`；比较 `level`、`active_weight` 与 `cps_ir` 系列。CPS 使用正主动超配乘以信号月之前估计的 CAPM 残差波动率。 | `level` vs `active_weight`；`active_weight` vs `cps_ir`；不同 active benchmark。 | Active benchmark 能合理代表经理的投资机会集；历史市值数据不存在前视偏差；高 idiosyncratic volatility 的乘数具有经济含义，而非单纯放大高风险股票。 |
+| **H3｜Manager-selection effect**：集中、低换手、偏主动选股的经理人具有更强信号质量。 | 在通用 AUM、历史长度、持仓数、集中度、换手、PUT 暴露等筛选之上，比较 `all`、`exclude_dirty` 和 `dedicated_like` 三种经理分类模式。 | 三种 manager universe 的收益、alpha、IR、持仓重合度和边际贡献。 | 持仓行为能够代理主动基金经理类型；本地分类未必等于法律或经济实体分类，可能混入保险公司、企业战略持股、养老金或其他非传统基金主体。 |
+| **H4｜Robustness**：结果能通过现实成本、PIT、参数扰动、样本外和多重检验。 | 保存完整 sweep；执行 48/12 月 walk-forward；计算 DSR；报告无效配置、覆盖、换手、成本和子时期。 | 样本内 vs OOS；单一最优格点 vs 参数邻域；原始 Sharpe vs DSR。 | 当前尝试次数必须完整计入；重复观察结果后再修改参数会增加未记录的 researcher degrees of freedom。 |
+
+### 1.5 研究贡献
+
+本项目的主要贡献不是某一条最高累计收益曲线，而是一套可以复核、反证和重复运行的研究基础设施。每次运行应记录：
+
+- run timestamp、Git SHA 和 config hash；
+- 输入数据与缓存哈希；
+- filing/accession/amendment 版本；
+- 经理和证券逐项筛选结果；
+- idea、来源经理、聚合分数和最终权重；
+- 交易、成本、持仓数量和风险约束；
+- sweep、walk-forward、DSR 和失败配置。
+
+---
+
+## 2. 数据与样本
+
+| 数据层 | 当前实现 | 主要限制 |
+|---|---|---|
+| 13F 申报 | SEC filings/datasets；保留 `period_date`、`filing_date`、accession 和 amendment | 不包含完整空头、现金、衍生品和季度内交易 |
+| 证券映射 | CUSIP → OpenFIGI → ticker；缓存并输出覆盖诊断 | 映射缺失、错误映射和公司行动可能造成系统性样本偏差 |
+| 收益数据 | Yahoo/yfinance 月度价格；本地缓存与 Chart API fallback | 不等同于包含退市收益和完整证券历史的 CRSP |
+| 主动基准 | `manager_held_mcap`、外部历史 SPY/SPX 权重或可见 13F 聚合 | Yahoo historical shares 可能被修订，当前免费市值代理并非严格 vendor PIT |
+| 风险模型 | Fama–French 因子；默认使用历史 CAPM 残差波动率 | 窗口、floor/cap 和 winsorization 属于研究假设 |
+| 审计输出 | 映射、覆盖、剔除、经理、idea、持仓、换手、成本、规则和 manifest | 研究有效性仍依赖上游数据质量和同一 run 文件的一致性 |
+
+### 2.1 经理人样本与三种分类模式
+
+AUM、历史长度、持仓数、集中度、换手、PUT 暴露等属于通用 universe 条件；`manager_filter_mode` 决定是否在这些条件之外应用经理类型清洗。
+
+| 模式 | 定义 | 保留范围 | 研究用途 |
+|---|---|---|---|
+| `all` | 不应用 manager classifier 或 manager allow/deny override。通用 universe 条件仍然生效。 | 所有满足 AUM、历史、持仓数、集中度等硬条件的申报主体。 | 未清洗基线；回答“简单使用全部合格 13F filers 会怎样”。 |
+| `exclude_dirty` | 在 `all` 基础上排除明显不适合复制的主体或异常行为指纹。 | 可保留 dedicated、transient 和未分类主体，只要未被标记为 dirty。 | 测试基础数据清洗是否有价值，避免把 manager-selection 与过强风格筛选混在一起。 |
+| `dedicated_like` | 先排除 dirty，再要求经理表现为集中、有限持仓宽度、低 ETF 暴露并具有一定持续性的主动选股型主体；同时服从 overrides。 | 行为上接近 dedicated stock picker 的经理。 | H3 的主要实验组。它是行为分类，不是经过 Form ADV 验证的法律实体分类。 |
+
+`dirty` 的典型原因包括银行经营账户、broker/dealer 或 market maker、央行/主权主体、慈善/捐赠账户、ETF sponsor、养老金、异常宽度和高 ETF 暴露等。具体原因以 `manager_classification.csv` 和运行时配置为准。
+
+> **重要限制**
+>
+> `dedicated_like` 不是“纯基金经理名单”。在接入 Form ADV、Bushee 或外部实体标签之前，分类结果可能仍包含保险公司、企业控股主体、大学基金或其他行为上类似集中经理的申报者。
+
+### 2.2 证券样本
+
+当前 live 默认排除 ETF、ETN 和其他 fund-like 持仓，并保留排除原因和价值覆盖诊断。证券缺少映射、市值或价格时，不填充为零：
+
+- 缺少 CUSIP 映射：从可交易证券池剔除并记录；
+- 缺少 active benchmark 市值：不把市值当成零，缩小 benchmark covered set 并记录覆盖率；
+- 缺少价格：按 `missing_price_policy` 处理；
+- 多类别股票：通过 `issuer_group` 合并计算 issuer exposure。
+
+### 2.3 点时样本构造
+
+每个再平衡月依次执行：
+
+1. 仅保留 `filing_date <= rebalance_month` 的申报版本；
+2. 为每位经理选择当时最新可见且未超过 filing/period staleness 上限的版本；
+3. 应用经理 hard filters 和 `manager_filter_mode`；
+4. 映射并过滤证券，计算 raw/investable book diagnostics；
+5. 构造当月 active benchmark 和历史风险输入；
+6. 计算经理内部信号并选择 Top-N ideas；
+7. 进行跨经理聚合、共识过滤、持仓数量和风险上限处理；
+8. 在月末设定下一期目标权重并记录交易成本。
+
+---
+
+## 3. 研究方法
+
+### 3.1 Book weight 与 `manager_held_mcap`
+
+对经理 \(m\)、股票 \(i\) 和决策月 \(t\)，申报组合权重为：
+
+\[
+w^{book}_{i,m,t}
+=
+\frac{\text{reported value}_{i,m,t}}
+{\sum_{j \in S_{m,t}}\text{reported value}_{j,m,t}},
+\]
+
+其中 \(S_{m,t}\) 是该经理在当月可用于研究的长股票持仓集合。
+
+`manager_held_mcap` 是一个**经理特定的 held-universe benchmark**：
+
+1. 取该经理当期持有、通过证券过滤且存在当月市值的股票集合 \(C_{m,t}\)；
+2. 对每只股票取得当月市场价值 \(MC_{i,t}\)；
+3. 只在该经理自己的 covered holdings 内归一化：
+
+\[
+w^{mcap}_{i,m,t}
+=
+\frac{MC_{i,t}}
+{\sum_{j \in C_{m,t}}MC_{j,t}}.
+\]
+
+随后：
+
+\[
+\text{ActiveWeight}_{i,m,t}
+=
+w^{book}_{i,m,t}
+-
+w^{mcap}_{i,m,t}.
+\]
+
+因此，`manager_held_mcap`：
+
+- 不是全市场市值指数；
+- 不是 SPY/SPX 权重；
+- 不是其他经理的 13F 聚合；
+- 只回答：**在该经理实际持有的股票集合中，相对于按市值持有，他对某只股票超配了多少。**
+
+缺少市值的股票不填成零；系统会审计 covered names、book coverage 和缺失规模。
+
+该定义包含三个重要假设：
+
+1. 经理当前持有的股票集合可以代理其投资机会集；
+2. held-universe 市值权重是合理的中性配置；
+3. 历史 shares 与价格具有足够的 PIT 质量。
+
+当前 `yahoo_shares_proxy` 适合基础设施研究，但不等同于严格 PIT 的 CRSP/Compustat 市值。
+
+### 3.2 Idea 信号
+
+| `idea_signal` | 经理内部排名含义 |
+|---|---|
+| `level` | 当前申报 book weight |
+| `change` | book weight 的季度变化 |
+| `initiation` | 新建仓股票，按当前 book weight 排名 |
+| `active_weight` | 当前 book weight 减 active benchmark weight |
+| `active_weight_change` | active weight 的季度变化 |
+| `active_weight_initiation` | 新建仓股票，按 active weight 排名 |
+| `cps_ir` | 正 active weight × 历史 CAPM 残差波动率 |
+| `cps_ir_change` | CPS 代理的季度变化 |
+| `cps_ir_initiation` | 新建仓股票，按 CPS 代理排名 |
+
+当前 CPS 风格代理为：
+
+\[
+\text{CPS}_{i,m,t}
+=
+\max(\text{ActiveWeight}_{i,m,t},0)
+\times
+\widehat{\sigma}^{idio}_{i,t}.
+\]
+
+\(\widehat{\sigma}^{idio}_{i,t}\) 仅使用 \(t\) 之前的月度收益估计。该公式并非论文参数的机械复刻；24 个月窗口、最少观测、floor/cap 和 winsorization 都属于工程假设。
+
+### 3.3 Idea 选择与聚合
+
+每位合格经理先按 `idea_signal` 排名并贡献 Top-N ideas。`min_consensus_funds` 随后要求一只股票至少被指定数量的**不同经理**选中。
+
+#### `manager_equal`：每个经理人一票
+
+设当月有 \(M_t\) 位实际贡献经理。每位经理获得相同总预算：
+
+\[
+B_{m,t}=\frac{1}{M_t}.
+\]
+
+经理 \(m\) 的 Top-K idea 集合为 \(I_{m,t}\)。其经理内部预算按这些股票的申报 book weight 归一化：
+
+\[
+q_{i,m,t}
+=
+\frac{w^{book}_{i,m,t}}
+{\sum_{j \in I_{m,t}}w^{book}_{j,m,t}}.
+\]
+
+股票 \(i\) 的 cap 前聚合权重为：
+
+\[
+W^{precap}_{i,t}
+=
+\sum_{m:i\in I_{m,t}}
+\frac{1}{M_t}q_{i,m,t}.
+\]
+
+直观上：
+
+- 每位经理只有**一票、同一份预算**；
+- Top-K 只是该经理如何拆分这一票；
+- 同一股票被三位经理选中，就获得三份经理预算的贡献；
+- 经理的 AUM 大小和 CPS 分数绝对值不会直接放大其投票权；
+- `min_consensus_funds=2` 表示至少需要两张独立经理票。
+
+这更接近“汇总经理 best ideas”的论文启发式组合思想，但不是对原论文权重方法的严格复刻。
+
+#### 其他聚合方式
+
+- `score`：跨经理加总 signal score 后归一化。高 active weight、高 idio-vol 或多经理重叠都可能显著放大股票权重；属于实验性高确信度/高风险版本。
+- `manager_count`：按选择该股票的不同经理人数加权，不考虑经理内 book weight。
+- `equal_name`：所有通过筛选的最终股票等权。
+
+排名、聚合和风险约束是三个独立步骤。`cps_ir` 可以仅用于排名，也可以在 `score` 模式下进一步影响最终权重；两者经济含义不同，必须分别报告。
+
+### 3.4 组合约束
+
+组合层支持：
+
+- `min_consensus_funds`：最低独立经理票数；
+- `min_portfolio_names` / `max_portfolio_names`：最少和最多股票数；
+- `max_name_weight`：单 ticker 上限；
+- `max_issuer_weight`：同 issuer 多类别股票合计上限；
+- `holding_horizon_q`：退出目标后允许延续持有的季度数；
+- `min_active_weight_holdings`：使用 active/CPS 信号前的经理 book 最低宽度；
+- `missing_price_policy`：缺失价格处理；
+- `bps_per_side`：单边交易成本。
+
+### 3.5 回测与执行假设
+
+1. 当月现有持仓先获得当月收益；
+2. 当月月底根据当时可见 filing 计算新目标权重；
+3. 新目标从之后的月份开始获得收益；
+4. 交易成本按 `one_way_turnover × bps_per_side` 扣除；
+5. 与 placebo、SPY 和多因子模型比较；
+6. 保存逐月经理、idea、holding sources、持仓和交易审计。
+
+该执行方式比按 `period_date` 立即交易更接近公开数据可实现性，但可能额外引入 filing date 到月底的等待。要分离 13F 原始信息和披露时滞，应使用日频价格构建 alpha decay curve。
+
+### 3.6 评价指标
+
+主要指标包括：
+
+- 年化收益、波动率和 Sharpe；
+- 相对 SPY 的 active return 与 information ratio；
+- 当前可用因子列上的回归 alpha 与 t 值；live 数据完整时通常为 FF5+MOM 六因子；
+- 最大回撤；
+- 换手率和模型内交易成本；真实流动性与 capacity 尚未建模；
+- 有效再平衡比例、持仓数量和 effective number；
+- sweep 网格及相邻参数表现（需从完整 grid 联合分析）；
+- walk-forward OOS active Sharpe；
+- Deflated Sharpe Ratio（DSR）。
+
+累计收益图只用于展示，不作为独立的策略有效性证据。
+
+---
+
+## 4. 实证结果
+
+### 4.1 当前探索性快照
+
+当前记录的最强探索性运行是 `reports/20260620T180809Z`（git `02ec3472`），覆盖 2015-01 至 2026-05。该运行使用：
+
+| 层级 | 参数 | 含义 |
+|---|---|---|
+| 经理样本 | AUM `$0.1B–$5B`，`dedicated_like` | 聚焦中小型、行为上接近集中主动选股的经理 |
+| 经理 hard filters | holdings ≤40；Top-10 ≥50%；低换手分位；PUT ≤5%；历史 ≥4Q | 提高经理信号的集中度和可解释性 |
+| 主动基准 | `manager_held_mcap` | 在经理自己的持仓子集中，以市值权重作为中性配置 |
+| Idea 信号 | `cps_ir` | 正主动超配 × 历史 CAPM 残差波动率 |
+| 每位经理 ideas | Top 3 | 不是严格 Top-1 best-idea，而是较宽的高确信度集合 |
+| 共识 | `min_consensus_funds=2` | 股票至少获得两位不同经理的选择 |
+| 聚合 | `score` | 跨经理加总 CPS score；信号强度直接影响最终权重 |
+| 组合宽度 | 最少5只、最多10只 | 高度集中的探索性组合 |
+| 风险上限 | 单名20%；issuer 25% | 允许高确信度股票形成较大仓位 |
+| Carry | `holding_horizon_q=0` | 每次重新形成目标组合，不额外保留旧 idea |
+| 成本 | 单边15 bps | 固定线性成本，尚未建模 ADV 和 nonlinear impact |
+
+结果摘要：
+
+| 指标 | 结果 |
+|---|---:|
+| 年化收益 | 约 **19.6%** |
+| 年化波动率 | 约 **21.3%** |
+| Sharpe ratio | 约 **0.83** |
+| 相对 SPY 的 IR | 约 **0.42** |
+| 六因子年化 alpha | 约 **6.7%** |
+| Alpha t 值 | **1.54** |
+| Walk-forward OOS months | **84** |
+| OOS active Sharpe | 约 **0.58** |
+| Deflated Sharpe Ratio | 约 **0.50** |
+| 平均实际股票数 | 约 **9.1** |
+| 平均 effective number | 约 **7.5** |
+| 平均单边月换手 | 约 **28.3%** |
+| 平均最大单名权重 | 约 **17.6%** |
+| 有效再平衡月 | **124/135**（约91.9%） |
+| 平均市值基准 book coverage | 约 **87.9%** |
+
+### 4.2 这组结果代表什么
+
+这组结果说明：
+
+- 小型、集中、低换手经理的主动超配中可能存在可研究的信息；
+- Top 3、至少两位经理共识和 score aggregation 的组合，历史上产生了较强点估计；
+- 13F 可能更适合作为慢速信息特征，而不是单独的完整 alpha 来源。
+
+但它**不代表 alpha 已得到验证**：
+
+1. **不是严格论文复现**：使用 Top 3、`score` 和最多10只股票，而非严格 Top 1、manager-equal 的 paper-style portfolio。
+2. **统计证据不足**：alpha t 值1.54仍低于常用显著性门槛。
+3. **DSR 证据较弱**：0.50远低于常见的严格研究门槛（例如0.95）；该门槛目前不是代码内预注册规则，后续必须在看新结果前固定。观察到的 OOS Sharpe 与参数搜索下的噪声赢家仍难区分。
+4. **组合高度集中**：score weighting、20%单名上限和约7.5的 effective number放大了少数股票的影响。
+5. **严格 PIT 尚未完成**：`manager_held_mcap` 当前依赖可被修订的 Yahoo shares proxy；该 run 的 `strict_pit_row_fraction=0`。
+6. **经理实体清洗不完整**：`dedicated_like` 是行为分类，不能保证全部为传统主动基金。
+7. **成本模型偏简单**：15 bps 固定成本未反映小盘股、集中仓位和披露后拥挤交易的 nonlinear impact。
+8. **研究过程已观察多轮结果**：真实 researcher degrees of freedom 大于单次 sweep 中记录的配置数。
+9. **Value tilt 旗标可能配置但未激活**：没有 PIT value score 时，不应把它解释为已检验的筛选条件。
+10. **13F 披露存在固有延迟**：即使经理在报告期末有选股 alpha，披露后可复制的剩余 alpha 可能很有限。
+
+因此当前结论只能是：
+
+> 这是一条值得继续验证的研究方向。它说明特定筛选和高集中 score weighting 可以产生较强历史结果，但尚不能证明公开 13F 本身提供稳定、可交易且经过多重检验的 alpha。
+
+### 4.3 与论文式组合的区别
+
+| 维度 | 论文式/经理投票思路 | 当前最强探索性快照 |
+|---|---|---|
+| 经理 ideas | 严格 Best Idea 或较窄高确信度集合 | Top 3 |
+| 经理权重 | 论文启发式对照：每位经理一票，`manager_equal` | `score` 直接放大高 CPS 股票 |
+| 最终股票数 | 可由经理集合自然形成 | 最多10只 |
+| 单名风险 | 通常不依赖极端 CPS magnitude | 允许20%单名 |
+| 研究解释 | 经理 best-idea 是否普遍有效 | 少数高 CPS、共识股票的集中策略是否有效 |
+
+两类组合应作为两个独立 hypothesis 报告，不能只用同一个“最佳参数”标签概括。
+
+---
+
+## 5. 稳健性与验收标准
+
+### 5.1 H1：Best-idea effect
+
+至少报告：
+
+- Top 1、Top 3、Top 5；
+- manager-equal 下的结果；
+- Top ideas 对普通持仓/placebo 的增量；
+- filing date 后不同等待期的 alpha decay；
+- 子时期和危机期。
+
+严格 H1 的主结果应来自 Top 1，而不是事后选择表现更好的 Top 3/5。
+
+### 5.2 H2：Active-weight effect
+
+至少比较：
+
+- `level`；
+- `active_weight`；
+- `cps_ir`；
+- `manager_held_mcap`、历史 SPY/SPX 和可见 13F 聚合基准；
+- idio-vol power、窗口及风险乘数的消融。
+
+若 `score` 版本有效而 manager-equal 版本无效，应明确区分“选股信息”和“高风险集中配置”的贡献。
+
+### 5.3 H3：Manager-selection effect
+
+固定同一信号和组合构造，比较：
+
+- `all`；
+- `exclude_dirty`；
+- `dedicated_like`。
+
+报告：
+
+- 收益、alpha 和 OOS；
+- 经理数量和有效贡献比例；
+- 最新持仓重合度；
+- 非传统实体占比；
+- 清洗条件的 marginal IR。
+
+### 5.4 Walk-forward 与多重检验
+
+- 默认使用 48 个月训练、12 个月测试；
+- 训练期只用于选参，测试期不回看；
+- DSR 必须区分 generated、feasible 和 effective trials；
+- 不应让结构性无效配置进入模型选择；
+- 当前项目建议将 `DSR > 0.95` 作为强验收线，而不是以累计净值替代。
+
+### 5.5 数据与交易验收
+
+正式研究至少需要：
+
+- 严格 PIT market cap；
+- 退市收益和 survivorship-aware returns；
+- amendment-safe 历史重建；
+- Form ADV 或外部实体标签；
+- ADV、bid–ask spread 和 market impact；
+- 同一 run 的文件 provenance 检查；
+- 真正未触碰的 holdout。
+
+---
+
+## 6. 后续研究方向
+
+1. 构建日频 alpha-decay curve：报告期末、T+15、T+30、filing date、filing 后月底及再延迟一个月。
+2. 使用 CRSP/WRDS 或同等级数据替代 Yahoo，加入退市收益和严格 PIT 市值。
+3. 接入 Form ADV、Bushee 或外部实体标签，区分传统主动基金、保险账户、企业战略持股和养老金。
+4. 对 `manager_held_mcap`、历史 SPY/SPX 和其他合理机会集基准做并列检验。
+5. 将 active-weight 选股信息与 score-based 风险预算完全分离。
+6. 研究 idio-vol exponent、score damping 和风险标准化，而不是默认线性放大高波动股票。
+7. 加入真实流动性、capacity 和披露后拥挤交易成本。
+8. 报告参数邻域、子时期、危机期和经理贡献集中度。
+9. 固定当前候选策略，不再调参，在未来数据或真正 untouched holdout 上验证。
+10. 将 13F 定位为慢速研究特征，与估值、盈利修正、价格动量和拥挤度联合使用。
+
+---
+
+## 7. 结论
+
+本项目已经建立一套较完整的 13F 点时研究框架，能够区分报告日、披露日、再平衡日和收益实现期，并审计经理筛选、idea 来源、聚合、持仓、换手、成本和参数搜索。
+
+当前仍无法确认公开 13F 本身具有稳定、可交易的 alpha。更准确的研究结论是：
+
+> 13F 可能保留经理选股能力的弱痕迹，但公开披露的延迟、信息残缺和拥挤交易会显著减少可复制收益。部分高集中、score-weighted 设定产生了较强历史结果，但尚未通过统计显著性、严格 PIT、多重检验、现实成本和独立留出样本的共同标准。
+
+---
+
+# 操作指南
+
+## 项目功能
+
+- 构建规则化 SEC 13F 经理人样本；
+- 处理 filing-date 可见性与 amendment 版本；
+- 通过 OpenFIGI 映射 CUSIP，并输出覆盖诊断；
+- 下载和缓存月度价格、因子及市值代理；
+- 计算 book weight、active weight 和 CPS 风格信号；
+- 支持 `all`、`exclude_dirty`、`dedicated_like` manager universe；
+- 运行 thesis/placebo、消融、parameter sweep、walk-forward 和 DSR；
+- 输出 dashboard、交互报告、CSV 审计文件及 manifest。
+
+## Quick start
+
+### 环境
+
+建议使用 Python 3.11+。
 
 ```powershell
 python -m pip install pandas numpy scipy statsmodels matplotlib requests yfinance pandas_datareader pytest pyarrow
-```
-
-For live 13F parsing, install the SEC EDGAR helper used by the adapter:
-
-```powershell
 python -m pip install edgartools
 ```
 
-Create a local `.env` file for secrets and SEC identity. Do not commit it.
+创建本地 `.env`，不要提交到 Git：
 
 ```text
 OPENFIGI_API_KEY=your_openfigi_key
 ```
 
-Also update `LIVE_CONFIG["identity"]` in `run_example.py` before live SEC downloads. SEC requests should use a real name/email user agent.
+Live SEC 下载前，将 `run_example.py` 中的 `LIVE_CONFIG["identity"]` 替换为真实姓名和邮箱。
 
-## Run
-
-Offline synthetic smoke run:
+### 运行
 
 ```powershell
+# 离线 synthetic smoke test
 python -B run_example.py --mode synthetic
-```
 
-Live data-chain smoke run:
-
-```powershell
+# Live 数据链 smoke test
 python -B run_example.py --mode live-smoke --smoke-cusips 300 --smoke-tickers 200
-```
 
-Full live run:
-
-```powershell
+# 完整 live 研究
 python -B run_example.py --mode live
+
+# 快速诊断：跳过 marginal 与 sweep
+python -B run_example.py --mode live --skip-marginal --skip-sweep
+
+# 比较经理分类模式
+python -B run_example.py --mode live --manager-filter-mode all --skip-marginal --skip-sweep
+python -B run_example.py --mode live --manager-filter-mode exclude_dirty --skip-marginal --skip-sweep
+python -B run_example.py --mode live --manager-filter-mode dedicated_like --skip-marginal --skip-sweep
 ```
 
-The live thesis default uses `active_benchmark_source="manager_held_mcap"`.
-For each visible manager filing, the engine restricts that month's market caps
-to the manager's security-filtered common-stock holdings and normalizes them to
-one. Active weight is `manager_weight - held_portfolio_market_cap_weight`.
-Missing market caps are excluded and audited; they are never filled with zero,
-and there is no fallback to the peer-13F aggregate.
-
-The first live run incrementally builds
-`data/processed/market_cap_history.parquet` from Yahoo historical shares and
-month-end closes. Split events are applied so prices and shares use a
-consistent share basis, including split-transition months. Each batch is
-checkpointed and subsequent runs reuse the cache. This free source is explicitly
-labelled `yahoo_shares_proxy`: Yahoo may revise historical shares, so it is a
-research-infrastructure proxy, not strict CRSP/Compustat point-in-time market
-capitalization. Replace the cache with an audited long table containing
-`month_end,ticker,market_cap,available_date,source,strict_pit` for publishable work.
-
-The live thesis default uses `manager_filter_mode="dedicated_like"`, while
-`all` remains the untouched baseline. Manager filtering modes:
-
-- `all` - no manager classifier or override is applied; this is the parity anchor.
-- `exclude_dirty` - drops obvious out-of-scope filers and extreme behavior fingerprints.
-- `dedicated_like` - keeps low-turnover, concentrated, bounded-breadth managers after calendar-quarter persistence.
-
-The classifier is local/PIT in v1. It does not use Form ADV or external Bushee
-labels. `factor_r2` is reported as a diagnostic and is not a default hard filter.
-
-Optionally, you can run active weights against point-in-time SPY/S&P 500 weights
-by preparing `data/processed/benchmark_weights_spy.parquet` or passing a path
-explicitly:
+测试：
 
 ```powershell
-python -B run_example.py --mode live --active-benchmark-source spy_holdings --active-benchmark-weights data/processed/benchmark_weights_spy.parquet
+python -B -m pytest tests
 ```
 
-The file may be CSV, Parquet, or XLSX, and must contain long-form columns:
+## 主要文件
+
+| 文件 | 作用 |
+|---|---|
+| `build_universe.py` | SEC 数据发现、解析、缓存和经理人样本构建 |
+| `data_adapters.py` | OpenFIGI、Yahoo/yfinance、Fama–French 和覆盖诊断 |
+| `engine.py` | 组合构造、PIT 回测、归因、成本和风险逻辑 |
+| `sweep.py` | 参数网格、walk-forward 和 Deflated Sharpe |
+| `manager_classifier.py` | PIT 经理行为分类 |
+| `run_diagnostics.py` | Manager、value unit 和筛选诊断 |
+| `report.py` | 静态 dashboard 和交互报告 |
+| `run_example.py` | synthetic、smoke 和 live 主流程 |
+| `data/security_overrides.csv` | 多类别证券的 issuer group override |
+| `data/fund_ticker_exclusions.csv` | ETF/ETN/基金类 ticker 补充排除表 |
+| `data/manager_overrides.csv` | 经理人 allow/deny override |
+
+## 主要输出
+
+运行在 `reports/` 下生成带时间戳的目录。以下文件按运行模式和开关生成；例如 `--skip-sweep` 不会产生完整 sweep 文件：
+
+| 文件 | 内容 |
+|---|---|
+| `strategy_dashboard.png` | 策略总览 |
+| `interactive_results.html` | 交互式 sweep 和逐月持仓报告 |
+| `sweep_grid.csv` | 参数组合和统计结果 |
+| `sweep_returns.csv` | 各配置逐月收益序列 |
+| `manifest.json` | Git SHA、配置、输入哈希、覆盖和运行元数据 |
+| `rebalance_summary_thesis.csv` | 再平衡级别摘要 |
+| `rebalance_holdings_thesis.csv` | 股票级最终持仓 |
+| `rebalance_holding_sources_thesis.csv` | 最终股票的来源经理和贡献 |
+| `rebalance_ideas_thesis.csv` | 经理级 idea 与 signal 明细 |
+| `rebalance_managers_thesis.csv` | 经理资格和贡献摘要 |
+| `rebalance_manager_candidates_audit.csv` | 经理候选值、cutoff 和逐项 pass/fail |
+| `rebalance_rules_thesis.json` | 运行规则和 active filter 状态 |
+| `manager_characteristics_raw_investable.csv` | Raw 与 investable book 特征对照 |
+| `manager_classification.csv` | 经理分类和 dirty 原因 |
+| `manager_filter_acceptance.csv` | 经理清洗对组合和绩效的影响 |
+| `active_benchmark_coverage_by_month.csv` | Active benchmark 月度覆盖 |
+| `value_unit_diagnostics.csv` | AUM/value 单位连续性诊断 |
+
+仅重建已有运行的 HTML：
+
+```powershell
+python -B report.py refresh reports/<run-directory>
+```
+
+## 配置原则
+
+项目存在三类数值：
+
+1. `engine.py` dataclass：通用 API 默认；
+2. `run_example.py::_default_run_configs()`：当前 thesis/placebo recipe；
+3. `manifest.json`：某一次运行真正使用的最终配置。
+
+**任何结果均以对应 run 的 `manifest.json` 和 `rebalance_rules_thesis.json` 为准。** README 中的数值只用于解释和示例。
+
+<details>
+<summary><strong>当前研究参考参数</strong></summary>
+
+| 层级 | 参数 | 当前探索性参考值 | 解释 |
+|---|---|---:|---|
+| 经理分类 | `manager_filter_mode` | `dedicated_like` | 行为上接近集中主动选股型经理 |
+| AUM | `min_aum`, `max_aum` | `$0.1B`, `$5B` | 决策时点经理 AUM 区间 |
+| 历史 | `min_history_quarters` | `4` | 最少申报历史 |
+| 时效 | `max_stale_filing_months` | `6` | Filing 公开时间最大陈旧月数 |
+| 时效 | `max_stale_period_months` | `6` | 持仓报告期最大陈旧月数 |
+| 集中度 | `use_concentration` | `True` | 启用集中度筛选 |
+| 集中度 | `top_n_concentration` | `10` | 计算前十大权重 |
+| 集中度 | `min_top_n_weight` | `50%` | Top-10 最低合计权重 |
+| 持仓数 | `max_holdings` | `40` | 经理长股票持仓硬上限 |
+| 换手率 | `use_low_turnover` | `True` | 启用低换手筛选 |
+| 换手率 | `turnover_quantile` | `0.34` | 保留较低换手横截面 |
+| 对冲 | `use_hedge_filter` | `True` | 启用 PUT 暴露筛选 |
+| 对冲 | `hedge_put_max_weight` | `5%` | Filing PUT value 最大比例 |
+| Value tilt | `use_value_tilt` | 配置可开 | 只有存在 PIT value scores 时才真正生效；运行规则应同时检查 `value_tilt_active` |
+| Active share | `use_active_share` | `False` | Thesis 默认不作为 hard filter |
+| Idea 信号 | `idea_signal` | `cps_ir` | 经理内部排名信号 |
+| Idea 数量 | `top_n_ideas` | `3` | 每位经理选择 Top 3 |
+| 聚合 | `idea_aggregation` | `score` | 跨经理加总 signal score；实验性高集中版本 |
+| 共识 | `min_consensus_funds` | `2` | 至少两位不同经理选择 |
+| 组合宽度 | `min_portfolio_names` | `5` | 少于5只则当月组合无效 |
+| 组合宽度 | `max_portfolio_names` | `10` | 最多保留10只股票 |
+| 单名上限 | `max_name_weight` | `20%` | 单 ticker 最终上限 |
+| Issuer 上限 | `max_issuer_weight` | `25%` | 同 issuer 合计上限 |
+| Carry | `holding_horizon_q` | `0` | 不额外保留已退出目标 |
+| 信号有效性 | `min_active_weight_holdings` | `10` | Active/CPS 计算的经理 book 最低宽度 |
+| 成本 | `bps_per_side` | `15 bps` | 单边线性交易成本 |
+| 缺失价格 | `missing_price_policy` | `exit` | 退出无价格证券 |
+| 主动基准 | `active_benchmark_source` | `manager_held_mcap` | 经理持仓子集市值权重 |
+
+这些数值描述当前探索性 recipe，不是已经验证的永久默认。论文式对照应使用 `manager_equal`，并单独报告严格 Top-1 结果。
+
+</details>
+
+<details>
+<summary><strong>Idea 信号与聚合方式</strong></summary>
+
+| `idea_signal` | 排名含义 |
+|---|---|
+| `level` | 当前经理 book weight |
+| `change` | book weight 的季度变化 |
+| `initiation` | 新建仓，按当前 book weight 排名 |
+| `active_weight` | book weight 减 active benchmark weight |
+| `active_weight_change` | active weight 的季度变化 |
+| `active_weight_initiation` | 新建仓，按 active weight 排名 |
+| `cps_ir` | 正 active weight × CAPM 残差波动率 |
+| `cps_ir_change` | CPS 代理的季度变化 |
+| `cps_ir_initiation` | 新建仓，按 CPS 代理排名 |
+
+| `idea_aggregation` | 权重含义 |
+|---|---|
+| `manager_equal` | 每位经理一票、同一总预算；经理内部按入选股票的申报 book weight 分配 |
+| `score` | 跨经理加总 signal score 后归一化 |
+| `manager_count` | 按选择该股票的不同经理人数加权 |
+| `equal_name` | 最终存活股票等权 |
+
+`consensus_weight` 是旧接口兼容项。显式设置 `idea_aggregation` 后，应以 `idea_aggregation` 为准。
+
+</details>
+
+<details>
+<summary><strong>CPS 残差波动率参数</strong></summary>
+
+| 参数 | 参考值 | 解释 |
+|---|---:|---|
+| `idio_vol_window_months` | `24` | CAPM 残差波动率滚动窗口（月） |
+| `idio_vol_min_obs` | `12` | 最少有效月度观测 |
+| `idio_vol_floor` | `10%` | 年化残差波动率下限 |
+| `idio_vol_cap` | `80%` | 年化残差波动率上限 |
+| `idio_vol_winsor_lower` | `5%` | 横截面下缩尾点 |
+| `idio_vol_winsor_upper` | `95%` | 横截面上缩尾点 |
+
+这些参数只用于稳定 CPS 排名输入，不是经过学术校准的常数。缓存或 manifest 内部可能简写为 `window_months`、`min_obs`；运行层配置以 `LIVE_CONFIG` 中的字段名为准。
+
+</details>
+
+<details>
+<summary><strong>当前探索性 sweep</strong></summary>
+
+当前 64 组笛卡尔网格：
+
+- `universe.aum_band`：`0.1–1B`、`0.1–5B`
+- `portfolio.idea_signal`：`cps_ir`、`cps_ir_change`
+- `portfolio.top_n_ideas`：`3`、`5`
+- `portfolio.idea_aggregation`：`manager_equal`、`score`
+- `portfolio.min_consensus_funds`：`1`、`2`
+- `portfolio.holding_horizon_q`：`0`、`1`
+
+固定项包括：
+
+- `manager_filter_mode=dedicated_like`
+- `min_portfolio_names=5`
+- `max_portfolio_names=10`
+- `min_active_weight_holdings=10`
+- concentration 和 low-turnover filters 开启
+
+Walk-forward 使用 48 个月训练、12 个月测试，以 active Sharpe 选参。生成配置数、可行配置数和有效独立试验数应分别报告。
+
+</details>
+
+<details>
+<summary><strong>Live 数据与运行参数</strong></summary>
+
+| 参数 | 默认/参考值 | 用途 |
+|---|---:|---|
+| `identity` | 占位字符串 | SEC 请求身份；live 前必须替换为真实姓名和邮箱 |
+| `openfigi_key` | `None` | 可由本地环境变量提供 |
+| `sec_history_start` | `2013-10-01` | SEC 申报历史起始日 |
+| `price_history_start` | `2014-01-01` | 价格和因子 warm-up 起始日 |
+| `start`, `end` | `2015-01-01`, `2026-05-31` | 默认研究区间 |
+| `benchmark_ticker` | `SPY` | 市场收益基准 |
+| ingest `min_aum`, `max_aum` | `$0.1B`, `$30B` | 原始抓取范围，与 thesis AUM 筛选不同 |
+| ingest `max_holdings` | `40` | 抓取/基础 universe 持仓数上限 |
+| ingest `max_put_weight` | `10%` | 宽松抓取边界；thesis 可使用更严格的5% |
+| `require_factors` | `False` | 因子缺失是否必须中止 |
+| `price_source` | `chart` | 可选 `chart`、`auto`、`yfinance` |
+| `exclude_fund_like_holdings` | `True` | Live 默认排除 ETF/ETN/基金类行 |
+| benchmark stale limit | `45 days` | Active benchmark 快照最大年龄 |
+| market-cap shares stale limit | `550 days` | 免费 shares proxy 的最大允许陈旧期 |
+| market-cap batch/workers/timeout | `25 / 6 / 20s` | 市值请求批量、并发和超时 |
+| 缓存和 override 路径 | `LIVE_CONFIG` | OpenFIGI、价格、市值、经理分类和风险缓存 |
+
+</details>
+
+<details>
+<summary><strong>主要命令行参数</strong></summary>
+
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| `--mode` | `synthetic` | `synthetic`、`live`、`live-smoke` |
+| `--output-root` | `reports` | 输出目录 |
+| `--smoke-cusips` | `300` | Smoke 模式映射 CUSIP 数量 |
+| `--smoke-tickers` | `200` | Smoke 模式取价 ticker 数量 |
+| `--skip-marginal` | off | 跳过 marginal-IR 消融 |
+| `--skip-sweep` | off | 跳过参数网格和 walk-forward |
+| `--equity-only` | off | 显式要求排除 ETF/ETN/基金类持仓；当前 live 配置默认已排除 |
+| `--refresh-openfigi-metadata` | off | 刷新缺少分类元数据的映射 |
+| `--price-source` | live config | `chart`、`auto`、`yfinance` |
+| `--active-benchmark-source` | thesis/live config | `manager_held_mcap`、`visible_13f_aggregate`、`spy_holdings` |
+| `--active-benchmark-weights` | none | 外部 benchmark 长表 |
+| `--active-benchmark-max-stale-days` | live config | Benchmark 快照最大年龄 |
+| `--manager-filter-mode` | thesis config | `all`、`exclude_dirty`、`dedicated_like` |
+| `--sweep-checkpoint-every` | `5` | 每 N 组保存 sweep checkpoint；`0` 关闭 |
+
+Fund-like 证券在当前 live 配置中默认排除；`--equity-only` 仍保留为显式开关和兼容接口。是否实际排除以对应 run 的 manifest/rules 为准。
+
+</details>
+
+## 数据源说明
+
+### `manager_held_mcap`
+
+Live 流程可根据历史 shares 和月末价格构建：
+
+```text
+data/processed/market_cap_history.parquet
+```
+
+免费来源标记为 `yahoo_shares_proxy`。更严格的 PIT 市值表应至少包含：
+
+```text
+month_end,ticker,market_cap,available_date,source,strict_pit
+```
+
+不得用当前 shares 或当前指数成分回填历史月份。
+
+### 历史 SPY/SPX 权重
+
+外部 benchmark 权重文件可使用 CSV、Parquet 或 XLSX：
 
 ```text
 month_end,ticker,weight
@@ -264,439 +780,42 @@ month_end,ticker,weight
 2020-01-31,MSFT,0.038
 ```
 
-Weights can be decimals or percentages. The loader normalizes tickers such as
-`BRK.B` to `BRK-B`. The default allows a recent prior-month snapshot for rare
-missing months (`active_benchmark_max_stale_days=45`) and fails if coverage is
-older than that, so a current SPY snapshot is not silently backfilled into
-historical tests.
-
-The repository does not auto-generate historical SPY constituent weights. A
-current holdings download cannot be used for past months without look-ahead
-bias.
+运行示例：
 
 ```powershell
-python -B run_example.py --mode live --active-benchmark-source visible_13f_aggregate
+python -B run_example.py --mode live `
+  --active-benchmark-source spy_holdings `
+  --active-benchmark-weights data/processed/benchmark_weights_spy.parquet
 ```
 
-ETF-excluded equity-only live run:
+## 已知限制
 
-```powershell
-python -B run_example.py --mode live --equity-only
-```
+- Yahoo/yfinance 不适合发表级、退市敏感的最终研究；
+- CUSIP/OpenFIGI 覆盖不完整，可能改变 AUM、持仓数和集中度；
+- `missing_price_policy="exit"` 不是退市收益模型；
+- Yahoo historical shares 可能被修订，`manager_held_mcap` 目前不是严格 PIT；
+- 13F 不披露完整空头、现金、对冲和季度内交易；
+- 经理分类尚未接入 Form ADV 或可靠外部实体标签；
+- 固定15 bps成本未建模 bid–ask spread、ADV 和 market impact；
+- Value tilt 只有在存在 PIT value score 时才真正生效；
+- 多轮观察结果后的参数修改会增加真实多重检验负担；
+- 高累计收益不能替代 alpha 显著性、DSR 和 untouched holdout；
+- 同一研究包中的 CSV、dashboard 和 manifest 必须来自同一 run。
 
-ETF/fund-like 13F rows are excluded by default in live mode. The `--equity-only`
-flag remains as an explicit way to request the same setting.
+## Git hygiene
 
-CPS-style implied-IR signals are available as diagnostics:
-
-- `cps_ir`
-- `cps_ir_change`
-- `cps_ir_initiation`
-
-They rank positive active overweight by:
+以下本地数据、密钥和生成文件默认不提交：
 
 ```text
-cps_score = positive_active_overweight * trailing_CAPM_residual_vol
+.env
+13f_cache/
+reports/
+artifacts/
+openfigi_cache.parquet
+yfinance_close_cache.parquet
+yfinance_close_cache_coverage.parquet
 ```
 
-Residual volatility is point-in-time: by default it uses the prior 24 monthly
-returns, requires 12 observations, and never uses the as-of month itself. Price
-and factor history starts in 2014 as warm-up while reported backtest returns
-still start in 2015. The
-24-month window plus the 10%/80% floor/cap and 5%/95% winsorization are pragmatic
-guardrails, not academically calibrated constants. They are written to the run
-manifest and should be treated as research assumptions.
+## 参考文献
 
-Future v2 data/research items:
-
-- Replace the Yahoo shares proxy with audited PIT market-cap data.
-- Add true historical SPY/SPX constituent-weight support.
-- Evaluate FF5+MOM residual volatility with longer windows.
-- Add ADV/Bushee enrichment for manager-type classification.
-
-The thesis portfolio uses CPS-IR only to rank ideas within each manager. Managers
-receive equal portfolio budgets; for Top 3/5, each manager's budget is allocated
-across the selected names in proportion to that manager's reported book weights
-(`idea_aggregation="manager_equal"`). Repeated selections therefore contribute
-multiple manager-budget shares. It does not require manager overlap
-(`min_consensus_funds=1`). Score-weighted aggregation remains available only as
-an experimental variant and is not the paper-style allocation.
-
-For operational convenience, the thesis currently retains
-`max_portfolio_names=30`. This aggregate name limit is a documented replication
-deviation rather than part of the paper-style manager-equal construction. The
-default formal sweep contains 144 predeclared variants across AUM band, CPS-IR
-signal form, Top 1/3/5 ideas, manager-equal vs score-weighted aggregation,
-consensus threshold, and 0/1-quarter carry.
-
-The live default uses `--price-source chart` through `LIVE_CONFIG` to avoid
-`yfinance` hangs on restricted networks. To compare against yfinance manually:
-
-```powershell
-python -B run_example.py --mode live --price-source auto
-```
-
-For faster diagnostics before a full run:
-
-```powershell
-python -B run_example.py --mode live --equity-only --skip-marginal --skip-sweep
-```
-
-To compare manager universe definitions:
-
-```powershell
-python -B run_example.py --mode live --manager-filter-mode all --skip-marginal --skip-sweep
-python -B run_example.py --mode live --manager-filter-mode exclude_dirty --skip-marginal --skip-sweep
-python -B run_example.py --mode live --manager-filter-mode dedicated_like --skip-marginal --skip-sweep
-```
-
-To populate OpenFIGI security metadata for an older ticker-only cache, run once with:
-
-```powershell
-python -B run_example.py --mode live-smoke --equity-only --refresh-openfigi-metadata
-```
-
-Outputs are written to timestamped folders under `reports/`, including:
-
-- `strategy_dashboard.png`
-- `interactive_results.html`
-- `sweep_grid.csv`
-- `sweep_returns.csv`
-- `manifest.json`
-- `rebalance_summary_thesis.csv`
-- `rebalance_holdings_thesis.csv`
-- `rebalance_managers_thesis.csv`
-- `rebalance_rules_thesis.json`
-- `manager_classification.csv`
-- `manager_filter_acceptance.csv`
-
-## 参数（中文） / Parameters (English)
-
-以下先给出完整中文说明，后面保留对应英文版本。参数名、枚举值和代码中的
-配置键不翻译，以便直接搜索源码和运行清单。
-
-### 中文：Thesis 策略默认参数
-
-这里必须区分两类默认值：`engine.py` 中 dataclass 的值是通用 API 默认值；
-`run_example.py::_default_run_configs()` 会覆盖其中多项，形成实际 thesis
-研究组合。下表默认指 thesis 配置。
-
-| 层级 | 参数 | Thesis 默认值 | 可选值 / 范围 | 重要解释 |
-|---|---|---:|---|---|
-| 管理人池 | `manager_filter_mode` | `dedicated_like` | `all`, `exclude_dirty`, `dedicated_like` | 保留分类为集中选股型的管理人；`exclude_dirty` 只排除明显不合格者，`all` 是不筛选基线。 |
-| 管理人池 | `min_aum`, `max_aum` | `$0.1B`, `$10B` | 非负美元边界 | 决策时点的管理人 AUM 区间；live 原始抓取覆盖 `$0.1B`–`$30B`。 |
-| 管理人池 | `min_history_quarters` | `4` | 整数 `>=1` | 管理人进入候选池前至少需要的申报历史。 |
-| 时效性 | `max_stale_filing_months` | `6` | 正整数或 `None` | 申报版本在决策月过旧时剔除。 |
-| 时效性 | `max_stale_period_months` | `6` | 正整数或 `None` | 持仓报告期在决策月过旧时剔除。 |
-| 集中度 | `use_concentration` | `True` | `True`, `False` | 是否启用集中度筛选。 |
-| 集中度 | `top_n_concentration` | `10` | 正整数 | 计算集中度时使用的最大持仓数量。 |
-| 集中度 | `min_top_n_weight` | `50%` | `0`–`1` | 前 N 大持仓合计权重的最低要求。 |
-| 集中度 | `max_holdings` | `40` | 正整数 | 长股票持仓数量硬上限；通过 Top-N 集中度测试也不能绕过。 |
-| 换手率 | `use_low_turnover` | `True` | `True`, `False` | 是否启用低换手管理人筛选。 |
-| 换手率 | `turnover_quantile` | `0.34` | `0`–`1` | 使用横截面分位数保留较低换手的管理人。 |
-| 对冲 | `use_hedge_filter` | `True` | `True`, `False` | 是否启用精确申报版本的 PUT 暴露筛选。 |
-| 对冲 | `hedge_put_max_weight` | `5%` | `0`–`1` | PUT value 相对申报组合的最大比例；缺少精确版本证据时采用 fail-closed。 |
-| 价值倾向 | `use_value_tilt` | `True` | `True`, `False` | 是否启用管理人价值倾向筛选。 |
-| 价值倾向 | `value_tilt_min_pctl` | `50%` | `0`–`1` | 管理人价值分数的最低横截面百分位。 |
-| Active share | `use_active_share` | `False` | `True`, `False` | 可选的管理人 active-share 筛选；thesis 默认关闭。 |
-| Active share | `min_active_share` | `60%` | `0`–`1` | 启用筛选且存在基准权重时的最低 active share。 |
-| Idea 排名 | `idea_signal` | `cps_ir` | 见下方信号表 | 只负责每位管理人内部的股票排名，不直接成为最终组合权重。 |
-| Idea 选择 | `top_n_ideas` | `3` | 正整数 | 每位合格管理人选择排名最高的 3 个 idea。 |
-| Idea 分配 | `idea_aggregation` | `manager_equal` | `manager_equal`, `score`, `manager_count`, `equal_name` | 决定被选 idea 如何聚合成股票目标权重。 |
-| 共识 | `min_consensus_funds` | `2` | 正整数 | 股票至少被两位合格管理人选中；重复选择代表独立的管理人票数。 |
-| 组合宽度 | `min_portfolio_names` | `10` | 非负整数 | 存活股票少于该值时，该次再平衡无效并持有现金。 |
-| 组合宽度 | `max_portfolio_names` | `30` | 正整数或 `None` | 权重上限处理前最多保留 30 只股票；这是 thesis 的便利性约束，也是明确记录的论文复现偏差。 |
-| 风险上限 | `max_name_weight` | `10%` | `0`–`1` | 单一 ticker 的最终权重上限。 |
-| 风险上限 | `max_issuer_weight` | `15%` | `0`–`1` | 映射到同一发行人的多个 ticker 合计权重上限。 |
-| 持有期 | `holding_horizon_q` | `0` | 整数 `>=0` | `0` 表示完全再平衡；`N` 表示目标退出后最多继续持有 N 个季度。 |
-| 信号有效性 | `min_active_weight_holdings` | `10` | 正整数 | 使用 active-weight/CPS 信号前要求管理人组合达到的最低宽度。 |
-| 交易成本 | `bps_per_side` | `15` bps | 非负数 | 买入和卖出分别计费。 |
-| 缺失收益 | `missing_price_policy` | `exit` | `exit`, `zero`, `raise` | `exit` 卖出缺失价格的持仓并分配给其余股票；`zero` 假设收益为零；`raise` 中止运行。 |
-| 主动基准 | `active_benchmark_source` | `manager_held_mcap` | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` | 用于 active-weight/CPS 的基准权重；默认方案是公开数据研究代理，不是严格 vendor PIT 数据。 |
-
-`consensus_weight` 是兼容旧接口的开关。显式设置 `idea_aggregation` 后它
-不生效；当 aggregation 为 `None` 时，`True` 回退到 `score`，`False`
-回退到 `manager_count`。
-
-### 中文：Idea 信号与权重聚合
-
-| `idea_signal` | 排名含义 |
-|---|---|
-| `level` | 当前管理人组合权重。 |
-| `change` | 组合权重的季度变化。 |
-| `initiation` | 新建仓股票，按当前组合权重排名。 |
-| `active_weight` | 当前组合权重减去 PIT 基准权重。 |
-| `active_weight_change` | Active weight 的季度变化。 |
-| `active_weight_initiation` | 新建仓股票，按 active weight 排名。 |
-| `cps_ir` | Active weight × CAPM 残差波动率，即当前实现的 CPS implied-IR 排名代理。 |
-| `cps_ir_change` | CPS implied-IR 代理的季度变化。 |
-| `cps_ir_initiation` | 新建仓股票，按 CPS implied-IR 代理排名。 |
-
-- `manager_equal`：每位参与管理人只有一份相同预算；其 Top-N idea 内部按
-  申报持仓权重分配。同一股票被多人选中会累积多份管理人预算。
-- `score`：跨管理人加总排名分数后归一化。这是实验性 score-weighting，
-  不是论文式默认构造。
-- `manager_count`：按选择该股票的管理人数加权。
-- `equal_name`：所有最终存活股票等权。
-
-### 中文：CPS 残差波动率参数
-
-| 参数 | 默认值 | 解释 |
-|---|---:|---|
-| `idio_vol_window_months` | `24` | CAPM 残差波动率的滚动月度窗口。 |
-| `idio_vol_min_obs` | `12` | 最少有效月度观测数。 |
-| `idio_vol_floor` | `10%` | 年化残差波动率下限。 |
-| `idio_vol_cap` | `80%` | 年化残差波动率上限。 |
-| `idio_vol_winsor_lower`, `idio_vol_winsor_upper` | `5%`, `95%` | 横截面缩尾分位数。 |
-
-这些参数只是稳定 implied-IR 排名输入。高 idiosyncratic volatility 本身
-不被视为正向 alpha，原始 CPS 分数也不是 thesis 最终股票权重。
-
-### 中文：默认稳健性 sweep
-
-默认笛卡尔网格共有 72 组：`idea_signal` 取 `cps_ir`、
-`cps_ir_change`、`cps_ir_initiation`；`top_n_ideas` 取 `1/3/5`；
-`idea_aggregation` 取 `manager_equal/score`；`min_consensus_funds` 取
-`1/2`；`holding_horizon_q` 取 `0/1`。
-
-固定项为：`manager_filter_mode=dedicated_like`、AUM `$0.1B`–`$10B`、
-`min_portfolio_names=10`、`max_portfolio_names=30`、
-`min_active_weight_holdings=10`，并启用集中度、低换手和价值倾向筛选。
-Walk-forward 使用 48 个月训练、12 个月测试，以 active Sharpe 选参；
-marginal-IR 另行评估单项筛选贡献。
-
-### 中文：Live 数据与运行参数
-
-| 参数 | 默认值 / 可选项 | 用途 |
-|---|---|---|
-| `identity` | 占位字符串 | SEC 请求身份，live 使用前必须替换为真实姓名和邮箱。 |
-| `openfigi_key` | `None` | 可由本地环境变量提供的 OpenFIGI API key。 |
-| `sec_history_start` | `2013-10-01` | SEC 申报历史起始日。 |
-| `price_history_start` | `2014-01-01` | 价格历史起始日。 |
-| `start`, `end` | `2015-01-01`, `2026-05-31` | 默认回测区间。 |
-| `benchmark_ticker` | `SPY` | 市场收益基准。 |
-| ingest `min_aum`, `max_aum` | `$0.1B`, `$30B` | 原始抓取范围，不等于 thesis 筛选范围。 |
-| ingest `max_holdings`, `max_put_weight` | `40`, `10%` | 抓取阶段的宽度和 PUT 边界；thesis 后续使用更严格的 `5%`。 |
-| `require_factors` | `False` | 因子缺失是否必须中止运行。 |
-| `price_source` | `chart` | 可选 `chart`, `auto`, `yfinance`。 |
-| `exclude_fund_like_holdings` | `True` | 排除 ETF/ETN/基金类持仓。 |
-| `refresh_openfigi_metadata`, `force_refresh_openfigi` | `False`, `False` | 控制缺失元数据刷新和强制全量重映射。 |
-| 基准时效上限 | `45` 天 | Active benchmark 快照最大年龄。 |
-| 市值缓存 | 自动下载 `True`，市值过期 `45` 天，股数过期 `550` 天 | 控制 manager-held market-cap 代理数据。 |
-| 市值请求 | batch `25`，workers `6`，timeout `20s` | 外部请求批量、并发和超时。 |
-| 缓存与 override 路径 | 见 `LIVE_CONFIG` | OpenFIGI、价格、基准、市值、证券组、管理人分类及 idio-vol 文件路径。 |
-
-### 中文：命令行参数
-
-| 选项 | 默认值 | 可选值 / 作用 |
-|---|---|---|
-| `--mode` | `synthetic` | `synthetic`, `live`, `live-smoke` |
-| `--output-root` | `reports` | 输出目录。 |
-| `--smoke-cusips`, `--smoke-tickers` | `300`, `200` | Smoke 模式映射和取价数量。 |
-| `--skip-marginal`, `--skip-sweep` | 关闭 | 分别跳过 marginal-IR 和参数网格。 |
-| `--equity-only` | 关闭 | 显式排除基金类行；当前 live 配置本身已默认排除。 |
-| `--refresh-openfigi-metadata` | 关闭 | 刷新缺少分类元数据的缓存映射。 |
-| `--price-source` | live 配置默认 | `chart`, `auto`, `yfinance` |
-| `--active-benchmark-source` | thesis/live 默认 | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` |
-| `--active-benchmark-weights` | 无 | 含 `month_end,ticker,weight` 的 CSV/Parquet/XLSX。 |
-| `--active-benchmark-max-stale-days` | live 配置默认 | 覆盖基准快照时效上限。 |
-| `--sweep-checkpoint-every` | `5` | 每 N 组保存部分网格结果；`0` 关闭。 |
-| `--manager-filter-mode` | thesis 默认 | `all`, `exclude_dirty`, `dedicated_like` |
-
-直接调用库时，未覆盖的 API 基线为
-`UniverseConfig(min_aum=$1B, max_aum=$30B, ...)`、
-`PortfolioConfig(top_n_ideas=8, idea_signal="level", max_name_weight=5%,
-max_issuer_weight=7.5%, ...)` 和
-`BacktestConfig(manager_filter_mode="all",
-active_benchmark_source="visible_13f_aggregate",
-missing_price_policy="exit")`。这些不是 thesis recipe。
-
-### English: parameter reference
-
-There are two distinct kinds of defaults. The dataclass defaults in `engine.py`
-are generic API defaults; the normal research run created by
-`run_example.py::_default_run_configs()` overrides many of them. The tables below
-use the **thesis run** values unless explicitly labelled otherwise.
-
-### Thesis strategy defaults
-
-| Layer | Parameter | Thesis default | Allowed / meaningful values | Meaning |
-|---|---|---:|---|---|
-| Manager universe | `manager_filter_mode` | `dedicated_like` | `all`, `exclude_dirty`, `dedicated_like` | `dedicated_like` keeps managers classified as concentrated stock pickers; `exclude_dirty` only removes clearly unsuitable managers; `all` is the untouched baseline. |
-| Manager universe | `min_aum`, `max_aum` | `$0.1B`, `$10B` | non-negative dollar bounds | Point-in-time manager AUM band. The raw live ingest covers `$0.1B`–`$30B` so alternative bands remain available. |
-| Manager universe | `min_history_quarters` | `4` | integer `>= 1` | Minimum filing history before a manager can qualify. |
-| Manager universe | `max_stale_filing_months` | `6` | positive integer or `None` | Rejects a filing version that was published too long before the decision month. |
-| Manager universe | `max_stale_period_months` | `6` | positive integer or `None` | Rejects holdings whose report period is too old at the decision month. |
-| Concentration | `use_concentration` | `True` | `True`, `False` | Enables the concentration screen. |
-| Concentration | `top_n_concentration` | `10` | positive integer | Number of largest positions used in the concentration calculation. |
-| Concentration | `min_top_n_weight` | `50%` | `0`–`1` | Required combined book weight of the largest `top_n_concentration` holdings. |
-| Concentration | `max_holdings` | `40` | positive integer | Hard maximum number of long-equity holdings; passing the Top-N test does not bypass it. |
-| Turnover | `use_low_turnover` | `True` | `True`, `False` | Enables the cross-sectional low-turnover screen. |
-| Turnover | `turnover_quantile` | `0.34` | `0`–`1` | Keeps the lower-turnover portion of eligible managers using the configured quantile threshold. |
-| Hedging | `use_hedge_filter` | `True` | `True`, `False` | Enables the filing-version PUT exposure screen. |
-| Hedging | `hedge_put_max_weight` | `5%` | `0`–`1` | Maximum PUT value relative to the filing book. Missing exact-version evidence is handled fail-closed. |
-| Value tilt | `use_value_tilt` | `True` | `True`, `False` | Enables the manager value-tilt screen. |
-| Value tilt | `value_tilt_min_pctl` | `50%` | `0`–`1` | Minimum cross-sectional percentile of the manager value score. |
-| Active share | `use_active_share` | `False` | `True`, `False` | Optional manager active-share screen; disabled in the thesis default. |
-| Active share | `min_active_share` | `60%` | `0`–`1` | Minimum true active share when that screen is enabled and benchmark weights exist. |
-| Idea ranking | `idea_signal` | `cps_ir` | see signal table below | Ranks securities inside each manager book; it is not the final portfolio weight. |
-| Idea selection | `top_n_ideas` | `3` | positive integer | Selects each qualifying manager's top three ranked ideas. |
-| Idea allocation | `idea_aggregation` | `manager_equal` | `manager_equal`, `score`, `manager_count`, `equal_name` | Determines how selected manager ideas become aggregate portfolio weights. |
-| Consensus | `min_consensus_funds` | `2` | positive integer | A stock must be selected by at least two qualifying managers. Repeated selections count as independent manager votes. |
-| Breadth | `min_portfolio_names` | `10` | non-negative integer | If fewer names survive, that rebalance is invalid and held as cash. |
-| Breadth | `max_portfolio_names` | `30` | positive integer or `None` | Caps the aggregate target before weight caps. This Top-30 limit is a thesis convenience and an explicit paper-replication deviation. |
-| Risk cap | `max_name_weight` | `10%` | `0`–`1` | Maximum final weight in one ticker. |
-| Risk cap | `max_issuer_weight` | `15%` | `0`–`1` | Maximum combined weight for tickers mapped to the same issuer group. |
-| Holding | `holding_horizon_q` | `0` | integer `>= 0` | `0` fully rebalances; `N` carries a dropped target for up to `N` additional quarters. |
-| Signal validity | `min_active_weight_holdings` | `10` | positive integer | Minimum manager-book breadth required before active-weight/CPS signals are considered meaningful. |
-| Trading cost | `bps_per_side` | `15` bps | non-negative number | Cost charged separately on purchases and sales. |
-| Missing returns | `missing_price_policy` | `exit` | `exit`, `zero`, `raise` | `exit` liquidates an unpriced holding and reallocates to priced survivors; `zero` assumes zero return; `raise` stops the run. |
-| Active benchmark | `active_benchmark_source` | `manager_held_mcap` | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` | Benchmark weights used to calculate active-weight and CPS signals. `manager_held_mcap` is a public-data research proxy, not strict vendor PIT data. |
-
-`consensus_weight` is a legacy compatibility switch. When
-`idea_aggregation` is explicitly set—as it is in the thesis run—it has no
-effect. If aggregation is `None`, `consensus_weight=True` falls back to `score`
-and `False` falls back to `manager_count`.
-
-### Idea signals and allocation rules
-
-| `idea_signal` option | Ranking quantity |
-|---|---|
-| `level` | Current manager book weight. |
-| `change` | Quarter-over-quarter change in book weight. |
-| `initiation` | Newly initiated positions, ranked by current book weight. |
-| `active_weight` | Current book weight minus point-in-time benchmark weight. |
-| `active_weight_change` | Quarter-over-quarter change in active weight. |
-| `active_weight_initiation` | Newly initiated positions ranked by active weight. |
-| `cps_ir` | Current active weight multiplied by CAPM residual volatility. This is the implemented CPS implied-IR ranking proxy. |
-| `cps_ir_change` | Quarter-over-quarter change in the CPS implied-IR proxy. |
-| `cps_ir_initiation` | Newly initiated positions ranked by the CPS implied-IR proxy. |
-
-Allocation is separate from ranking:
-
-- `manager_equal` gives every contributing manager one equal budget. Within a
-  manager's Top-N selections, that budget follows the manager's reported book
-  weights. If several managers select the same stock, it receives several
-  manager shares.
-- `score` sums ranking scores across managers and normalizes them. This is an
-  experimental score-weighted construction, not the paper-style default.
-- `manager_count` weights by the number of managers selecting each stock.
-- `equal_name` gives every surviving selected stock equal weight.
-
-### CPS residual-volatility inputs
-
-| Parameter | Default | Meaning |
-|---|---:|---|
-| `idio_vol_window_months` | `24` | Trailing monthly window for the CAPM residual-volatility estimate. |
-| `idio_vol_min_obs` | `12` | Minimum valid monthly observations. |
-| `idio_vol_floor` | `10%` | Lower annualized residual-volatility guardrail. |
-| `idio_vol_cap` | `80%` | Upper annualized residual-volatility guardrail. |
-| `idio_vol_winsor_lower`, `idio_vol_winsor_upper` | `5%`, `95%` | Cross-sectional winsorization percentiles. |
-
-These volatility controls stabilize the implied-IR ranking input. High
-idiosyncratic volatility is not treated as an independent positive-alpha
-factor, and the raw CPS score is not the thesis portfolio weight.
-
-### Default robustness sweep
-
-The default Cartesian sweep contains 72 configurations:
-
-- `idea_signal`: `cps_ir`, `cps_ir_change`, `cps_ir_initiation`
-- `top_n_ideas`: `1`, `3`, `5`
-- `idea_aggregation`: `manager_equal`, `score`
-- `min_consensus_funds`: `1`, `2`
-- `holding_horizon_q`: `0`, `1`
-
-The sweep fixes `manager_filter_mode=dedicated_like`, AUM at `$0.1B`–`$10B`,
-`min_portfolio_names=10`, `max_portfolio_names=30`,
-`min_active_weight_holdings=10`, and keeps concentration, low-turnover, and
-value-tilt screens enabled. Walk-forward selection uses 48 training months and
-12 test months, selecting on active Sharpe. Marginal-IR analysis separately
-tests isolated screen contributions.
-
-### Live data and runtime defaults
-
-| Parameter | Default / options | Purpose |
-|---|---|---|
-| `identity` | placeholder string | SEC-compliant caller identity; replace with a real name and email. |
-| `openfigi_key` | `None` | Optional OpenFIGI API key; local environment loading can supply it. |
-| `sec_history_start` | `2013-10-01` | Earliest SEC filing-history request date. |
-| `price_history_start` | `2014-01-01` | Earliest price-history request date. |
-| `start`, `end` | `2015-01-01`, `2026-05-31` | Default backtest window. |
-| `benchmark_ticker` | `SPY` | Broad-market return benchmark. |
-| ingest `min_aum`, `max_aum` | `$0.1B`, `$30B` | Broad ingestion bounds, distinct from the thesis filter band. |
-| ingest `max_holdings` | `40` | Ingestion/universe holding-count ceiling. |
-| ingest `max_put_weight` | `10%` | Broad ingestion PUT bound; thesis filtering later uses `5%`. |
-| `require_factors` | `False` | Whether missing factor data must abort rather than degrade optional analysis. |
-| `price_source` | `chart`; options `chart`, `auto`, `yfinance` | Price downloader selection. |
-| `exclude_fund_like_holdings` | `True` | Excludes ETF/ETN/fund-like rows in the configured live pipeline. |
-| `refresh_openfigi_metadata`, `force_refresh_openfigi` | `False`, `False` | Control normal metadata refresh and explicit full remapping. |
-| benchmark staleness | `45` days | Maximum age for active-benchmark snapshots. |
-| market-cap download | auto `True`, stale `45` days, shares stale `550` days | Controls the manager-held market-cap proxy cache. |
-| market-cap requests | batch `25`, workers `6`, timeout `20s` | External request batching and concurrency. |
-| cache/override paths | values in `LIVE_CONFIG` | Paths for OpenFIGI, prices, benchmark weights, market cap, security groups, manager overrides, classification, and idio-vol caches. |
-
-### Command-line parameters
-
-| Option | Default | Allowed values / effect |
-|---|---|---|
-| `--mode` | `synthetic` | `synthetic`, `live`, `live-smoke` |
-| `--output-root` | `reports` | Output directory. |
-| `--smoke-cusips` | `300` | CUSIPs mapped in smoke mode. |
-| `--smoke-tickers` | `200` | Tickers priced in smoke mode. |
-| `--skip-marginal` | off | Skip marginal-IR ablation. |
-| `--skip-sweep` | off | Skip grid and walk-forward sweep. |
-| `--equity-only` | off | Explicitly request exclusion of fund-like rows; the current live config already defaults to exclusion. |
-| `--refresh-openfigi-metadata` | off | Refresh cached mappings missing classification metadata. |
-| `--price-source` | live-config default | `chart`, `auto`, `yfinance` |
-| `--active-benchmark-source` | thesis/live-config default | `manager_held_mcap`, `visible_13f_aggregate`, `spy_holdings` |
-| `--active-benchmark-weights` | none | CSV/Parquet/XLSX table containing `month_end,ticker,weight`. |
-| `--active-benchmark-max-stale-days` | live-config default | Override benchmark snapshot age limit. |
-| `--sweep-checkpoint-every` | `5` | Write partial sweep output every N configurations; `0` disables it. |
-| `--manager-filter-mode` | thesis default | `all`, `exclude_dirty`, `dedicated_like` |
-
-For direct library use, the untouched dataclass defaults are
-`UniverseConfig(min_aum=$1B, max_aum=$30B, ...)`,
-`PortfolioConfig(top_n_ideas=8, idea_signal="level", max_name_weight=5%,
-max_issuer_weight=7.5%, ...)`, and
-`BacktestConfig(manager_filter_mode="all",
-active_benchmark_source="visible_13f_aggregate",
-missing_price_policy="exit")`. They are API baselines, not the thesis recipe.
-
-## Testing
-
-```powershell
-python -B -m pytest tests
-```
-
-## Current Caveats
-
-- yfinance is suitable for first-pass infrastructure validation, not publishable delisting-sensitive research. CRSP/WRDS or an equivalent survivorship-aware source is the preferred production-grade source.
-- CUSIP/OpenFIGI mapping coverage is incomplete and must be reviewed through the run diagnostics. Large unmapped value is a research-validity risk.
-- `missing_price_policy="exit"` is a pragmatic public-data fallback, not a substitute for true delisting returns.
-- Prior-period turnover can still use a later amendment of the prior period; this is tracked as a known point-in-time issue in `AGENTS.md`.
-- Backtest results should be interpreted through active/factor-adjusted metrics, turnover, drawdown, and robustness checks. Do not judge the strategy by cumulative return alone.
-
-## Git Hygiene
-
-The repository intentionally ignores local data and generated artifacts:
-
-- `.env`
-- `13f_cache/`
-- `reports/`
-- `artifacts/`
-- `openfigi_cache.parquet`
-- `yfinance_close_cache.parquet`
-- `yfinance_close_cache_coverage.parquet`
-
-Regenerate these locally as needed.
-
-To rebuild only an existing run's interactive HTML after report-template changes,
-without rerunning data ingestion, backtests, or the parameter sweep:
-
-```powershell
-python -B report.py refresh reports/<run-directory>
-```
-
-This reads `sweep_grid.csv` and `sweep_returns.csv` from the run directory and
-overwrites its `interactive_results.html`. Use `--output <path>` to write elsewhere.
+Cohen, R. B., Polk, C., and Silli, B., *Best Ideas*. SSRN abstract 1364827.

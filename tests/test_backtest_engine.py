@@ -50,7 +50,7 @@ from run_diagnostics import manager_characteristics_audit
 from sweep import deflated_sharpe
 
 
-def test_default_thesis_and_72_trial_sweep_contract():
+def test_default_thesis_and_64_trial_sweep_contract():
     thesis, _, axes, _, _ = _default_run_configs()
 
     assert thesis.portfolio.idea_signal == "cps_ir"
@@ -60,17 +60,26 @@ def test_default_thesis_and_72_trial_sweep_contract():
     assert thesis.universe.use_concentration is True
     assert LIVE_CONFIG["max_holdings"] == thesis.universe.max_holdings == 40
     assert thesis.portfolio.min_consensus_funds == 2
-    assert thesis.portfolio.max_portfolio_names == 30
-    assert axes[("universe", "aum_band")] == [("0.1-10B", 0.1e9, 10e9)]
+    assert thesis.universe.max_aum == 5e9
+    assert thesis.portfolio.min_portfolio_names == 5
+    assert thesis.portfolio.max_portfolio_names == 10
+    assert thesis.portfolio.max_name_weight == 0.20
+    assert thesis.portfolio.max_issuer_weight == 0.25
+    assert axes[("universe", "aum_band")] == [
+        ("0.1-1B", 0.1e9, 1e9),
+        ("0.1-5B", 0.1e9, 5e9),
+    ]
     assert axes[("portfolio", "idea_signal")] == [
         "cps_ir",
         "cps_ir_change",
-        "cps_ir_initiation",
     ]
+    assert axes[("portfolio", "top_n_ideas")] == [3, 5]
     assert axes[("portfolio", "idea_aggregation")] == ["manager_equal", "score"]
     assert axes[("portfolio", "min_consensus_funds")] == [1, 2]
     assert axes[("universe", "use_concentration")] == [True]
-    assert int(np.prod([len(values) for values in axes.values()])) == 72
+    assert axes[("portfolio", "min_portfolio_names")] == [5]
+    assert axes[("portfolio", "max_portfolio_names")] == [10]
+    assert int(np.prod([len(values) for values in axes.values()])) == 64
 
 
 def test_concentration_requires_top10_threshold_and_max_holdings_cap():
